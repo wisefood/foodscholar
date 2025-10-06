@@ -116,7 +116,6 @@ async def chat(request: ChatRequest):
     try:
         chain, memory = create_structured_chain(request.session_id, request.max_history)
 
-        # ✅ Correct async call
         response = await chain.ainvoke({"input": request.message})
 
         # Save memory (this part can remain sync)
@@ -176,11 +175,11 @@ async def root():
     """Health check endpoint."""
     return {
         "status": "running",
-        "service": "Food Facts Assistant (LangChain + Structured Output)",
+        "service": "Wisefood - FoodScholar)",
         "active_sessions": len(memories)
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8005)
+    uvicorn.run(app, host="0.0.0.0", port=os.getenv("PORT", 8005))
