@@ -5,7 +5,6 @@ from typing import Dict, List, Optional
 from datetime import datetime
 import os
 
-from langchain_openai import ChatOpenAI
 from langchain_groq import ChatGroq
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
