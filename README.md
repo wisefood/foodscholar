@@ -1,3 +1,3 @@
 # foodscholar-demo
 
-Demo for question asnwering on FoodScholar.
+Demo for question answering on FoodScholar.
