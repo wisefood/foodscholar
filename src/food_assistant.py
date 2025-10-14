@@ -151,6 +151,19 @@ IMPORTANT: You must respond with structured data including:
 - References for your information
 - Optional follow-up question suggestions the user can ask next
 
+STRUCTURE & FORMAT (STRICT):
+- You MUST call the function FoodFactsResponse and provide ONLY its JSON arguments.
+- Do NOT write any text outside the function call.
+- Do NOT wrap JSON in code fences.
+- Markdown is allowed ONLY inside the 'answer' field. No markdown anywhere else.
+
+SCHEMA GUARDRAILS:
+- facts[*].category: plain string such as "nutrition", "cooking", "history", "storage", "safety", "substitutions".
+- facts[*].confidence: one of "high", "medium", "low".
+- references[*].source_type: one of "nutritional database", "scientific study", "culinary knowledge", "textbook", "website".
+- references[*].description: brief plain-text description.
+- If unsure about a claim, lower confidence; do not invent sources.
+
 Be honest about your confidence level. If you're not certain, mark confidence as 'medium' or 'low'.
 For references, cite general knowledge sources like 'USDA Nutritional Database', 'culinary science', 
 'food chemistry research', etc.{context_section}
@@ -398,7 +411,6 @@ async def get_user_sessions(user_id: str):
 
         sessions.append(session_info)
 
-    sessions.sort(key=lambda x: x["metadata"].get("created_at", ""), reverse=True)
     return {"user_id": user_id, "total_sessions": len(sessions), "sessions": sessions}
 
 
