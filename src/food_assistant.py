@@ -5,13 +5,18 @@ from typing import Dict, List, Optional
 from datetime import datetime
 import os
 import json
+import logging
 
 from langchain_groq import ChatGroq
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 
-app = FastAPI(title="FoodScholar Assistant API")
+# Initialize logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="FoodScholar Assistant API", debug=True)
 
 # In-memory storage for conversation memories and contexts
 memories: Dict[str, ConversationBufferWindowMemory] = {}
@@ -141,7 +146,7 @@ def create_structured_chain(session_id: str, max_history: int = 20):
 information about food, nutrition, cooking, ingredients, and culinary topics.
 
 IMPORTANT: You must respond with structured data including:
-- A natural language answer
+- A natural language answer, optionally in markdown format
 - Specific food facts with categories (nutrition, cooking, history, storage, etc.) only if not greeting
 - References for your information
 - Optional follow-up question suggestions the user can ask next
@@ -268,6 +273,7 @@ async def start_session(request: SessionStartRequest):
         )
 
     except Exception as e:
+        logger.error(f"Error starting session: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
@@ -344,6 +350,7 @@ async def chat(request: ChatRequest):
         )
 
     except Exception as e:
+        logger.error(f"Error processing chat message: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
@@ -364,33 +371,34 @@ async def get_user_sessions(user_id: str):
             "messages": [],
         }
 
-        # Get conversation history if exists
-        if session_id in memories:
-            memory = memories[session_id]
-            history = memory.load_memory_variables({})
-            messages_raw = history.get("chat_history", [])
-            session_info["message_count"] = len(messages_raw)
+        # # Get conversation history if exists
+        # if session_id in memories:
+        #     memory = memories[session_id]
+        #     history = memory.load_memory_variables({})
+        #     messages_raw = history.get("chat_history", [])
+        #     session_info["message_count"] = len(messages_raw)
             
-            # Parse structured responses
-            messages = []
-            for msg in messages_raw:
-                message_data = {"type": msg.type, "content": msg.content}
+        #     # Parse structured responses
+        #     messages = []
+        #     for msg in messages_raw:
+        #         message_data = {"type": msg.type, "content": msg.content}
                 
-                # If it's an AI message, try to parse the JSON back to structured format
-                if msg.type == "ai":
-                    try:
-                        structured_content = json.loads(msg.content)
-                        message_data["structured_response"] = structured_content
-                    except:
-                        # If parsing fails, keep as plain text
-                        message_data["content"] = msg.content
+        #         # If it's an AI message, try to parse the JSON back to structured format
+        #         if msg.type == "ai":
+        #             try:
+        #                 structured_content = json.loads(msg.content)
+        #                 message_data["structured_response"] = structured_content
+        #             except:
+        #                 # If parsing fails, keep as plain text
+        #                 message_data["content"] = msg.content
                 
-                messages.append(message_data)
+        #         messages.append(message_data)
             
-            session_info["messages"] = messages
+        #     session_info["messages"] = messages
 
         sessions.append(session_info)
 
+    sessions.sort(key=lambda x: x["metadata"].get("created_at", ""), reverse=True)
     return {"user_id": user_id, "total_sessions": len(sessions), "sessions": sessions}
 
 
@@ -533,4 +541,4 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8005)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8005)), log_level="debug")
