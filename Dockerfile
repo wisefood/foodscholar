@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 8005
 
-ENTRYPOINT ["python", "src/food_assistant.py"]
+ENTRYPOINT ["python", "src/app.py"]
