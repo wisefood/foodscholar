@@ -9,7 +9,7 @@ from models.search import (
     SearchSummaryResponse,
     ArticleMetadata,
 )
-from utils.citation_validator import create_citation_from_article
+from utilities.citation_validator import create_citation_from_article
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

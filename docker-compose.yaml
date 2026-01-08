@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  food-facts-api:
+  foodscholar:
     build: .
     container_name: foodscholar
     ports:
@@ -18,9 +18,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    networks:
-      - food-facts-network
-
-networks:
-  food-facts-network:
-    driver: bridge
