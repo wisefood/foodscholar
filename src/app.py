@@ -2,10 +2,13 @@ from fastapi import FastAPI, HTTPException
 import asyncio
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
+from routers.generic import install_error_handler
 from datetime import datetime
 import os
 import json
 import logging
+import logsys
+import uvicorn
 
 from langchain_groq import ChatGroq
 from langchain.memory import ConversationBufferWindowMemory
@@ -13,23 +16,106 @@ from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 
 # Initialize logger
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logsys.configure()
+
+
+class Config:
+    def __init__(self):
+        self.settings = {}
+
+    def setup(self):
+        # Read environment variables and store them in the settings dictionary
+        self.settings["HOST"] = os.getenv("HOST", "127.0.0.1")
+        self.settings["PORT"] = int(os.getenv("PORT", 8000))
+        self.settings["DEBUG"] = os.getenv("DEBUG", "true").lower() == "true"
+        self.settings["CONTEXT_PATH"] = os.getenv("CONTEXT_PATH", "")
+        self.settings["APP_EXT_DOMAIN"] = os.getenv(
+            "APP_EXT_DOMAIN", "http://wisefood.gr"
+        )
+        self.settings["ELASTIC_HOST"] = os.getenv(
+            "ELASTIC_HOST", "http://elasticsearch:9200"
+        )
+        self.settings["ES_DIM"] = int(os.getenv("ES_DIM", 384))
+        self.settings["FOODSCHOLAR_URL"] = os.getenv(
+            "FOODSCHOLAR_URL", "http://foodscholar:8001"
+        )
+        self.settings["RECIPEWRANGLER_URL"] = os.getenv(
+            "RECIPEWRANGLER_URL", "http://recipewrangler:8001"
+        )
+        self.settings["FOODCHAT_URL"] = os.getenv(
+            "FOODCHAT_URL", "http://foodchat:8001"
+        )
+        self.settings["MINIO_ENDPOINT"] = os.getenv(
+            "MINIO_ENDPOINT", "http://minio:9000"
+        )
+        self.settings["MINIO_ROOT"] = os.getenv("MINIO_ROOT", "root")
+        self.settings["MINIO_ROOT_PASSWORD"] = os.getenv(
+            "MINIO_ROOT_PASSWORD", "minioadmin"
+        )
+        self.settings["MINIO_EXT_URL_CONSOLE"] = os.getenv(
+            "MINIO_EXT_URL_CONSOLE", "https://s3.wisefood.gr/console"
+        )
+        self.settings["MINIO_EXT_URL_API"] = os.getenv(
+            "MINIO_EXT_URL_API", "https://s3.wisefood.gr"
+        )
+        self.settings["MINIO_BUCKET"] = os.getenv("MINIO_BUCKET", "system")
+        self.settings["KEYCLOAK_URL"] = os.getenv(
+            "KEYCLOAK_URL", "http://keycloak:8080"
+        )
+        self.settings["KEYCLOAK_EXT_URL"] = os.getenv(
+            "KEYCLOAK_EXT_URL", "https://auth.wisefood.gr"
+        )
+        self.settings["KEYCLOAK_ISSUER_URL"] = os.getenv(
+            "KEYCLOAK_ISSUER_URL", "https://auth.wisefood.gr/realms/master"
+        )
+        self.settings["KEYCLOAK_REALM"] = os.getenv("KEYCLOAK_REALM", "master")
+        self.settings["KEYCLOAK_CLIENT_ID"] = os.getenv(
+            "KEYCLOAK_CLIENT_ID", "wisefood-api"
+        )
+        self.settings["KEYCLOAK_CLIENT_SECRET"] = os.getenv(
+            "KEYCLOAK_CLIENT_SECRET", "secret"
+        )
+        self.settings["CACHE_ENABLED"] = (
+            os.getenv("CACHE_ENABLED", "false").lower() == "true"
+        )
+        self.settings["REDIS_HOST"] = os.getenv("REDIS_HOST", "redis")
+        self.settings["REDIS_PORT"] = int(os.getenv("REDIS_PORT", 6379))
+        self.settings["POSTGRES_HOST"] = os.getenv("POSTGRES_HOST", "localhost")
+        self.settings["POSTGRES_PORT"] = int(os.getenv("POSTGRES_PORT", 5432))
+        self.settings["POSTGRES_USER"] = os.getenv("POSTGRES_USER", "postgres")
+        self.settings["POSTGRES_PASSWORD"] = os.getenv("POSTGRES_PASSWORD", "postgres")
+        self.settings["POSTGRES_DB"] = os.getenv("POSTGRES_DB", "wisefood")
+        self.settings["POSTGRES_POOL_SIZE"] = int(os.getenv("POSTGRES_POOL_SIZE", 10))
+        self.settings["POSTGRES_MAX_OVERFLOW"] = int(
+            os.getenv("POSTGRES_MAX_OVERFLOW", 20)
+        )
+
+
+# Configure application settings
+config = Config()
+config.setup()
+
 
 app = FastAPI(title="FoodScholar Assistant API", debug=True)
+install_error_handler(app)
+
 
 # In-memory storage for conversation memories and contexts
 memories: Dict[str, ConversationBufferWindowMemory] = {}
 user_contexts: Dict[str, str] = {}
 # Track which sessions belong to which users
 user_sessions: Dict[str, List[str]] = {}  # user_id -> [session_ids]
-session_metadata: Dict[str, Dict] = {}  # session_id -> {user_id, created_at, last_active, title}
+session_metadata: Dict[str, Dict] = (
+    {}
+)  # session_id -> {user_id, created_at, last_active, title}
 session_titles: Dict[str, str] = {}  # session_id -> title
 
 
 # Structured output models
 class Reference(BaseModel):
     """Reference source for a food fact."""
+
     source_type: str = Field(
         description="Type of source (e.g., 'nutritional database', 'scientific study', 'culinary knowledge')"
     )
@@ -38,6 +124,7 @@ class Reference(BaseModel):
 
 class FoodFact(BaseModel):
     """Individual food fact with context."""
+
     fact: str = Field(description="The specific food fact or information")
     category: str = Field(
         description="Category of the fact (e.g., 'nutrition', 'cooking', 'history', 'storage')"
@@ -47,6 +134,7 @@ class FoodFact(BaseModel):
 
 class FoodFactsResponse(BaseModel):
     """Structured response from the food facts assistant."""
+
     answer: str = Field(description="Natural language response to the user's question")
     facts: List[FoodFact] = Field(description="List of specific food facts mentioned")
     references: List[Reference] = Field(
@@ -76,9 +164,9 @@ def generate_session_title(user_message: str, user_context: str = "") -> str:
             temperature=0.3,
             api_key=os.getenv("GROQ_API_KEY"),
         )
-        
+
         context_info = f"\nUser context: {user_context}" if user_context else ""
-        
+
         prompt = f"""Based on this user's first message in a food facts conversation, generate a very short, concise title (3-6 words max) that summarizes what they want to know about.{context_info}
 
 User's message: "{user_message}"
@@ -90,14 +178,14 @@ Generate ONLY the title, nothing else. Examples of good titles:
 - "Gluten-Free Baking Tips"
 
 Title:"""
-        
+
         response = llm.invoke(prompt)
         title = response.content.strip().strip('"').strip("'")
-        
+
         # Ensure title isn't too long
         if len(title) > 50:
             title = title[:47] + "..."
-        
+
         return title
     except Exception as e:
         # Fallback to a generic title if generation fails
@@ -111,13 +199,15 @@ def is_first_user_message(session_id: str) -> bool:
     memory = memories[session_id]
     history = memory.load_memory_variables({})
     messages = history.get("chat_history", [])
-    
+
     # Count only human messages, excluding the automated greeting
     human_messages = [
-        msg for msg in messages 
-        if msg.type == "human" and msg.content != "Hello! I'd like help with food and nutrition questions."
+        msg
+        for msg in messages
+        if msg.type == "human"
+        and msg.content != "Hello! I'd like help with food and nutrition questions."
     ]
-    
+
     return len(human_messages) == 0
 
 
@@ -193,6 +283,7 @@ if provided without making them feel uncomfortable by repeating it. Ask them wha
 
 class SessionStartRequest(BaseModel):
     """Request to start a new session with context."""
+
     session_id: str
     user_id: str = Field(
         description="User identifier to track sessions across multiple conversations"
@@ -205,6 +296,7 @@ class SessionStartRequest(BaseModel):
 
 class SessionStartResponse(BaseModel):
     """Response when starting a new session."""
+
     session_id: str
     message: str
     greeting: FoodFactsResponse
@@ -242,9 +334,9 @@ async def start_session(request: SessionStartRequest):
         if existing_user_id != request.user_id:
             raise HTTPException(
                 status_code=409,
-                detail=f"Session ID '{request.session_id}' already exists for another user. Please use a unique session ID."
+                detail=f"Session ID '{request.session_id}' already exists for another user. Please use a unique session ID.",
             )
-    
+
     # Store user context
     user_contexts[request.session_id] = request.user_context
 
@@ -300,7 +392,7 @@ async def chat(request: ChatRequest):
         if existing_user_id != request.user_id:
             raise HTTPException(
                 status_code=403,
-                detail=f"Access denied. Session '{request.session_id}' belongs to another user."
+                detail=f"Access denied. Session '{request.session_id}' belongs to another user.",
             )
 
     # If context provided and it's a new session, store it
@@ -338,18 +430,20 @@ async def chat(request: ChatRequest):
 
         # Save to memory with full structured response
         memory.save_context(
-            {"input": request.message}, 
-            {"output": response.model_dump_json()}
+            {"input": request.message}, {"output": response.model_dump_json()}
         )
-        
+
         # Generate title if this is the first user message (not the initial greeting)
-        if first_message and request.message != "Hello! I'd like help with food and nutrition questions.":
+        if (
+            first_message
+            and request.message
+            != "Hello! I'd like help with food and nutrition questions."
+        ):
             session_title = generate_session_title(
-                request.message, 
-                user_contexts.get(request.session_id, "")
+                request.message, user_contexts.get(request.session_id, "")
             )
             session_titles[request.session_id] = session_title
-            
+
             # Update metadata with title
             if request.session_id in session_metadata:
                 session_metadata[request.session_id]["title"] = session_title
@@ -359,7 +453,7 @@ async def chat(request: ChatRequest):
             response=response,
             timestamp=datetime.now().isoformat(),
             is_first_message=first_message,
-            session_title=session_title
+            session_title=session_title,
         )
 
     except Exception as e:
@@ -390,12 +484,12 @@ async def get_user_sessions(user_id: str):
         #     history = memory.load_memory_variables({})
         #     messages_raw = history.get("chat_history", [])
         #     session_info["message_count"] = len(messages_raw)
-            
+
         #     # Parse structured responses
         #     messages = []
         #     for msg in messages_raw:
         #         message_data = {"type": msg.type, "content": msg.content}
-                
+
         #         # If it's an AI message, try to parse the JSON back to structured format
         #         if msg.type == "ai":
         #             try:
@@ -404,9 +498,9 @@ async def get_user_sessions(user_id: str):
         #             except:
         #                 # If parsing fails, keep as plain text
         #                 message_data["content"] = msg.content
-                
+
         #         messages.append(message_data)
-            
+
         #     session_info["messages"] = messages
 
         sessions.append(session_info)
@@ -419,14 +513,14 @@ async def get_context(user_id: str, session_id: str):
     """Retrieve user context for a session."""
     if session_id not in user_contexts:
         raise HTTPException(status_code=404, detail="Session context not found")
-    
+
     # Validate session ownership
     if session_id in session_metadata:
         owner_id = session_metadata[session_id].get("user_id")
         if owner_id != user_id:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied. You don't have permission to access this session."
+                detail="Access denied. You don't have permission to access this session.",
             )
 
     return {"session_id": session_id, "user_context": user_contexts[session_id]}
@@ -437,14 +531,14 @@ async def get_history(user_id: str, session_id: str):
     """Retrieve conversation history for a session."""
     if session_id not in memories:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Check if session belongs to the user
     if session_id in session_metadata:
         owner_id = session_metadata[session_id].get("user_id")
         if owner_id != user_id:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied. This session does not belong to you."
+                detail="Access denied. This session does not belong to you.",
             )
 
     memory = memories[session_id]
@@ -454,7 +548,7 @@ async def get_history(user_id: str, session_id: str):
     messages = []
     for msg in history.get("chat_history", []):
         message_data = {"type": msg.type, "content": msg.content}
-        
+
         # If it's an AI message, try to parse the JSON back to structured format
         if msg.type == "ai":
             try:
@@ -463,7 +557,7 @@ async def get_history(user_id: str, session_id: str):
             except:
                 # If parsing fails, keep as plain text
                 message_data["content"] = msg.content
-        
+
         messages.append(message_data)
 
     return {
@@ -479,16 +573,16 @@ async def clear_history(user_id: str, session_id: str):
     """Clear conversation history for a session."""
     if session_id not in memories:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Check if session belongs to the user
     if session_id in session_metadata:
         owner_id = session_metadata[session_id].get("user_id")
         if owner_id != user_id:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied. This session does not belong to you."
+                detail="Access denied. This session does not belong to you.",
             )
-    
+
     memories[session_id].clear()
     return {"message": f"History cleared for session {session_id}"}
 
@@ -496,16 +590,16 @@ async def clear_history(user_id: str, session_id: str):
 @app.delete("/user/{user_id}/session/{session_id}")
 async def delete_session(user_id: str, session_id: str):
     """Delete entire session including context."""
-    
+
     # Check if session exists and belongs to the user
     if session_id in session_metadata:
         owner_id = session_metadata[session_id].get("user_id")
         if owner_id != user_id:
             raise HTTPException(
                 status_code=403,
-                detail="Access denied. This session does not belong to you."
+                detail="Access denied. This session does not belong to you.",
             )
-    
+
     deleted_items = []
 
     # Delete metadata
@@ -528,7 +622,7 @@ async def delete_session(user_id: str, session_id: str):
     if session_id in user_contexts:
         del user_contexts[session_id]
         deleted_items.append("context")
-    
+
     if session_id in session_titles:
         del session_titles[session_id]
         deleted_items.append("title")
@@ -551,6 +645,7 @@ async def root():
 
 
 if __name__ == "__main__":
-    import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8005)), log_level="debug")
+    uvicorn.run(
+        app, host="0.0.0.0", port=int(os.getenv("PORT", 8005)), log_level="debug"
+    )

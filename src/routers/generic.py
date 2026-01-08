@@ -1,131 +1,206 @@
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
-from fastapi import HTTPException, Request
-from starlette.responses import JSONResponse
+import functools
+import inspect
+import time
+from logging import Logger, getLogger
+from typing import Any, Awaitable, Callable, Optional, Union, TypeVar, Dict
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from exceptions import APIException, DataError 
+from starlette.responses import Response
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel
 
-# -------------------------------------------------
-# Core: rich APIException (RFC-7807 compatible)
-# -------------------------------------------------
-class APIException(HTTPException):
+from exceptions import APIException
+
+log = getLogger(__name__)
+
+# ---------- Success envelope ----------
+class APIEnvelope(BaseModel):
+    help: str
+    success: bool = True
+    result: Any
+
+def _ok(result: Any, request: Request) -> APIEnvelope:
+    return APIEnvelope(help=str(request.url), result=result)
+
+# ---------- Helpers ----------
+T = TypeVar("T")
+EndpointFn = Union[Callable[..., T], Callable[..., Awaitable[T]]]
+ResultMapper = Callable[[Any], Any]
+
+REDACT_KEYS = {
+    "password",
+    "pwd",
+    "token",
+    "access_token",
+    "authorization",
+    "secret",
+    "apikey",
+    "api_key",
+}
+
+def _redact(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        return d  # best effort
+    out = {}
+    for k, v in d.items():
+        if k.lower() in REDACT_KEYS:
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
+
+def _pick_request(args, kwargs, fn) -> Optional[Request]:
+    req = kwargs.get("request")
+    if isinstance(req, Request):
+        return req
+    sig = inspect.signature(fn)
+    bound = sig.bind_partial(*args, **kwargs)
+    for name, param in sig.parameters.items():
+        val = bound.arguments.get(name)
+        if isinstance(val, Request):
+            return val
+    return None
+
+# ---------- Decorator ----------
+def render(
+    map_result: Optional[ResultMapper] = None,
+    *,
+    logger: Optional[Logger] = None,
+    event: Optional[str] = None,
+) -> Callable[[EndpointFn], EndpointFn]:
     """
-    Rich HTTP error with structured fields and helpers
-    to render RFC-7807 problem+json consistently.
+    Wrap an endpoint to:
+      - pass through Response objects
+      - re-raise APIException for global handlers
+      - wrap unknown errors via APIException.from_unexpected
+      - envelope successful results uniformly
+      - log only on exceptions
     """
+    logger = logger or log
 
-    def __init__(
-        self,
-        status_code: int,
-        detail: str = "",
-        *,
-        code: Optional[str] = None,      # machine-friendly error code (e.g. "auth/unauthorized")
-        errors: Any = None,                  # field-level errors, validation issues, etc.
-        extra: Optional[Dict[str, Any]] = None,  # any additional context (never secrets)
-        headers: Optional[Dict[str, str]] = None,
-        instance: Optional[str] = None,      # unique id for this occurrence
-        retry_after: Optional[int] = None,   # seconds; sets Retry-After header if given
-    ) -> None:
-        super().__init__(status_code=status_code, detail=detail, headers=headers or {})
-        self.code = code
-        self.errors = errors or []
-        self.extra = extra or {}
-        self.instance = instance or f"urn:uuid:{uuid.uuid4()}"
-        self.timestamp = datetime.now(timezone.utc).isoformat()
+    def decorator(func: EndpointFn) -> EndpointFn:
+        is_coro = inspect.iscoroutinefunction(func)
 
-        if retry_after is not None:
-            self.headers["Retry-After"] = str(retry_after)
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            req = _pick_request(args, kwargs, func)
+            if req is None:
+                raise RuntimeError(
+                    "render(): endpoint must accept a 'request: Request' parameter "
+                    "to build the success envelope."
+                )
 
-    # Problem Details (RFC 7807):
-    def to_problem(self, request: Optional[Request] = None) -> Dict[str, Any]:
-        body: Dict[str, Any] = {
-            "type": self.extra.get("type", "about:blank"),
-            "title": self.extra.get("title", self.__class__.__name__),
-            "status": self.status_code,
-            "detail": self.detail,
-            "instance": self.instance,
-            "timestamp": self.timestamp,
-        }
-        if self.code:
-            body["code"] = self.code
-        if self.errors is not None:
-            body["errors"] = self.errors
-        if request is not None:
-            body["path"] = str(request.url.path)
-        if self.extra:
-            # keep extra last to avoid collisions with reserved keys
-            body["extra"] = self.extra
-        return body
+            started = time.perf_counter()
+            ev = event or func.__name__
+            rid = getattr(getattr(req, "state", None), "request_id", None)
 
-    def to_response(self, request: Optional[Request] = None) -> JSONResponse:
-        return JSONResponse(
-            self.to_problem(request),
-            status_code=self.status_code,
-            headers=self.headers,
-            media_type="application/problem+json",
+            try:
+                if is_coro:
+                    result = await func(*args, **kwargs)
+                else:
+                    result = await run_in_threadpool(func, *args, **kwargs)
+
+                if isinstance(result, Response):
+                    return result 
+                if map_result:
+                    result = map_result(result)
+
+                return _ok(result, req)
+
+            except APIException as exc:
+                # Log only on exception
+                level = 30 if exc.status_code < 500 else 40  # WARNING for 4xx, ERROR for 5xx
+                dur = (time.perf_counter() - started) * 1000
+                logger.log(
+                    level,
+                    f"api.api_exception:{ev}",
+                    extra={
+                        "method": req.method,
+                        "path": req.url.path,
+                        "status": exc.status_code,
+                        "code": getattr(exc, "code", None),
+                        "detail": exc.detail,
+                        "duration_ms": round(dur, 2),
+                        "request_id": rid,
+                    },
+                    exc_info=exc.status_code >= 500,
+                )
+                raise  # handled by global APIException handler
+
+            except Exception as exc:
+                dur = (time.perf_counter() - started) * 1000
+                logger.exception(
+                    f"api.unexpected:{ev}",
+                    extra={
+                        "method": req.method,
+                        "path": req.url.path,
+                        "duration_ms": round(dur, 2),
+                        "request_id": rid,
+                    },
+                )
+                raise APIException.from_unexpected(exc) from exc
+
+        return async_wrapper  # Always return the async wrapper
+
+    return decorator
+
+
+def install_error_handler(app: FastAPI) -> None:
+    """
+    Installs exception handlers that render a minimal, uniform error shape:
+
+    {
+      "success": false,
+      "error": {
+         "detail": "...",
+         "title": "...",
+         "code": "..."
+      },
+      "help": "<url>"
+    }
+    """
+    @app.exception_handler(APIException)
+    async def handle_api_exception(request: Request, exc: APIException):
+        return _to_simple_response(request, exc)
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation(request: Request, exc: RequestValidationError):
+        data_error = DataError(
+            detail="Validation failed",
+            errors=exc.errors(),
+            extra={"title": "RequestValidationError"},
         )
+        return _to_simple_response(request, data_error)
 
-    @property
-    def retryable(self) -> bool:
-        """Whether the client might retry (useful for clients/backoffs)."""
-        return self.status_code in (429, 503, 504) or 500 <= self.status_code < 600
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception):
+        from exceptions import APIException as _APIException
+        internal = _APIException.from_unexpected(exc)
+        return _to_simple_response(request, internal)
 
-    @classmethod
-    def from_unexpected(cls, exc: Exception) -> "APIException":
-        """Factory to wrap unknown exceptions safely."""
-        # Never leak internal messages by default; attach the message to extra if needed.
-        return InternalError(extra={"cause": exc.__class__.__name__})
+def _to_simple_response(request: Request, exc: APIException):
+    """
+    Convert any APIException into the minimal shape.
+    """
+    title = exc.extra.get("title", exc.__class__.__name__)
+    code = getattr(exc, "code", None)
+    detail = exc.detail
 
-
-# -------------------------------------------------
-# Typed Exceptions (40x / 50x)
-# -------------------------------------------------
-
-class InvalidError(APIException):
-    def __init__(self, detail: str = "Bad Request", **kw):
-        super().__init__(400, detail, code="request/invalid", **kw)
-
-class DataError(APIException):
-    def __init__(self, detail: str = "Unprocessable Entity", errors: Any = None, **kw):
-        super().__init__(422, detail, code="request/unprocessable", errors=errors, **kw)
-
-class AuthenticationError(APIException):
-    def __init__(self, detail: str = "Unauthorized", **kw):
-        super().__init__(401, detail, code="auth/unauthorized", **kw)
-
-class AuthorizationError(APIException):
-    def __init__(self, detail: str = "Forbidden", **kw):
-        super().__init__(403, detail, code="auth/forbidden", **kw)
-
-class NotFoundError(APIException):
-    def __init__(self, detail: str = "Not Found", **kw):
-        super().__init__(404, detail, code="resource/not_found", **kw)
-
-class NotAllowedError(APIException):
-    def __init__(self, detail: str = "Method Not Allowed", **kw):
-        super().__init__(405, detail, code="request/not_allowed", **kw)
-
-class ConflictError(APIException):
-    def __init__(self, detail: str = "Conflict", **kw):
-        super().__init__(409, detail, code="resource/conflict", **kw)
-
-class RateLimitError(APIException):
-    def __init__(self, detail: str = "Too Many Requests", retry_after: Optional[int] = None, **kw):
-        super().__init__(429, detail, code="quota/rate_limited", retry_after=retry_after, **kw)
-
-class InternalError(APIException):
-    def __init__(self, detail: str = "Internal Server Error", **kw):
-        super().__init__(500, detail, code="server/internal", **kw)
-
-class BadGatewayError(APIException):
-    def __init__(self, detail: str = "Bad Gateway", **kw):
-        super().__init__(502, detail, code="upstream/bad_gateway", **kw)
-
-class ServiceUnavailableError(APIException):
-    def __init__(self, detail: str = "Service Unavailable", retry_after: Optional[int] = None, **kw):
-        super().__init__(503, detail, code="upstream/unavailable", retry_after=retry_after, **kw)
-
-class GatewayTimeoutError(APIException):
-    def __init__(self, detail: str = "Gateway Timeout", **kw):
-        super().__init__(504, detail, code="upstream/timeout", **kw)
+    body = {
+        "success": False,
+        "error": {
+            "title": title,
+            "detail": detail,
+            "code": code,
+        },
+        "help": str(request.url),
+    }
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        body,
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
