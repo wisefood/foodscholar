@@ -2,6 +2,9 @@
 import logging
 from typing import List, Dict, Any
 from langchain.prompts import ChatPromptTemplate
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.tools import tool
+from langchain import hub
 from backend.groq import GROQ_CHAT
 from models.search import (
     Citation,
@@ -31,6 +34,8 @@ class SynthesisAgent:
             temperature: Model temperature (lower = more focused)
         """
         self.llm = GROQ_CHAT.get_client(model=model, temperature=temperature)
+        self._agent_executor = None
+        self._tools = None
 
     def synthesize_search_results(
         self,
@@ -111,7 +116,6 @@ Article {idx}:
     ) -> Dict[str, Any]:
         """Generate synthesis using LLM."""
 
-        # Adjust complexity based on expertise level
         complexity_instructions = {
             "beginner": "Use simple, accessible language. Explain technical terms. Use analogies where helpful.",
             "intermediate": "Use clear scientific language. Define complex terms when first introduced.",
@@ -132,20 +136,37 @@ CRITICAL RULES:
 5. Highlight strength of evidence (e.g., "preliminary findings suggest..." vs "strong evidence demonstrates...")
 
 OUTPUT FORMAT:
-Return a JSON object with:
-- "summary": A comprehensive markdown-formatted summary (3-5 paragraphs)
+Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
+Ensure all strings are properly escaped (use \\n for newlines, \\t for tabs, \\" for quotes).
+
+JSON structure:
+- "summary": A comprehensive markdown-formatted summary. Use rich markdown formatting:
+  - **Bold** for key terms, important findings, and emphasis
+  - *Italic* for study types, scientific names, and technical terms
+  - Use bullet lists (- ) or numbered lists for clarity
+  - Use headings (###) to organize sections
+  - Use > blockquotes for notable quotes or key takeaways
+  - Separate paragraphs with \\n\\n
+  - Keep it focused and scannable with clear visual hierarchy
 - "findings": Array of objects, each with:
-  - "finding": The specific finding or insight
+  - "finding": The specific finding or insight (properly escaped string, can use markdown)
   - "category": One of [nutrition, health outcomes, methodology, safety, mechanisms, epidemiology]
   - "confidence": One of [high, medium, low]
   - "supporting_article_urns": Array of URN strings that support this finding
   - "supporting_sections": Array of section names (abstract, methods, results, discussion)
 
 SUMMARY STRUCTURE:
-1. Opening: Direct answer to the query with key consensus
-2. Body: Major findings organized thematically
-3. Nuance: Conflicting evidence, limitations, or gaps
-4. Conclusion: Practical implications or future research needs"""),
+1. Opening: Direct answer to the query with **key consensus in bold**
+2. Body: Major findings organized with headings and bullet points
+3. Nuance: Conflicting evidence, limitations, or gaps (use *italic* for caveats)
+4. Conclusion: Practical implications with **bold takeaways**
+
+FORMATTING EXAMPLES:
+- "**Natto consumption** showed significant antithrombotic effects in *hypercholesterolemia rats*."
+- "### Key Health Outcomes\\n\\n- Improved blood circulation\\n- Reduced cholesterol levels"
+- "> Important: These findings are based on *animal studies* and may not directly translate to humans."
+
+IMPORTANT: Return ONLY the JSON object. Do not wrap it in code blocks or add any other text."""),
             ("human", f"""Query: {query}
 
 Articles to synthesize:
@@ -159,6 +180,7 @@ Generate a synthesis that answers the query comprehensively.""")
 
             # Parse the JSON response
             import json
+            import re
             content = response.content.strip()
 
             # Try to extract JSON from code blocks if present
@@ -167,9 +189,34 @@ Generate a synthesis that answers the query comprehensively.""")
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
 
+            # Clean up control characters that break JSON parsing
+            # Remove or escape control characters except for allowed ones
+            content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
+
+            # Log the cleaned content for debugging
+            logger.debug(f"Cleaned LLM response (first 500 chars): {content[:500]}")
+
             result = json.loads(content)
             return result
 
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}")
+            logger.error(f"Problematic content (first 1000 chars): {content[:1000] if 'content' in locals() else 'N/A'}")
+
+            # Try to use JSON repair or extract what we can
+            try:
+                # Attempt to fix common JSON issues
+                result = json.loads(content)
+                logger.info("Successfully parsed with json5")
+                return result
+            except Exception as json5_error:
+                logger.error(f"json5 parsing also failed: {json5_error}")
+
+            # Final fallback
+            return {
+                "summary": f"Unable to parse LLM response. Please try again or check the logs.",
+                "findings": []
+            }
         except Exception as e:
             logger.error(f"Error generating synthesis: {e}")
             # Fallback to simple summary
@@ -265,3 +312,149 @@ Return ONLY a JSON array of 3 strings, each a specific question. Example:
         except Exception as e:
             logger.error(f"Error generating follow-ups: {e}")
             return []
+
+    def get_tools(self) -> List:
+        """
+        Get LangChain tools for this agent.
+
+        Returns:
+            List of LangChain tool functions
+        """
+        if self._tools is not None:
+            return self._tools
+
+        # Create a closure to capture self
+        agent_instance = self
+
+        @tool
+        def synthesize_articles(
+            query: str,
+            articles_json: str,
+            expertise_level: str = "intermediate",
+            language: str = "en"
+        ) -> str:
+            """
+            Synthesize information from multiple scientific articles into a comprehensive summary.
+
+            Args:
+                query: The search query or question to answer
+                articles_json: JSON string containing array of article data
+                expertise_level: Target expertise level (beginner, intermediate, expert)
+                language: Target language code (default: en)
+
+            Returns:
+                JSON string containing synthesized findings and summary
+            """
+            import json
+
+            try:
+                articles = json.loads(articles_json)
+                result = agent_instance.synthesize_search_results(
+                    query=query,
+                    articles=articles,
+                    expertise_level=expertise_level,
+                    language=language
+                )
+                return result.model_dump_json()
+            except Exception as e:
+                logger.error(f"Error in synthesize_articles tool: {e}")
+                return json.dumps({"error": str(e)})
+
+        @tool
+        def generate_follow_up_questions(query: str, findings_json: str) -> str:
+            """
+            Generate follow-up questions based on a query and findings.
+
+            Args:
+                query: Original search query
+                findings_json: JSON string containing array of findings
+
+            Returns:
+                JSON array of follow-up question strings
+            """
+            import json
+
+            try:
+                findings_data = json.loads(findings_json)
+                findings = [
+                    SynthesizedFinding(**f) for f in findings_data
+                ]
+                suggestions = agent_instance._generate_follow_ups(query, findings)
+                return json.dumps(suggestions)
+            except Exception as e:
+                logger.error(f"Error in generate_follow_up_questions tool: {e}")
+                return json.dumps([])
+
+        self._tools = [synthesize_articles, generate_follow_up_questions]
+        return self._tools
+
+    @property
+    def agent_executor(self) -> AgentExecutor:
+        """
+        Get a LangChain AgentExecutor that can be used in LangGraph graphs.
+
+        This property lazily creates and caches an AgentExecutor with tools
+        for synthesis operations.
+
+        Returns:
+            AgentExecutor configured with synthesis tools
+
+        Example:
+            >>> agent = SynthesisAgent()
+            >>> executor = agent.agent_executor
+            >>> result = executor.invoke({
+            ...     "input": "Synthesize these articles about natto..."
+            ... })
+        """
+        if self._agent_executor is not None:
+            return self._agent_executor
+
+        # Get tools
+        tools = self.get_tools()
+
+        # Pull a prompt from LangChain hub or use a custom one
+        try:
+            prompt = hub.pull("hwchase17/tool-calling-agent")
+        except Exception as e:
+            logger.warning(f"Could not pull prompt from hub: {e}. Using custom prompt.")
+            # Fallback to custom prompt
+            from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a scientific literature synthesis assistant.
+You have access to tools for synthesizing research articles and generating follow-up questions.
+Use these tools to help users understand scientific literature comprehensively."""),
+                ("human", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
+            ])
+
+        # Create the agent
+        agent = create_tool_calling_agent(self.llm, tools, prompt)
+
+        # Create the executor
+        self._agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            handle_parsing_errors=True
+        )
+
+        return self._agent_executor
+
+    def as_runnable(self):
+        """
+        Get the agent as a LangChain Runnable for use in LangGraph.
+
+        This is an alias for agent_executor that's more explicit about
+        LangGraph compatibility.
+
+        Returns:
+            AgentExecutor (which implements Runnable protocol)
+
+        Example:
+            >>> from langgraph.graph import StateGraph
+            >>> agent = SynthesisAgent()
+            >>> graph = StateGraph(...)
+            >>> graph.add_node("synthesis", agent.as_runnable())
+        """
+        return self.agent_executor
