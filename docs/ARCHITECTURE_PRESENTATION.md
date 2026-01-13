@@ -1,5 +1,4 @@
 # FoodScholar Architecture Overview
----
 
 ## Part 1: Architecture Overview 
 
