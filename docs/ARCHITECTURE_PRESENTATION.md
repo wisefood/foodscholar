@@ -67,7 +67,7 @@ async def summarize_search(request: SearchSummaryRequest):
     return await service.summarize_search(request)
 ```
 
----
+
 
 ## Part 3: Layer 2 - Service Layer
 
@@ -105,7 +105,7 @@ class SearchSummarizer:
         # 6. Return
 ```
 
----
+
 
 ## Part 4: Layer 3 - Agent Layer
 
@@ -137,7 +137,6 @@ class SynthesisAgent:
         # 5. Return structured response
 ```
 
----
 
 ## Part 5: Understanding Agents vs Tools
 
@@ -157,7 +156,6 @@ class SynthesisAgent:
 - **Tools** = Kitchen appliances (blender, oven, knife)
 - **Agents** = Chef (decides when/how to use each appliance)
 
----
 
 ## Part 6: Data Flow Example - Search Summary
 
@@ -189,7 +187,6 @@ class SynthesisAgent:
    - Returns HTTP response to client
 ```
 
----
 
 ## Part 7: Key Design Principles
 
@@ -213,7 +210,6 @@ Each layer can be tested independently with mocks
 ### 5. **Reusability**
 Services and agents can be used from multiple API endpoints
 
----
 
 ## Part 8: Other Key Components Explained
 
@@ -228,8 +224,6 @@ External service integrations
 - `GROQ_CHAT`: Groq LLM client pool
 - Database connections
 - Third-party APIs
-
----
 
 ## Part 9: LangChain Integration
 
@@ -255,10 +249,7 @@ executor = agent.agent_executor
 runnable = agent.as_runnable()
 ```
 
----
-
-
-## Part 10: Error Handling & Resilience
+## Part 10: Error Handling 
 
 ### Multi-Layer Error Handling:
 
@@ -291,7 +282,6 @@ except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))
 ```
 
----
 
 ## Part 11: Development Workflow
 
@@ -318,7 +308,6 @@ except Exception as e:
    - Integration tests for service
    - E2E tests for API
 
----
 
 ## Part 12: Best Practices
 
@@ -339,11 +328,9 @@ except Exception as e:
 - Hardcode configuration
 - Ignore errors silently
 
----
 
-## Part 13: Common Patterns
+## Part 13: Common Pattern for Adding New Functionality
 
-### Pattern 1: Adding a New Agent
 ```python
 # 1. Create agent class
 class MyNewAgent:
