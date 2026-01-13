@@ -74,18 +74,38 @@ class SearchSummaryResponse(BaseModel):
     )
 
 
+class ArticleResult(BaseModel):
+    """Article result from search."""
+
+    urn: str = Field(description="Article URN")
+    title: str = Field(description="Article title")
+    description: Optional[str] = Field(default=None, description="Article description")
+    abstract: Optional[str] = Field(default=None, description="Article abstract")
+    tags: Optional[List[str]] = Field(default=None, description="Article tags")
+    category: Optional[str] = Field(default=None, description="Article category")
+    authors: Optional[List[str]] = Field(default=None, description="List of authors")
+    venue: Optional[str] = Field(
+        default=None, description="Publication venue (journal/conference)"
+    )
+    publication_year: Optional[str] = Field(
+        default=None, description="Publication year"
+    )
+    score: Optional[float] = Field(
+        default=None,
+        description="Relevance score from search",
+        alias="_score"
+    )
+
+    class Config:
+        populate_by_name = True  # Allows using either 'score' or '_score'
+
+
 class SearchSummaryRequest(BaseModel):
     """Request model for search summarization."""
 
-    query: str = Field(description="Search query string")
-    filters: Optional[Dict[str, Any]] = Field(
-        default=None, description="Facet filters to apply (e.g., year range, journal)"
-    )
-    max_articles: int = Field(
-        default=10,
-        ge=1,
-        le=50,
-        description="Maximum number of articles to analyze (1-50)",
+    query: str = Field(description="Original search query string")
+    results: List[ArticleResult] = Field(
+        description="List of article search results to summarize"
     )
     language: str = Field(
         default="en", description="Language for the summary (ISO 639-1 code)"
