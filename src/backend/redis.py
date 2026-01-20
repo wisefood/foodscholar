@@ -32,7 +32,7 @@ class RedisClientSingleton:
         self._pool = redis.ConnectionPool(
             host=redis_host,
             port=redis_port,
-            db=2,
+            db=5,
             decode_responses=True,
             max_connections=10,
         )

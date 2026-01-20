@@ -1,13 +1,20 @@
 """FoodScholar API - Main Application."""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 import logsys
 import uvicorn
+from contextlib import asynccontextmanager
 
 from routers.generic import install_error_handler
 from api.v1 import search, sessions, enrich
+from workers.enrichment_worker import (
+    start_background_worker,
+    stop_background_worker,
+    get_worker,
+)
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -55,12 +62,40 @@ class Config:
             redis_port_env = redis_port_env.split(":")[-1]
         self.settings["REDIS_PORT"] = int(redis_port_env)
 
+        # Background worker configuration
+        self.settings["ENABLE_BACKGROUND_WORKER"] = (
+            os.getenv("ENABLE_BACKGROUND_WORKER", "false").lower() == "true"
+        )
+        self.settings["WORKER_BATCH_SIZE"] = int(os.getenv("WORKER_BATCH_SIZE", "50"))
+        self.settings["WORKER_POLL_INTERVAL"] = int(
+            os.getenv("WORKER_POLL_INTERVAL", "10")
+        )
+
+
 # Configure application settings
 config = Config()
 config.setup()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle startup and shutdown events."""
+    # Startup
+    if config.settings["ENABLE_BACKGROUND_WORKER"]:
+        logger.info("Starting background enrichment worker...")
+        start_background_worker()
+
+    yield
+
+    # Shutdown
+    if config.settings["ENABLE_BACKGROUND_WORKER"]:
+        logger.info("Stopping background enrichment worker...")
+        stop_background_worker()
+
+
 # Initialize FastAPI app
 app = FastAPI(
+    lifespan=lifespan,
     title="FoodScholar API",
     description="""
 FoodScholar: AI-powered scientific literature assistant for food science.
@@ -104,6 +139,7 @@ app.include_router(search.router, prefix="/api/v1")
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(enrich.router, prefix="/api/v1")
 
+
 @app.get("/")
 async def root():
     """Root endpoint - API information."""
@@ -125,13 +161,30 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {
+    health_data = {
         "status": "healthy",
         "service": "FoodScholar",
         "version": "1.0.0",
         "cache_enabled": config.settings["CACHE_ENABLED"],
         "elasticsearch_host": config.settings["ELASTIC_HOST"],
     }
+
+    # Add worker status if enabled
+    if config.settings["ENABLE_BACKGROUND_WORKER"]:
+        worker = get_worker()
+        health_data["background_worker"] = worker.get_stats()
+
+    return health_data
+
+
+@app.get("/api/v1/worker/status")
+async def worker_status():
+    """Get background worker status and statistics."""
+    if not config.settings["ENABLE_BACKGROUND_WORKER"]:
+        return {"enabled": False, "message": "Background worker is disabled"}
+
+    worker = get_worker()
+    return {"enabled": True, **worker.get_stats()}
 
 
 if __name__ == "__main__":
