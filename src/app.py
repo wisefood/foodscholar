@@ -41,8 +41,19 @@ class Config:
         self.settings["CACHE_ENABLED"] = (
             os.getenv("CACHE_ENABLED", "false").lower() == "true"
         )
-        self.settings["REDIS_HOST"] = os.getenv("REDIS_HOST", "redis")
-        self.settings["REDIS_PORT"] = int(os.getenv("REDIS_PORT", 6379))
+        # Handle REDIS_HOST - parse from URL if needed
+        redis_host_env = os.getenv("REDIS_HOST", "redis")
+        if "://" in redis_host_env:
+            # Extract host from URL like tcp://10.111.3.185:6379
+            redis_host_env = redis_host_env.split("://")[1].split(":")[0]
+        self.settings["REDIS_HOST"] = redis_host_env
+
+        # Handle REDIS_PORT - parse from URL if needed
+        redis_port_env = os.getenv("REDIS_PORT", "6379")
+        if "://" in redis_port_env:
+            # Extract port from URL like tcp://10.111.3.185:6379
+            redis_port_env = redis_port_env.split(":")[-1]
+        self.settings["REDIS_PORT"] = int(redis_port_env)
 
 # Configure application settings
 config = Config()
