@@ -1,7 +1,8 @@
 """Article enrichment API endpoints."""
 import logging
 from fastapi import APIRouter, HTTPException
-from services.article_enricher import ArticleEnricher, ArticleInput, EnrichmentResponse
+from services.article_enricher import ArticleEnricher
+from src.models.enrich import ArticleInput, EnrichmentResponse
 
 logger = logging.getLogger(__name__)
 

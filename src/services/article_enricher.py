@@ -1,39 +1,9 @@
 """Article enrichment service for scientific articles."""
 import logging
 from typing import Dict, Any, Optional
-from pydantic import BaseModel, Field
+from models.enrich import ArticleInput, EnrichmentResponse
 from agents.enrichment_agent import EnrichmentAgent
-
 logger = logging.getLogger(__name__)
-
-
-class ArticleInput(BaseModel):
-    """Input model for article enrichment."""
-
-    urn: str = Field(description="Article URN (unique identifier)")
-    title: str = Field(description="Article title")
-    abstract: str = Field(description="Article abstract text")
-    authors: Optional[str] = Field(
-        default=None, description="Comma-separated list of authors"
-    )
-
-
-class EnrichmentResponse(BaseModel):
-    """Response model for article enrichment."""
-
-    urn: str = Field(description="Article URN")
-    title: str = Field(description="Article title")
-    keywords: list[str] = Field(description="Extracted and homogenized keywords")
-    reader_group: str = Field(description="Target reader group for this article")
-    population_group: str = Field(description="Study population group")
-    study_type: str = Field(description="Type of study (RCT, meta-analysis, etc.)")
-    evaluation: Dict[str, Any] = Field(
-        description="User value score, actionability, verdict, and safety info"
-    )
-    annotations: Dict[str, Any] = Field(
-        description="Simplified abstract, glossary, and Q&A sections"
-    )
-
 
 class ArticleEnricher:
     """Service for enriching scientific articles with annotations and metadata."""
