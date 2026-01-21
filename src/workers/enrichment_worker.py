@@ -61,6 +61,9 @@ class BackgroundEnrichmentWorker:
         # Statistics
         self.stats = {"processed": 0, "failed": 0, "skipped": 0, "started_at": None}
 
+        # Pagination cursor - stored in Redis to persist across restarts
+        self._cursor_key = "enrichment:cursor"
+
         logger.info("Background enrichment worker initialized")
 
     def start(self):
@@ -94,12 +97,12 @@ class BackgroundEnrichmentWorker:
 
         logger.info(f"Background enrichment worker stopped. Stats: {self.stats}")
 
-    def _try_claim_article(self, article_id: int) -> bool:
+    def _try_claim_article(self, article_id: str) -> bool:
         """
         Try to claim an article for processing using Redis lock.
 
         Args:
-            article_id: Article ID to claim
+            article_id: Article URN to claim
 
         Returns:
             True if successfully claimed, False otherwise
@@ -116,26 +119,37 @@ class BackgroundEnrichmentWorker:
 
         return bool(acquired)
 
-    def _release_lock(self, article_id: int):
+    def _release_lock(self, article_id: str):
         """Release the processing lock for an article."""
         lock_key = f"enrichment:lock:{article_id}"
         self.redis.delete(lock_key)
 
-    def _is_processed(self, article_id: int) -> bool:
+    def _is_processed(self, article_id: str) -> bool:
         """Check if article has already been successfully processed."""
         return self.redis.client.sismember("enrichment:processed", article_id)
 
-    def _mark_processed(self, article_id: int):
+    def _mark_processed(self, article_id: str):
         """Mark article as successfully processed."""
         self.redis.client.sadd("enrichment:processed", article_id)
 
-    def _get_retry_count(self, article_id: int) -> int:
+    def _is_permanently_failed(self, article_id: str) -> bool:
+        """Check if article has permanently failed (exceeded max retries)."""
+        return self.redis.client.sismember("enrichment:failed", article_id)
+
+    def _mark_permanently_failed(self, article_id: str):
+        """Mark article as permanently failed (won't be retried)."""
+        self.redis.client.sadd("enrichment:failed", article_id)
+        # Clean up the retry key since we won't retry anymore
+        retry_key = f"enrichment:retry:{article_id}"
+        self.redis.delete(retry_key)
+
+    def _get_retry_count(self, article_id: str) -> int:
         """Get current retry count for an article."""
         retry_key = f"enrichment:retry:{article_id}"
         count = self.redis.get(retry_key)
         return int(count) if count else 0
 
-    def _increment_retry(self, article_id: int) -> int:
+    def _increment_retry(self, article_id: str) -> int:
         """Increment and return retry count."""
         retry_key = f"enrichment:retry:{article_id}"
         new_count = self.redis.client.incr(retry_key)
@@ -192,6 +206,12 @@ class BackgroundEnrichmentWorker:
                 self.stats["skipped"] += 1
                 return True
 
+            # Check if permanently failed (exceeded retries previously)
+            if self._is_permanently_failed(article_id):
+                logger.debug(f"Article {article_id} permanently failed, skipping")
+                self.stats["skipped"] += 1
+                return True
+
             # Try to claim the article
             if not self._try_claim_article(article_id):
                 logger.debug(f"Article {article_id} locked by another worker")
@@ -201,7 +221,8 @@ class BackgroundEnrichmentWorker:
             # Check retry count
             retry_count = self._get_retry_count(article_id)
             if retry_count >= self.max_retries:
-                logger.warning(f"Article {article_id} exceeded max retries")
+                logger.warning(f"Article {article_id} exceeded max retries, marking as permanently failed")
+                self._mark_permanently_failed(article_id)
                 self._release_lock(article_id)
                 self.stats["failed"] += 1
                 return False
@@ -247,34 +268,55 @@ class BackgroundEnrichmentWorker:
 
             return False
 
+    def _get_cursor(self) -> int:
+        """Get current pagination cursor from Redis."""
+        cursor = self.redis.get(self._cursor_key)
+        return int(cursor) if cursor else 1
+
+    def _set_cursor(self, cursor: int):
+        """Save pagination cursor to Redis."""
+        self.redis.set(self._cursor_key, str(cursor))
+
     def _run(self):
         """Main worker loop running in background thread."""
         logger.info("Worker thread started")
 
         while self._running:
             try:
-                # Fetch articles from catalog
+                # Get current cursor position
+                cursor = self._get_cursor()
+
+                # Fetch articles from catalog with pagination
                 client = WISEFOOD.get_client()
                 try:
-                    articles = client.articles[1 : self.batch_size]
-                    logger.debug(f"Fetched {len(articles)} articles")
+                    end_idx = cursor + self.batch_size - 1
+                    articles = client.articles[cursor:end_idx]
+                    logger.debug(f"Fetched {len(articles)} articles (cursor={cursor})")
                 finally:
                     WISEFOOD.return_client(client)
 
                 if not articles:
-                    logger.debug(f"No articles found, sleeping {self.poll_interval}s")
+                    # No more articles - reset cursor to start over
+                    logger.info("Reached end of catalog, resetting cursor to 1")
+                    self._set_cursor(1)
                     self._shutdown_event.wait(timeout=self.poll_interval)
                     continue
 
                 # Process each article
+                processed_in_batch = 0
                 for article in articles:
                     if not self._running:
                         break
 
                     self._process_article(article)
+                    processed_in_batch += 1
+
+                # Advance cursor for next batch
+                new_cursor = cursor + len(articles)
+                self._set_cursor(new_cursor)
 
                 # Wait before next batch
-                logger.debug(f"Batch complete. Stats: {self.stats}")
+                logger.debug(f"Batch complete (processed {processed_in_batch}). Stats: {self.stats}")
                 self._shutdown_event.wait(timeout=self.poll_interval)
 
             except Exception as e:
@@ -289,6 +331,7 @@ class BackgroundEnrichmentWorker:
         return {
             **self.stats,
             "running": self._running,
+            "cursor": self._get_cursor(),
             "uptime_seconds": (
                 (
                     datetime.now() - datetime.fromisoformat(self.stats["started_at"])
