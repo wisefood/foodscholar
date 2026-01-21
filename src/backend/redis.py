@@ -1,10 +1,11 @@
 """Redis client singleton for caching."""
-import os
 import redis
 import threading
 import logging
 import json
 from typing import Optional
+
+from config import config
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,8 @@ class RedisClientSingleton:
 
     def _initialize(self):
         """Initialize Redis connection pool."""
-        redis_host = os.getenv("REDIS_HOST", "redis")
-        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        redis_host = config.settings["REDIS_HOST"]
+        redis_port = config.settings["REDIS_PORT"]
 
         self._pool = redis.ConnectionPool(
             host=redis_host,
@@ -158,8 +159,8 @@ class RedisClient:
 
     @classmethod
     def _initialize_redis(cls):
-        redis_host = os.getenv("REDIS_HOST", "redis")
-        redis_port = int(os.getenv("REDIS_PORT", 6379))
+        redis_host = config.settings["REDIS_HOST"]
+        redis_port = config.settings["REDIS_PORT"]
 
         cls._pool = redis.ConnectionPool(
             host=redis_host,
