@@ -183,7 +183,7 @@ class BackgroundEnrichmentWorker:
         Returns:
             True if successful, False otherwise
         """
-        article_id = article.id if hasattr(article, "id") else article.urn
+        article_id = article.urn
 
         try:
             # Check if already processed
