@@ -27,7 +27,7 @@ class RedisClientSingleton:
     def _initialize(self):
         """Initialize Redis connection pool."""
         redis_host = os.getenv("REDIS_HOST", "redis")
-        redis_port = int(os.getenv("REDIS_PORT", 6379))
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
 
         self._pool = redis.ConnectionPool(
             host=redis_host,
