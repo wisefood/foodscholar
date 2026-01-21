@@ -14,7 +14,7 @@ from minio.error import S3Error
 from io import BytesIO
 from datetime import datetime
 from utils import is_valid_uuid
-from app import config
+from config import config
 import uuid
 from exceptions import (
     NotAllowedError,

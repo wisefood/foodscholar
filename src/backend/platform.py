@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 from threading import Lock
 from wisefood import DataClient, Credentials
-from app import config
+from config import config
 logger = logging.getLogger(__name__)
 
 
