@@ -1,5 +1,5 @@
 """Q&A models and schemas for non-contextual question answering."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Literal
 
 
@@ -148,19 +148,43 @@ class QAResponse(BaseModel):
 
 
 class QAFeedbackRequest(BaseModel):
-    """Request model for submitting feedback on dual-answer A/B tests."""
+    """Request model for submitting feedback on QA answers."""
 
     request_id: str = Field(
         description="The request_id from the QAResponse being evaluated"
     )
-    preferred_answer: Literal["a", "b", "neither", "both"] = Field(
-        description="Which answer the user preferred"
+    preferred_answer: Optional[Literal["a", "b", "neither", "both"]] = Field(
+        default=None,
+        description=(
+            "Dual-answer preference (A/B feedback only). "
+            "Use when both primary and secondary answers are shown."
+        ),
+    )
+    helpfulness: Optional[Literal["helpful", "not_helpful"]] = Field(
+        default=None,
+        description=(
+            "General helpfulness feedback. "
+            "Use for single-answer or overall quality feedback."
+        ),
+    )
+    target_answer: Literal["primary", "secondary", "overall"] = Field(
+        default="overall",
+        description="Which answer the feedback targets (default: overall).",
     )
     reason: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Optional reason for preference",
     )
+
+    @model_validator(mode="after")
+    def validate_feedback_signal(self):
+        """Require at least one concrete feedback signal."""
+        if self.preferred_answer is None and self.helpfulness is None:
+            raise ValueError(
+                "Provide at least one of 'preferred_answer' or 'helpfulness'."
+            )
+        return self
 
 
 class QAFeedbackResponse(BaseModel):

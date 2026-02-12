@@ -70,7 +70,10 @@ class QAFeedbackRecord(Base):
         nullable=False,
         index=True,
     )
-    preferred_answer = Column(String(16), nullable=False)
+    preferred_answer = Column(String(16), nullable=True)
+    helpfulness = Column(String(24), nullable=True)
+    target_answer = Column(String(16), nullable=False, default="overall")
+    feedback_mode = Column(String(24), nullable=False, default="general")
     reason = Column(Text, nullable=True)
 
     created_at = Column(

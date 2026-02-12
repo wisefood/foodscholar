@@ -81,17 +81,28 @@ async def ask_question(request: QARequest):
 @router.post("/feedback", response_model=QAFeedbackResponse)
 async def submit_feedback(request: QAFeedbackRequest):
     """
-    Submit feedback on a dual-answer A/B test.
+    Submit feedback on a QA answer.
 
-    When you receive a response with both `primary_answer` and `secondary_answer`,
-    use the `request_id` from the response to submit which answer you preferred.
+    Use `request_id` from `/qa/ask` and provide either:
+    - `preferred_answer` for dual-answer A/B preference, and/or
+    - `helpfulness` for general answer quality feedback.
 
-    **Example:**
+    **Example (dual-answer A/B):**
     ```json
     {
         "request_id": "550e8400-e29b-41d4-a716-446655440000",
         "preferred_answer": "a",
         "reason": "More detailed citations"
+    }
+    ```
+
+    **Example (single-answer/general):**
+    ```json
+    {
+        "request_id": "550e8400-e29b-41d4-a716-446655440000",
+        "helpfulness": "helpful",
+        "target_answer": "primary",
+        "reason": "Clear and actionable"
     }
     ```
     """

@@ -372,19 +372,29 @@ class QAService:
         self, feedback: QAFeedbackRequest
     ) -> QAFeedbackResponse:
         """Store user feedback to PostgreSQL."""
+        feedback_mode = (
+            "ab_preference" if feedback.preferred_answer is not None else "general"
+        )
         try:
             factory = POSTGRES_ASYNC_SESSION_FACTORY()
             async with factory() as session:
                 record = QAFeedbackRecord(
                     request_id=uuid.UUID(feedback.request_id),
                     preferred_answer=feedback.preferred_answer,
+                    helpfulness=feedback.helpfulness,
+                    target_answer=feedback.target_answer,
+                    feedback_mode=feedback_mode,
                     reason=feedback.reason,
                 )
                 session.add(record)
                 await session.commit()
                 logger.info(
-                    "Recorded QA feedback for request %s: %s",
-                    feedback.request_id, feedback.preferred_answer,
+                    "Recorded QA feedback for request %s: mode=%s, preference=%s, helpfulness=%s, target=%s",
+                    feedback.request_id,
+                    feedback_mode,
+                    feedback.preferred_answer,
+                    feedback.helpfulness,
+                    feedback.target_answer,
                 )
         except Exception as e:
             logger.error(
