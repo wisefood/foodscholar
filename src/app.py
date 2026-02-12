@@ -9,7 +9,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 
 from routers.generic import install_error_handler
-from api.v1 import search, sessions, enrich
+from api.v1 import search, sessions, enrich, qa
 from workers.enrichment_worker import (
     start_background_worker,
     stop_background_worker,
@@ -53,6 +53,11 @@ FoodScholar: AI-powered scientific literature assistant for food science.
 - Expertise-level adjusted summaries (beginner/intermediate/expert)
 - Intelligent caching for performance
 
+### Question Answering
+- Non-contextual Q&A with semantic article retrieval
+- Simple mode (automatic RAG) and advanced mode (custom model/RAG selection)
+- A/B testing with dual-answer feedback
+
 ### Chat Sessions
 - Conversational interface for food and nutrition questions
 - Context-aware responses with memory
@@ -61,6 +66,7 @@ FoodScholar: AI-powered scientific literature assistant for food science.
 ## API Organization
 
 - `/api/v1/search` - Search summarization endpoints
+- `/api/v1/qa` - Question answering endpoints
 - `/api/v1/sessions` - Chat session management
     """,
     version="1.0.0",
@@ -83,6 +89,7 @@ install_error_handler(app)
 app.include_router(search.router, prefix="/api/v1")
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(enrich.router, prefix="/api/v1")
+app.include_router(qa.router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -95,6 +102,9 @@ async def root():
         "endpoints": {
             "search_summaries": "/api/v1/search/summarize",
             "enrich_article": "/api/v1/enrich/article",
+            "qa_ask": "/api/v1/qa/ask",
+            "qa_feedback": "/api/v1/qa/feedback",
+            "qa_models": "/api/v1/qa/models",
             "trending": "/api/v1/search/trending",
             "chat": "/api/v1/sessions/chat",
             "docs": "/docs",

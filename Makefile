@@ -8,7 +8,7 @@ IMGTAG=wisefood/foodscholar:latest
 all: build push
 
 build:
-	$(DOCKER) build . -t $(IMGTAG)
+	$(DOCKER) build . --no-cache -t $(IMGTAG)
 
 push:
 	$(DOCKER) push $(IMGTAG)
