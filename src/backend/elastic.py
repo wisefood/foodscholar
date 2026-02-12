@@ -6,7 +6,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-ELASTIC_HOST = os.getenv("ELASTIC_HOST", "http://elasticsearch:9200")
+ELASTIC_HOST = os.getenv("ELASTIC_HOST", "http://elastic:9200")
 ES_DIM = int(os.getenv("ES_DIM", 384))
 
 
@@ -28,7 +28,6 @@ class ElasticsearchClientSingleton:
                         # max_retries=3,
                         # retry_on_timeout=True,
                     )
-                    instance._bootstrap()
                     cls._instance = instance
         return cls._instance
 

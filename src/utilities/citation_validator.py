@@ -150,12 +150,21 @@ def create_citation_from_article(
     Returns:
         Citation object
     """
+    # Extract year as int from publication_year (e.g. "2017-01-01" -> 2017)
+    raw_year = article_metadata.get("publication_year") or article_metadata.get("year")
+    year = None
+    if raw_year:
+        try:
+            year = int(str(raw_year)[:4])
+        except (ValueError, TypeError):
+            pass
+
     return Citation(
         article_urn=article_metadata.get("urn", ""),
         article_title=article_metadata.get("title", "Unknown Title"),
         authors=article_metadata.get("authors", []),
-        year=article_metadata.get("year"),
-        journal=article_metadata.get("journal"),
+        year=year,
+        journal=article_metadata.get("venue") or article_metadata.get("journal"),
         section=section,
         quote=quote,
         confidence=confidence,

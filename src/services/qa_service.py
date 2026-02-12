@@ -18,6 +18,8 @@ from models.qa import (
 )
 from agents.qa_agent import QAAgent
 from backend.elastic import ELASTIC_CLIENT
+from backend.postgres import POSTGRES_ASYNC_SESSION_FACTORY
+from models.db import QARequestRecord, QAFeedbackRecord
 from utilities.cache import CacheManager
 from exceptions import InvalidError
 
@@ -121,11 +123,12 @@ class QAService:
         # Dual-answer logic (simple mode only)
         secondary_answer: Optional[QAAnswer] = None
         dual_feedback: Optional[DualAnswerFeedback] = None
+        dual_strategy: Optional[str] = None
         if request.mode == "simple" and self._should_generate_dual_answer(
             request.question
         ):
-            secondary_answer, dual_feedback = self._generate_secondary_answer(
-                request, articles, request_id
+            secondary_answer, dual_feedback, dual_strategy = (
+                self._generate_secondary_answer(request, articles, request_id)
             )
 
         response = QAResponse(
@@ -147,7 +150,60 @@ class QAService:
                 cache_key, response.model_dump(), ttl=TTL_QA_RESPONSE
             )
 
+        # Persist to PostgreSQL
+        await self._persist_request(
+            request, response, effective_model, effective_rag, dual_strategy
+        )
+
         return response
+
+    async def _persist_request(
+        self,
+        request: QARequest,
+        response: QAResponse,
+        effective_model: str,
+        effective_rag: bool,
+        dual_strategy: Optional[str] = None,
+    ) -> None:
+        """Persist the QA request and response to PostgreSQL (best-effort)."""
+        try:
+            factory = POSTGRES_ASYNC_SESSION_FACTORY()
+            async with factory() as session:
+                record = QARequestRecord(
+                    id=uuid.UUID(response.request_id),
+                    question=request.question,
+                    mode=request.mode,
+                    model=effective_model,
+                    rag_enabled=effective_rag,
+                    top_k=request.top_k,
+                    expertise_level=request.expertise_level,
+                    language=request.language,
+                    user_id=request.user_id,
+                    member_id=request.member_id,
+                    primary_answer=response.primary_answer.model_dump(),
+                    secondary_answer=(
+                        response.secondary_answer.model_dump()
+                        if response.secondary_answer
+                        else None
+                    ),
+                    dual_strategy=dual_strategy,
+                    retrieved_article_urns=[
+                        a.urn for a in response.retrieved_articles
+                    ],
+                    confidence=response.primary_answer.confidence,
+                    articles_consulted=response.primary_answer.articles_consulted,
+                    cache_hit=response.cache_hit,
+                )
+                session.add(record)
+                await session.commit()
+                logger.info(
+                    "Persisted QA request %s to PostgreSQL", response.request_id
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to persist QA request %s: %s",
+                response.request_id, e, exc_info=True,
+            )
 
     def _retrieve_articles(
         self, question: str, top_k: int
@@ -176,7 +232,6 @@ class QAService:
                     RetrievedArticle(
                         urn=r.get("urn", r.get("_id", "")),
                         title=r.get("title", ""),
-                        abstract=r.get("abstract"),
                         authors=r.get("authors"),
                         venue=r.get("venue"),
                         publication_year=r.get("publication_year"),
@@ -255,8 +310,12 @@ class QAService:
         request: QARequest,
         articles: List[Dict[str, Any]],
         request_id: str,
-    ) -> Tuple[QAAnswer, DualAnswerFeedback]:
-        """Generate a secondary answer using a different configuration."""
+    ) -> Tuple[QAAnswer, DualAnswerFeedback, str]:
+        """Generate a secondary answer using a different configuration.
+
+        Returns:
+            Tuple of (secondary_answer, dual_feedback, strategy_name)
+        """
         strategy_name, primary_cfg, secondary_cfg = self._select_dual_strategy()
 
         secondary_model = secondary_cfg.get("model", DEFAULT_GROQ_MODEL)
@@ -307,27 +366,31 @@ class QAService:
             answer_b_label=secondary_label,
         )
 
-        return secondary_answer, feedback
+        return secondary_answer, feedback, strategy_name
 
     async def submit_feedback(
         self, feedback: QAFeedbackRequest
     ) -> QAFeedbackResponse:
-        """Store user feedback for A/B testing analysis."""
-        feedback_key = f"qa_feedback:{feedback.request_id}"
-
-        feedback_data = {
-            "request_id": feedback.request_id,
-            "preferred_answer": feedback.preferred_answer,
-            "reason": feedback.reason,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-        self.cache_manager.set(feedback_key, feedback_data, ttl=TTL_QA_FEEDBACK)
-
-        logger.info(
-            "Recorded QA feedback for request %s: %s",
-            feedback.request_id, feedback.preferred_answer,
-        )
+        """Store user feedback to PostgreSQL."""
+        try:
+            factory = POSTGRES_ASYNC_SESSION_FACTORY()
+            async with factory() as session:
+                record = QAFeedbackRecord(
+                    request_id=uuid.UUID(feedback.request_id),
+                    preferred_answer=feedback.preferred_answer,
+                    reason=feedback.reason,
+                )
+                session.add(record)
+                await session.commit()
+                logger.info(
+                    "Recorded QA feedback for request %s: %s",
+                    feedback.request_id, feedback.preferred_answer,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to persist QA feedback for request %s: %s",
+                feedback.request_id, e, exc_info=True,
+            )
 
         return QAFeedbackResponse(
             request_id=feedback.request_id,

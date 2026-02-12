@@ -50,10 +50,20 @@ class QARequest(BaseModel):
         default="en",
         description="Language for the answer (ISO 639-1 code)",
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Optional user identifier for tracking",
+    )
+    member_id: Optional[str] = Field(
+        default=None,
+        description="Optional member identifier for tracking",
+    )
 
 
 class QAAnswer(BaseModel):
     """A single Q&A answer with citations and metadata."""
+
+    model_config = {"protected_namespaces": ()}
 
     answer: str = Field(
         description="Concise, explainable answer in markdown format"
@@ -82,7 +92,6 @@ class RetrievedArticle(BaseModel):
 
     urn: str = Field(description="Article URN")
     title: str = Field(description="Article title")
-    abstract: Optional[str] = Field(default=None, description="Article abstract")
     authors: Optional[List[str]] = Field(default=None, description="Article authors")
     venue: Optional[str] = Field(default=None, description="Publication venue")
     publication_year: Optional[str] = Field(

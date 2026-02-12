@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from routers.generic import install_error_handler
 from api.v1 import search, sessions, enrich, qa
+from backend.db_init import init_db
 from workers.enrichment_worker import (
     start_background_worker,
     stop_background_worker,
@@ -26,6 +27,8 @@ logsys.configure()
 async def lifespan(app: FastAPI):
     """Handle startup and shutdown events."""
     # Startup
+    init_db()
+
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Starting background enrichment worker...")
         start_background_worker()

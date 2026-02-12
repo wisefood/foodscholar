@@ -41,6 +41,15 @@ class Config:
         self.settings["WORKER_POLL_INTERVAL"] = int(
             os.getenv("WORKER_POLL_INTERVAL", "10")
         )
+        self.settings["POSTGRES_HOST"] = os.getenv("POSTGRES_HOST", "localhost")
+        self.settings["POSTGRES_PORT"] = int(os.getenv("POSTGRES_PORT", 5432))
+        self.settings["POSTGRES_USER"] = os.getenv("POSTGRES_USER", "postgres")
+        self.settings["POSTGRES_PASSWORD"] = os.getenv("POSTGRES_PASSWORD", "postgres")
+        self.settings["POSTGRES_DB"] = os.getenv("POSTGRES_DB", "wisefood")
+        self.settings["POSTGRES_POOL_SIZE"] = int(os.getenv("POSTGRES_POOL_SIZE", 10))
+        self.settings["POSTGRES_MAX_OVERFLOW"] = int(
+            os.getenv("POSTGRES_MAX_OVERFLOW", 20)
+        )
 
 
 # Configure application settings

@@ -70,7 +70,7 @@ LANGUAGE: Respond in {language}.
 
 CRITICAL RULES:
 1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
-2. Every factual claim MUST cite at least one article by its URN.
+2. Every factual claim MUST cite at least one article using a markdown link in the format: [First Author et al. (Year)](/articles/ARTICLE_URN). For example: [Quezada et al. (2017)](/articles/urn:article:physical-activity-and-calorie-intake-med). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors.
 3. If the articles do not contain sufficient information, say so explicitly.
 4. Do NOT fabricate information beyond what the articles support.
 5. Clearly indicate when findings are preliminary vs well-established.
@@ -81,18 +81,18 @@ Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON 
 Ensure all strings are properly escaped (use \\n for newlines, \\" for quotes).
 
 JSON structure:
-{{
-  "answer": "Markdown-formatted concise answer with inline citations referencing article URNs",
+{{{{
+  "answer": "Markdown-formatted concise answer with inline citations as markdown links",
   "cited_articles": [
-    {{
+    {{{{
       "urn": "the article URN",
       "section": "abstract",
       "confidence": "high"
-    }}
+    }}}}
   ],
   "overall_confidence": "high",
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-}}
+}}}}
 
 IMPORTANT: Return ONLY the JSON object."""),
             ("human", f"""Question: {question}
@@ -152,11 +152,11 @@ CRITICAL RULES:
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
 
-{{
+{{{{
   "answer": "Markdown-formatted concise answer",
   "overall_confidence": "high or medium or low",
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-}}"""),
+}}}}"""),
             ("human", f"""Question: {question}
 
 Answer the question concisely using your scientific knowledge."""),
@@ -190,7 +190,14 @@ Answer the question concisely using your scientific knowledge."""),
 - Authors: {author_str}
 - Year: {article.get('publication_year', 'N/A')}
 - Journal: {article.get('venue', 'N/A')}
-- Abstract: {abstract[:600]}"""
+- Study Type: {article.get('ai_category', 'N/A')}
+- Abstract: {abstract}"""
+
+            ai_key_takeaways = article.get("ai_key_takeaways", [])
+            if ai_key_takeaways:
+                takeaways = "; ".join(ai_key_takeaways)
+                summary += f"\n- Key Takeaways: {takeaways}"
+
             summaries.append(summary)
         return "\n\n".join(summaries)
 
