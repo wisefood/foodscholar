@@ -7,6 +7,7 @@ import logging
 import logsys
 import uvicorn
 from contextlib import asynccontextmanager
+from sqlalchemy import text
 
 from routers.generic import install_error_handler
 from api.v1 import search, sessions, enrich, qa
@@ -29,11 +30,22 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
 
+    from backend.postgres import POSTGRES_ASYNC_ENGINE
+    eng = POSTGRES_ASYNC_ENGINE()
+    async with eng.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    logger.info("Database connection OK")
+
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Starting background enrichment worker...")
         start_background_worker()
 
     yield
+
+    logger.info("App shutdown: closing DB connections")
+    from backend.postgres import PostgresConnectionSingleton
+    await PostgresConnectionSingleton.close()
+    logger.info("DB connections closed")
 
     # Shutdown
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
