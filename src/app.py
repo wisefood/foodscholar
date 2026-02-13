@@ -120,6 +120,8 @@ async def root():
             "qa_ask": "/api/v1/qa/ask",
             "qa_feedback": "/api/v1/qa/feedback",
             "qa_models": "/api/v1/qa/models",
+            "qa_questions": "/api/v1/qa/questions",
+            "qa_tips_of_the_day": "/api/v1/qa/tips",
             "trending": "/api/v1/search/trending",
             "chat": "/api/v1/sessions/chat",
             "docs": "/docs",

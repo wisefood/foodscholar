@@ -9,6 +9,8 @@ from models.qa import (
     QAResponse,
     QAFeedbackRequest,
     QAFeedbackResponse,
+    SimpleNutriQuestionsResponse,
+    TipsOfTheDayResponse,
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
 )
@@ -129,6 +131,32 @@ async def list_available_models():
         "available_models": AVAILABLE_GROQ_MODELS,
         "default_model": DEFAULT_GROQ_MODEL,
     }
+
+
+@router.get("/questions", response_model=SimpleNutriQuestionsResponse)
+async def get_simple_nutri_questions():
+    """Get 4 simple starter nutrition questions cached for 30 minutes."""
+    try:
+        return qa_service.get_simple_nutri_questions()
+    except Exception as e:
+        logger.error("Error getting starter nutrition questions: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error generating starter questions. Please try again.",
+            extra={"cause": e.__class__.__name__},
+        )
+
+
+@router.get("/tips", response_model=TipsOfTheDayResponse)
+async def get_tips_of_the_day():
+    """Get 2 did_you_know facts and 2 tips, cached for 30 minutes."""
+    try:
+        return qa_service.get_tips_of_the_day()
+    except Exception as e:
+        logger.error("Error getting nutrition tips of the day: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error generating tips of the day. Please try again.",
+            extra={"cause": e.__class__.__name__},
+        )
 
 
 @router.delete("/cache/clear")

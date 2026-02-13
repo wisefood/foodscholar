@@ -193,3 +193,38 @@ class QAFeedbackResponse(BaseModel):
     request_id: str = Field(description="Request identifier")
     status: str = Field(description="Feedback status")
     message: str = Field(description="Confirmation message")
+
+
+class SimpleNutriQuestionsResponse(BaseModel):
+    """Response model for starter nutrition questions."""
+
+    questions: List[str] = Field(
+        description="A list of simple starter nutrition questions"
+    )
+    generated_at: str = Field(
+        description="ISO timestamp when these questions were generated"
+    )
+    cache_hit: bool = Field(
+        default=False,
+        description="Whether this result came from cache",
+    )
+
+
+class TipsOfTheDayResponse(BaseModel):
+    """Response model for nutrition tips/facts of the day."""
+
+    did_you_know: List[str] = Field(
+        default_factory=list,
+        description="Exactly 2 short human-focused 'Did you know?' nutrition facts"
+    )
+    tips: List[str] = Field(
+        default_factory=list,
+        description="Exactly 2 short human-focused nutrition tips"
+    )
+    generated_at: str = Field(
+        description="ISO timestamp when these tips were generated"
+    )
+    cache_hit: bool = Field(
+        default=False,
+        description="Whether this result came from cache",
+    )
