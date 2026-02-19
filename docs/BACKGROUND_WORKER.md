@@ -159,8 +159,10 @@ docker logs -f foodscholar-api
 The worker uses these Redis keys:
 
 - `enrichment:processed` (SET) - IDs of successfully processed articles
+- `enrichment:cursor` (STRING) - 0-based offset into the catalog (persists pagination across restarts)
 - `enrichment:lock:{article_id}` (STRING, 300s TTL) - Processing locks
 - `enrichment:retry:{article_id}` (STRING, 24h TTL) - Retry counts
+- `enrichment:failed` (SET) - IDs of permanently failed articles (exceeded retries)
 
 ### Clear Processed Set
 
@@ -169,6 +171,15 @@ To reprocess all articles:
 ```bash
 redis-cli
 > DEL enrichment:processed
+```
+
+### Reset Cursor
+
+If the worker seems “stuck” or you added new articles and want to restart scanning from the beginning:
+
+```bash
+redis-cli
+> DEL enrichment:cursor
 ```
 
 ### Check Locks

@@ -62,6 +62,7 @@ class BackgroundEnrichmentWorker:
         self.stats = {"processed": 0, "failed": 0, "skipped": 0, "started_at": None}
 
         # Pagination cursor - stored in Redis to persist across restarts
+        # NOTE: This is a 0-based offset into `client.articles` (see wisefood EntityProxy slicing).
         self._cursor_key = "enrichment:cursor"
 
         logger.info("Background enrichment worker initialized")
@@ -161,10 +162,12 @@ class BackgroundEnrichmentWorker:
         Extract fields from enriched data for storage.
 
         Returns:
-            Tuple of (direct_fields, extras_fields)
+            Tuple of (enhance_fields, article_fields, extras_fields)
         """
-        # Direct fields for enhance_self
-        direct_fields = {}
+        # NOTE: The data-catalog `/enhance` endpoint currently validates `fields` keys
+        # and only accepts: ai_tags, ai_category, ai_key_takeaways.
+        enhance_fields: Dict[str, Any] = {}
+        article_fields: Dict[str, Any] = {}
 
         def _clean_str_list(value: Any, *, default: Optional[list[str]] = None) -> list[str]:
             if isinstance(value, str) and value.strip():
@@ -201,7 +204,7 @@ class BackgroundEnrichmentWorker:
                     continue
                 combined_tags.append(tt)
         if combined_tags:
-            direct_fields["ai_tags"] = combined_tags
+            enhance_fields["ai_tags"] = combined_tags
 
         keywords = _clean_str_list(enriched_data.get("keywords"), default=[])
         tags = _clean_str_list(enriched_data.get("tags"), default=["Other"])
@@ -210,50 +213,48 @@ class BackgroundEnrichmentWorker:
             enriched_data.get("hard_exclusion_flags"), default=["None"]
         )
 
-        direct_fields["keywords"] = keywords
-        direct_fields["tags"] = tags
-        direct_fields["topics"] = topics
-        direct_fields["hard_exclusion_flags"] = hard_exclusion_flags
-
         reader_group = _clean_optional_str(enriched_data.get("reader_group"))
-        if reader_group is not None:
-            direct_fields["reader_group"] = reader_group
-
         age_group = _clean_optional_str(enriched_data.get("age_group"))
-        if age_group is not None:
-            direct_fields["age_group"] = age_group
-
         population_group = _clean_optional_str(enriched_data.get("population_group"))
-        if population_group is not None:
-            direct_fields["population_group"] = population_group
-
         geographic_context = enriched_data.get("geographic_context")
-        if isinstance(geographic_context, dict) and geographic_context:
-            direct_fields["geographic_context"] = geographic_context
-
         biological_model = _clean_optional_str(enriched_data.get("biological_model"))
-        if biological_model is not None:
-            direct_fields["biological_model"] = biological_model
 
         study_type = _clean_optional_str(enriched_data.get("study_type"))
         if study_type is not None:
-            direct_fields["study_type"] = study_type
-            # Backwards-compatible field used elsewhere in the app.
-            direct_fields["ai_category"] = study_type
+            enhance_fields["ai_category"] = study_type
 
         try:
             conf_val = enriched_data.get("annotation_confidence")
             conf = float(conf_val) if conf_val is not None else None
         except Exception:
             conf = None
-        if conf is not None:
-            direct_fields["annotation_confidence"] = max(0.0, min(1.0, conf))
+        annotation_confidence = max(0.0, min(1.0, conf)) if conf is not None else None
 
         evaluation = enriched_data.get("evaluation") if isinstance(enriched_data.get("evaluation"), dict) else {}
         verdict = _clean_str_list(evaluation.get("verdict"), default=[])
         if verdict:
-            direct_fields["key_takeaways"] = verdict[:3]
-            direct_fields["ai_key_takeaways"] = verdict[:3]
+            enhance_fields["ai_key_takeaways"] = verdict[:3]
+
+        # Standard article fields should be updated via PATCH /articles/{urn} (save),
+        # not via /enhance.
+        article_fields["keywords"] = keywords
+        article_fields["tags"] = tags
+        article_fields["topics"] = topics
+        article_fields["hard_exclusion_flags"] = hard_exclusion_flags
+        if reader_group is not None:
+            article_fields["reader_group"] = reader_group
+        if age_group is not None:
+            article_fields["age_group"] = age_group
+        if population_group is not None:
+            article_fields["population_group"] = population_group
+        if isinstance(geographic_context, dict) and geographic_context:
+            article_fields["geographic_context"] = geographic_context
+        if biological_model is not None:
+            article_fields["biological_model"] = biological_model
+        if study_type is not None:
+            article_fields["study_type"] = study_type
+        if annotation_confidence is not None:
+            article_fields["annotation_confidence"] = annotation_confidence
 
         # Everything else goes to extras
         extras_fields = {
@@ -262,7 +263,7 @@ class BackgroundEnrichmentWorker:
             "enriched_at": datetime.now().isoformat(),
         }
 
-        return direct_fields, extras_fields
+        return enhance_fields, article_fields, extras_fields
 
     def _process_article(self, article) -> bool:
         """
@@ -310,7 +311,7 @@ class BackgroundEnrichmentWorker:
             enriched_data = self.enrichment_agent.enrich_article(article)
 
             # Extract fields
-            direct_fields, extras_fields = self._extract_enrichment_fields(
+            enhance_fields, article_fields, extras_fields = self._extract_enrichment_fields(
                 enriched_data
             )
 
@@ -319,9 +320,17 @@ class BackgroundEnrichmentWorker:
             try:
                 updated_article = client.articles[article_id]
                 updated_article.enhance_self(
-                    agent="foodscholar-v1", fields=direct_fields
+                    agent="foodscholar-v1", fields=enhance_fields
                 )
-                updated_article.extras = extras_fields
+                original_sync = getattr(updated_article, "sync", True)
+                try:
+                    updated_article.sync = False
+                    for field_name, field_value in article_fields.items():
+                        setattr(updated_article, field_name, field_value)
+                    updated_article.extras = extras_fields
+                    updated_article.save(only_dirty=True)
+                finally:
+                    updated_article.sync = original_sync
 
                 logger.info(f"Successfully enriched article {article_id}")
             finally:
@@ -346,13 +355,19 @@ class BackgroundEnrichmentWorker:
             return False
 
     def _get_cursor(self) -> int:
-        """Get current pagination cursor from Redis."""
+        """Get current pagination offset from Redis (0-based)."""
         cursor = self.redis.get(self._cursor_key)
-        return int(cursor) if cursor else 1
+        if not cursor:
+            return 0
+        try:
+            return max(0, int(cursor))
+        except Exception:
+            logger.warning("Invalid enrichment cursor value in Redis; resetting to 0")
+            return 0
 
     def _set_cursor(self, cursor: int):
-        """Save pagination cursor to Redis."""
-        self.redis.set(self._cursor_key, str(cursor))
+        """Save pagination offset to Redis."""
+        self.redis.set(self._cursor_key, str(max(0, int(cursor))))
 
     def _run(self):
         """Main worker loop running in background thread."""
@@ -366,7 +381,7 @@ class BackgroundEnrichmentWorker:
                 # Fetch articles from catalog with pagination
                 client = WISEFOOD.get_client()
                 try:
-                    end_idx = cursor + self.batch_size - 1
+                    end_idx = cursor + self.batch_size
                     articles = client.articles[cursor:end_idx]
                     logger.debug(f"Fetched {len(articles)} articles (cursor={cursor})")
                 finally:
@@ -374,8 +389,8 @@ class BackgroundEnrichmentWorker:
 
                 if not articles:
                     # No more articles - reset cursor to start over
-                    logger.info("Reached end of catalog, resetting cursor to 1")
-                    self._set_cursor(1)
+                    logger.info("Reached end of catalog, resetting cursor to 0")
+                    self._set_cursor(0)
                     self._shutdown_event.wait(timeout=self.poll_interval)
                     continue
 
