@@ -166,6 +166,27 @@ class BackgroundEnrichmentWorker:
         # Direct fields for enhance_self
         direct_fields = {}
 
+        def _clean_str_list(value: Any, *, default: Optional[list[str]] = None) -> list[str]:
+            if isinstance(value, str) and value.strip():
+                value = [value.strip()]
+            if not isinstance(value, list):
+                return default or []
+            cleaned: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip()
+                if not s or s in cleaned:
+                    continue
+                cleaned.append(s)
+            return cleaned if cleaned or default is None else default
+
+        def _clean_optional_str(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            s = value.strip()
+            return s if s else None
+
         combined_tags: list[str] = []
         for src in (enriched_data.get("keywords"), enriched_data.get("tags")):
             if isinstance(src, str) and src.strip():
@@ -182,21 +203,62 @@ class BackgroundEnrichmentWorker:
         if combined_tags:
             direct_fields["ai_tags"] = combined_tags
 
-        if "study_type" in enriched_data:
-            direct_fields["ai_category"] = enriched_data["study_type"]
+        keywords = _clean_str_list(enriched_data.get("keywords"), default=[])
+        tags = _clean_str_list(enriched_data.get("tags"), default=["Other"])
+        topics = _clean_str_list(enriched_data.get("topics"), default=["Other"])[:3]
+        hard_exclusion_flags = _clean_str_list(
+            enriched_data.get("hard_exclusion_flags"), default=["None"]
+        )
 
-        if "evaluation" in enriched_data and "verdict" in enriched_data["evaluation"]:
-            direct_fields["ai_key_takeaways"] = enriched_data["evaluation"]["verdict"]
+        direct_fields["keywords"] = keywords
+        direct_fields["tags"] = tags
+        direct_fields["topics"] = topics
+        direct_fields["hard_exclusion_flags"] = hard_exclusion_flags
+
+        reader_group = _clean_optional_str(enriched_data.get("reader_group"))
+        if reader_group is not None:
+            direct_fields["reader_group"] = reader_group
+
+        age_group = _clean_optional_str(enriched_data.get("age_group"))
+        if age_group is not None:
+            direct_fields["age_group"] = age_group
+
+        population_group = _clean_optional_str(enriched_data.get("population_group"))
+        if population_group is not None:
+            direct_fields["population_group"] = population_group
+
+        geographic_context = enriched_data.get("geographic_context")
+        if isinstance(geographic_context, dict) and geographic_context:
+            direct_fields["geographic_context"] = geographic_context
+
+        biological_model = _clean_optional_str(enriched_data.get("biological_model"))
+        if biological_model is not None:
+            direct_fields["biological_model"] = biological_model
+
+        study_type = _clean_optional_str(enriched_data.get("study_type"))
+        if study_type is not None:
+            direct_fields["study_type"] = study_type
+            # Backwards-compatible field used elsewhere in the app.
+            direct_fields["ai_category"] = study_type
+
+        try:
+            conf_val = enriched_data.get("annotation_confidence")
+            conf = float(conf_val) if conf_val is not None else None
+        except Exception:
+            conf = None
+        if conf is not None:
+            direct_fields["annotation_confidence"] = max(0.0, min(1.0, conf))
+
+        evaluation = enriched_data.get("evaluation") if isinstance(enriched_data.get("evaluation"), dict) else {}
+        verdict = _clean_str_list(evaluation.get("verdict"), default=[])
+        if verdict:
+            direct_fields["key_takeaways"] = verdict[:3]
+            direct_fields["ai_key_takeaways"] = verdict[:3]
 
         # Everything else goes to extras
         extras_fields = {
             "annotations": enriched_data.get("annotations", {}),
-            "keywords": enriched_data.get("keywords", []),
-            "tags": enriched_data.get("tags", ["Other"]),
-            "reader_group": enriched_data.get("reader_group"),
-            "population_group": enriched_data.get("population_group"),
-            "study_type": enriched_data.get("study_type"),
-            "evaluation": enriched_data.get("evaluation", {}),
+            "evaluation": evaluation,
             "enriched_at": datetime.now().isoformat(),
         }
 
