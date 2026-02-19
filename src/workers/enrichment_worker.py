@@ -166,8 +166,21 @@ class BackgroundEnrichmentWorker:
         # Direct fields for enhance_self
         direct_fields = {}
 
-        if "keywords" in enriched_data:
-            direct_fields["ai_tags"] = enriched_data["keywords"]
+        combined_tags: list[str] = []
+        for src in (enriched_data.get("keywords"), enriched_data.get("tags")):
+            if isinstance(src, str) and src.strip():
+                src = [src.strip()]
+            if not isinstance(src, list):
+                continue
+            for t in src:
+                if not isinstance(t, str):
+                    continue
+                tt = t.strip()
+                if not tt or tt in combined_tags:
+                    continue
+                combined_tags.append(tt)
+        if combined_tags:
+            direct_fields["ai_tags"] = combined_tags
 
         if "study_type" in enriched_data:
             direct_fields["ai_category"] = enriched_data["study_type"]
@@ -178,6 +191,8 @@ class BackgroundEnrichmentWorker:
         # Everything else goes to extras
         extras_fields = {
             "annotations": enriched_data.get("annotations", {}),
+            "keywords": enriched_data.get("keywords", []),
+            "tags": enriched_data.get("tags", ["Other"]),
             "reader_group": enriched_data.get("reader_group"),
             "population_group": enriched_data.get("population_group"),
             "study_type": enriched_data.get("study_type"),
