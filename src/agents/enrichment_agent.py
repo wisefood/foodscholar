@@ -29,6 +29,10 @@ Use ONLY the information in the title/authors/abstract below.
 - If something is not stated, write "Not stated".
 - Return STRICT JSON ONLY (no Markdown, no extra text).
 
+Allowed knowledge:
+- You may use general textbook definitions to explain glossary terms.
+- Do NOT use external knowledge to infer study methods, results, effect sizes, or recommendations beyond what the abstract states.
+
 ARTICLE
 
 Title: {title}
@@ -56,7 +60,7 @@ FIELD RULES (follow exactly)
   Food safety & allergens | Public health nutrition | Other
   If unsure, set topics to ["Other"].
 - tags: MUST be present. 3-8 generic tags that help aggregate this article with others.
-  Tags can be more general than topics and do NOT need to appear verbatim in the text, but they MUST be supported by the abstract
+  Tags can be more general than topics and do NOT need to appear verbatim in the text,
   as high-level themes (no invented facts or results). Use short phrases (1-3 words), Title Case, no punctuation.
   If unsure, set tags to ["Other"].
 - study_type: Select ONE:
@@ -75,7 +79,11 @@ FIELD RULES (follow exactly)
   Animal-only | In vitro only | No dietary exposure studied | No nutrition-related outcomes | Conference abstract only | Retracted study | None
 - annotation_confidence: Float 0.0-1.0 (confidence in correct classification)
 - annotations.abstract: Rewrite for an average citizen using short sentences; state what was done, what was found, and what it does NOT prove
-- annotations.glosary: 3-7 high-signal terms from the abstract (do NOT invent); if none, []
+- annotations.glosary: 3-7 high-signal terms from the abstract (do NOT invent).
+  Must be an array of objects with keys: term, definition, rationale.
+  - definition: plain-language definition (textbook-style; no new study claims)
+  - rationale: 1 sentence why a normal reader should care
+  If none, []
 - annotations.user_qa / expert_qa / practitioner_qa: Each must be an array of EXACTLY 3 objects with:
   - question: <= 20 words that a user/expert/practitioner might ask even if they haven't read the abstract; do NOT invent questions beyond the abstract content
   - answer: 1-2 sentences grounded ONLY in the abstract; mention uncertainty/limits if needed
@@ -108,7 +116,11 @@ OUTPUT JSON (keys must match exactly, no extra keys; must be valid JSON)
   "annotation_confidence": 0.0,
   "annotations": {{
     "abstract": "",
-    "glosary": [],
+    "glosary": [
+      {{"term": "", "definition": "", "rationale": ""}},
+      {{"term": "", "definition": "", "rationale": ""}},
+      {{"term": "", "definition": "", "rationale": ""}}
+    ],
     "user_qa": [
       {{"question": "", "answer": "", "grounding": ""}},
       {{"question": "", "answer": "", "grounding": ""}},
@@ -149,6 +161,7 @@ _DEFAULT_ANNOTATION_OUTPUT: Dict[str, Any] = {
     "hard_exclusion_flags": ["None"],
     "annotation_confidence": 0.0,
     "annotations": {
+        "original_abstract": "",
         "abstract": "",
         "glosary": [],
         "user_qa": [],
@@ -380,6 +393,41 @@ class EnrichmentAgent:
             enriched["age_group"] = population_group
         if (not population_group or population_group == "Not stated") and age_group and age_group != "Not stated":
             enriched["population_group"] = age_group
+
+        glosary = annotations.get("glosary")
+        if isinstance(glosary, str) and glosary.strip():
+            glosary = [{"term": glosary.strip(), "definition": "Not stated", "rationale": "Not stated"}]
+        if isinstance(glosary, list):
+            normalized_glosary = []
+            for entry in glosary:
+                if isinstance(entry, str):
+                    term = entry.strip()
+                    if term:
+                        normalized_glosary.append(
+                            {"term": term, "definition": "Not stated", "rationale": "Not stated"}
+                        )
+                    continue
+                if isinstance(entry, dict):
+                    term = entry.get("term", "")
+                    if isinstance(term, str):
+                        term = term.strip()
+                    else:
+                        term = ""
+                    if not term:
+                        continue
+                    definition = entry.get("definition", "Not stated")
+                    if not isinstance(definition, str) or not definition.strip():
+                        definition = "Not stated"
+                    rationale = entry.get("rationale", "Not stated")
+                    if not isinstance(rationale, str) or not rationale.strip():
+                        rationale = "Not stated"
+                    normalized_glosary.append(
+                        {"term": term, "definition": definition.strip(), "rationale": rationale.strip()}
+                    )
+            annotations["glosary"] = normalized_glosary[:7]
+        else:
+            annotations["glosary"] = []
+        enriched["annotations"] = annotations
 
         topics = enriched.get("topics")
         if isinstance(topics, str) and topics.strip():
