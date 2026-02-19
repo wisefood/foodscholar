@@ -75,6 +75,7 @@ CRITICAL RULES:
 4. Do NOT fabricate information beyond what the articles support.
 5. Clearly indicate when findings are preliminary vs well-established.
 6. If articles disagree, present both perspectives.
+7. For each cited article, include a "quote" field containing the EXACT verbatim passage from that article's abstract that best supports your answer to the user's question. The quote MUST be copied directly from the provided abstract text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -87,6 +88,7 @@ JSON structure:
     {{{{
       "urn": "the article URN",
       "section": "abstract",
+      "quote": "verbatim excerpt from the abstract supporting the answer",
       "confidence": "high"
     }}}}
   ],
@@ -104,7 +106,9 @@ Answer the question concisely using the articles above as evidence."""),
         ])
 
         parsed = self._invoke_and_parse(prompt)
-        answer = self._build_qa_answer(parsed, articles=articles, rag_used=True)
+        answer = self._build_qa_answer(
+            parsed, question=question, articles=articles, rag_used=True
+        )
         follow_ups = parsed.get("follow_ups", [])
         return answer, follow_ups
 
@@ -163,7 +167,9 @@ Answer the question concisely using your scientific knowledge."""),
         ])
 
         parsed = self._invoke_and_parse(prompt)
-        answer = self._build_qa_answer(parsed, articles=None, rag_used=False)
+        answer = self._build_qa_answer(
+            parsed, question=question, articles=None, rag_used=False
+        )
         follow_ups = parsed.get("follow_ups", [])
         return answer, follow_ups
 
@@ -240,6 +246,7 @@ Answer the question concisely using your scientific knowledge."""),
     def _build_qa_answer(
         self,
         parsed: Dict[str, Any],
+        question: str,
         articles: Optional[List[Dict[str, Any]]] = None,
         rag_used: bool = True,
     ) -> QAAnswer:
@@ -250,9 +257,16 @@ Answer the question concisely using your scientific knowledge."""),
             for cited in parsed.get("cited_articles", []):
                 urn = cited.get("urn", "")
                 if urn in article_lookup:
+                    abstract_text = self._get_article_abstract_text(
+                        article_lookup[urn]
+                    )
+                    quote = self._coerce_quote_to_abstract_span(
+                        cited.get("quote"), abstract_text, question=question
+                    )
                     citation = create_citation_from_article(
                         article_lookup[urn],
                         section=cited.get("section", "abstract"),
+                        quote=quote,
                         confidence=cited.get("confidence", "medium"),
                     )
                     citations.append(citation)
@@ -265,3 +279,85 @@ Answer the question concisely using your scientific knowledge."""),
             rag_used=rag_used,
             articles_consulted=len(articles) if articles else 0,
         )
+
+    @staticmethod
+    def _get_article_abstract_text(article: Dict[str, Any]) -> str:
+        abstract = article.get("abstract") or article.get("description") or ""
+        return abstract if isinstance(abstract, str) else ""
+
+    @staticmethod
+    def _coerce_quote_to_abstract_span(
+        quote: Any, abstract_text: str, question: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Ensure a quote is an exact substring of the provided abstract text.
+
+        If the LLM returns a quote that differs only in whitespace/casing, attempt to
+        recover the exact matching span from the abstract. If no quote is provided
+        or no match can be found, fall back to a best-effort sentence from the abstract.
+        """
+        if not abstract_text:
+            return None
+
+        if isinstance(quote, str):
+            candidate = quote.strip()
+        else:
+            candidate = ""
+
+        if candidate and candidate in abstract_text:
+            return candidate
+
+        if candidate:
+            # Try to match the candidate in the abstract even if whitespace differs,
+            # then return the exact span as it appears in the abstract for highlighting.
+            tokens = candidate.split()
+            if len(tokens) >= 3:
+                pattern = r"\\s+".join(re.escape(tok) for tok in tokens)
+                match = re.search(pattern, abstract_text)
+                if match:
+                    return match.group(0)
+                match = re.search(pattern, abstract_text, flags=re.IGNORECASE)
+                if match:
+                    return match.group(0)
+
+        # Best-effort fallback: pick the most question-relevant sentence.
+        return QAAgent._best_effort_quote_from_abstract(
+            abstract_text=abstract_text, question=question
+        )
+
+    @staticmethod
+    def _best_effort_quote_from_abstract(
+        abstract_text: str, question: Optional[str]
+    ) -> Optional[str]:
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\\s+", abstract_text.strip())
+            if s.strip()
+        ]
+        if not sentences:
+            return None
+
+        if not question:
+            return sentences[0]
+
+        q = question.lower()
+        q_terms = {t for t in re.findall(r"[a-z0-9]+", q) if len(t) > 2}
+        if not q_terms:
+            return sentences[0]
+
+        def score_sentence(sentence: str) -> int:
+            s_terms = set(re.findall(r"[a-z0-9]+", sentence.lower()))
+            return len(q_terms & s_terms)
+
+        best = max(sentences, key=score_sentence)
+        # Keep the excerpt reasonably short while remaining an exact substring.
+        words = best.split()
+        if len(words) > 60:
+            first_n = words[:60]
+            pattern = r"\\s+".join(re.escape(tok) for tok in first_n)
+            match = re.search(pattern, best)
+            if match:
+                return match.group(0).strip()
+            # If matching fails for any reason, prefer returning the full sentence
+            # (still an exact substring) over returning a normalized variant.
+        return best
