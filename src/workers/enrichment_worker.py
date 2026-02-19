@@ -9,14 +9,19 @@ multiple API replicas.
 import logging
 import threading
 import traceback
+import time
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from backend.redis import RedisClientSingleton
-from backend.platform import WISEFOOD
-from agents.enrichment_agent import EnrichmentAgent
-
 logger = logging.getLogger(__name__)
+
+
+class RedisUnavailable(RuntimeError):
+    """Raised when Redis is required but unreachable."""
+
+
+class CatalogUnavailable(RuntimeError):
+    """Raised when the data-catalog API is unreachable."""
 
 
 class BackgroundEnrichmentWorker:
@@ -36,6 +41,9 @@ class BackgroundEnrichmentWorker:
         poll_interval: int = 10,
         max_retries: int = 3,
         processing_timeout: int = 300,
+        *,
+        redis_client: Optional[Any] = None,
+        enrichment_agent: Optional[Any] = None,
     ):
         """
         Initialize the background worker.
@@ -51,8 +59,20 @@ class BackgroundEnrichmentWorker:
         self.max_retries = max_retries
         self.processing_timeout = processing_timeout
 
-        self.redis = RedisClientSingleton()
-        self.enrichment_agent = EnrichmentAgent()
+        # Lazy imports + DI make this module testable without external deps.
+        if redis_client is None:
+            from backend.redis import RedisClientSingleton  # local import (optional in tests)
+
+            self.redis = RedisClientSingleton()
+        else:
+            self.redis = redis_client
+
+        if enrichment_agent is None:
+            from agents.enrichment_agent import EnrichmentAgent  # local import (optional in tests)
+
+            self.enrichment_agent = EnrichmentAgent()
+        else:
+            self.enrichment_agent = enrichment_agent
 
         self._thread: Optional[threading.Thread] = None
         self._running = False
@@ -65,7 +85,52 @@ class BackgroundEnrichmentWorker:
         # NOTE: This is a 0-based offset into `client.articles` (see wisefood EntityProxy slicing).
         self._cursor_key = "enrichment:cursor"
 
+        # Redis outage tracking (avoid log spam)
+        self._redis_down = False
+        self._redis_last_error_log_at = 0.0  # monotonic seconds
+        self._catalog_down = False
+        self._catalog_last_error_log_at = 0.0  # monotonic seconds
+
         logger.info("Background enrichment worker initialized")
+
+    @staticmethod
+    def _is_catalog_unavailable_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(
+            s in msg
+            for s in (
+                "connection refused",
+                "failed to establish a new connection",
+                "max retries exceeded",
+                "httpconnectionpool",
+                "newconnectionerror",
+                "read timed out",
+                "connect timeout",
+                "temporarily unavailable",
+            )
+        )
+
+    def _redis_available(self) -> bool:
+        """Best-effort check that Redis is reachable."""
+        try:
+            client = getattr(self.redis, "client", None)
+            if client is None:
+                return False
+            ping = getattr(client, "ping", None)
+            if callable(ping):
+                ping()
+                return True
+            # Fallback for test doubles without ping()
+            client.get("__foodscholar_ping__")
+            return True
+        except Exception:
+            return False
+
+    def _redis_call(self, op: str, fn):
+        try:
+            return fn()
+        except Exception as e:
+            raise RedisUnavailable(op) from e
 
     def start(self):
         """Start the background worker thread."""
@@ -110,12 +175,17 @@ class BackgroundEnrichmentWorker:
         """
         lock_key = f"enrichment:lock:{article_id}"
 
+        client = self.redis.client
+
         # Use SET NX (set if not exists) with expiration
-        acquired = self.redis.client.set(
-            lock_key,
-            threading.get_ident(),  # Use thread ID as lock value
-            nx=True,
-            ex=self.processing_timeout,
+        acquired = self._redis_call(
+            "redis.set(lock)",
+            lambda: client.set(
+                lock_key,
+                threading.get_ident(),  # Use thread ID as lock value
+                nx=True,
+                ex=self.processing_timeout,
+            ),
         )
 
         return bool(acquired)
@@ -123,38 +193,74 @@ class BackgroundEnrichmentWorker:
     def _release_lock(self, article_id: str):
         """Release the processing lock for an article."""
         lock_key = f"enrichment:lock:{article_id}"
-        self.redis.delete(lock_key)
+        client = self.redis.client
+        self._redis_call("redis.delete(lock)", lambda: client.delete(lock_key))
+
+    def _release_lock_best_effort(self, article_id: str):
+        lock_key = f"enrichment:lock:{article_id}"
+        try:
+            client = getattr(self.redis, "client", None)
+            if client is None:
+                return
+            client.delete(lock_key)
+        except Exception:
+            return
 
     def _is_processed(self, article_id: str) -> bool:
         """Check if article has already been successfully processed."""
-        return self.redis.client.sismember("enrichment:processed", article_id)
+        client = self.redis.client
+        return bool(
+            self._redis_call(
+                "redis.sismember(processed)",
+                lambda: client.sismember("enrichment:processed", article_id),
+            )
+        )
 
     def _mark_processed(self, article_id: str):
         """Mark article as successfully processed."""
-        self.redis.client.sadd("enrichment:processed", article_id)
+        client = self.redis.client
+        self._redis_call(
+            "redis.sadd(processed)",
+            lambda: client.sadd("enrichment:processed", article_id),
+        )
 
     def _is_permanently_failed(self, article_id: str) -> bool:
         """Check if article has permanently failed (exceeded max retries)."""
-        return self.redis.client.sismember("enrichment:failed", article_id)
+        client = self.redis.client
+        return bool(
+            self._redis_call(
+                "redis.sismember(failed)",
+                lambda: client.sismember("enrichment:failed", article_id),
+            )
+        )
 
     def _mark_permanently_failed(self, article_id: str):
         """Mark article as permanently failed (won't be retried)."""
-        self.redis.client.sadd("enrichment:failed", article_id)
+        client = self.redis.client
+        self._redis_call(
+            "redis.sadd(failed)",
+            lambda: client.sadd("enrichment:failed", article_id),
+        )
         # Clean up the retry key since we won't retry anymore
         retry_key = f"enrichment:retry:{article_id}"
-        self.redis.delete(retry_key)
+        self._redis_call("redis.delete(retry)", lambda: client.delete(retry_key))
 
     def _get_retry_count(self, article_id: str) -> int:
         """Get current retry count for an article."""
         retry_key = f"enrichment:retry:{article_id}"
-        count = self.redis.get(retry_key)
+        client = self.redis.client
+        count = self._redis_call("redis.get(retry)", lambda: client.get(retry_key))
         return int(count) if count else 0
 
     def _increment_retry(self, article_id: str) -> int:
         """Increment and return retry count."""
         retry_key = f"enrichment:retry:{article_id}"
-        new_count = self.redis.client.incr(retry_key)
-        self.redis.client.expire(retry_key, 86400)  # Expire after 24 hours
+        client = self.redis.client
+        new_count = self._redis_call("redis.incr(retry)", lambda: client.incr(retry_key))
+        self._redis_call(
+            "redis.expire(retry)",
+            lambda: client.expire(retry_key, 86400),  # Expire after 24 hours
+        )
         return new_count
 
     def _extract_enrichment_fields(self, enriched_data: Dict[str, Any]) -> tuple:
@@ -275,7 +381,12 @@ class BackgroundEnrichmentWorker:
         Returns:
             True if successful, False otherwise
         """
-        article_id = article.urn
+        article_id = getattr(article, "urn", None)
+        if not isinstance(article_id, str) or not article_id.strip():
+            logger.error(f"Failed to process article with missing/invalid URN: {article_id!r}")
+            self.stats["failed"] += 1
+            return False
+        article_id = article_id.strip()
 
         try:
             # Check if already processed
@@ -315,26 +426,40 @@ class BackgroundEnrichmentWorker:
                 enriched_data
             )
 
-            # Update article in catalog
-            client = WISEFOOD.get_client()
-            try:
-                updated_article = client.articles[article_id]
-                updated_article.enhance_self(
-                    agent="foodscholar-v1", fields=enhance_fields
-                )
-                original_sync = getattr(updated_article, "sync", True)
-                try:
-                    updated_article.sync = False
-                    for field_name, field_value in article_fields.items():
-                        setattr(updated_article, field_name, field_value)
-                    updated_article.extras = extras_fields
-                    updated_article.save(only_dirty=True)
-                finally:
-                    updated_article.sync = original_sync
+            # Persist enrichment output first using the entity instance we already
+            # have (in-place), then attempt the optional /enhance call.
+            #
+            # Rationale: if /enhance fails it may leave the upstream client entity
+            # in a "dirty" state that causes subsequent save() to include ai_* keys,
+            # which the base PATCH schema rejects.
+            if enhance_fields:
+                extras_fields["enhance_agent"] = "foodscholar-v1"
+                extras_fields["enhance_fields"] = enhance_fields
 
-                logger.info(f"Successfully enriched article {article_id}")
+            original_sync = getattr(article, "sync", True)
+            try:
+                article.sync = False
+                for field_name, field_value in article_fields.items():
+                    setattr(article, field_name, field_value)
+                article.extras = extras_fields
+                try:
+                    article.save(only_dirty=True)
+                except Exception as save_err:
+                    if self._is_catalog_unavailable_error(save_err):
+                        raise CatalogUnavailable(str(save_err)) from save_err
+                    raise
             finally:
-                WISEFOOD.return_client(client)
+                article.sync = original_sync
+
+            if enhance_fields:
+                try:
+                    article.enhance_self(agent="foodscholar-v1", fields=enhance_fields)
+                except Exception as enhance_err:
+                    logger.warning(
+                        f"Enhance endpoint failed for article {article_id}; skipping /enhance. Error: {enhance_err}"
+                    )
+
+            logger.info(f"Successfully enriched article {article_id}")
 
             # Mark as processed and release lock
             self._mark_processed(article_id)
@@ -343,20 +468,47 @@ class BackgroundEnrichmentWorker:
 
             return True
 
+        except RedisUnavailable:
+            self._release_lock_best_effort(article_id)
+            raise
+
+        except CatalogUnavailable:
+            try:
+                self._release_lock(article_id)
+            except RedisUnavailable:
+                self._release_lock_best_effort(article_id)
+            raise
+
         except Exception as e:
             logger.error(f"Failed to process article {article_id}: {e}")
             logger.debug(traceback.format_exc())
 
-            # Increment retry count and release lock
-            self._increment_retry(article_id)
-            self._release_lock(article_id)
+            # Non-retriable failures (e.g. invalid URNs) should not spam retries.
+            msg = str(e) if e is not None else ""
+            try:
+                if "invalid urn format" in msg.lower():
+                    logger.warning(
+                        f"Marking article {article_id} as permanently failed due to invalid URN"
+                    )
+                    self._mark_permanently_failed(article_id)
+                else:
+                    self._increment_retry(article_id)
+            except RedisUnavailable:
+                # Redis went away during failure handling; best-effort unlock below.
+                pass
+
+            try:
+                self._release_lock(article_id)
+            except RedisUnavailable:
+                self._release_lock_best_effort(article_id)
             self.stats["failed"] += 1
 
             return False
 
     def _get_cursor(self) -> int:
         """Get current pagination offset from Redis (0-based)."""
-        cursor = self.redis.get(self._cursor_key)
+        client = self.redis.client
+        cursor = self._redis_call("redis.get(cursor)", lambda: client.get(self._cursor_key))
         if not cursor:
             return 0
         try:
@@ -367,51 +519,110 @@ class BackgroundEnrichmentWorker:
 
     def _set_cursor(self, cursor: int):
         """Save pagination offset to Redis."""
-        self.redis.set(self._cursor_key, str(max(0, int(cursor))))
+        client = self.redis.client
+        self._redis_call(
+            "redis.set(cursor)",
+            lambda: client.set(self._cursor_key, str(max(0, int(cursor)))),
+        )
 
     def _run(self):
         """Main worker loop running in background thread."""
         logger.info("Worker thread started")
 
+        from backend.platform import WISEFOOD  # local import (optional in tests)
+
         while self._running:
             try:
-                # Get current cursor position
-                cursor = self._get_cursor()
-
-                # Fetch articles from catalog with pagination
-                client = WISEFOOD.get_client()
-                try:
-                    end_idx = cursor + self.batch_size
-                    articles = client.articles[cursor:end_idx]
-                    logger.debug(f"Fetched {len(articles)} articles (cursor={cursor})")
-                finally:
-                    WISEFOOD.return_client(client)
-
-                if not articles:
-                    # No more articles - reset cursor to start over
-                    logger.info("Reached end of catalog, resetting cursor to 0")
-                    self._set_cursor(0)
+                # If Redis is down, pause (locks/cursor/dedup depend on it).
+                if not self._redis_available():
+                    now = time.monotonic()
+                    if (not self._redis_down) or (
+                        now - self._redis_last_error_log_at > 30
+                    ):
+                        logger.error(
+                            "Redis unavailable (connection refused). Worker paused until Redis recovers."
+                        )
+                        self._redis_last_error_log_at = now
+                    self._redis_down = True
                     self._shutdown_event.wait(timeout=self.poll_interval)
                     continue
 
-                # Process each article
-                processed_in_batch = 0
-                for article in articles:
-                    if not self._running:
-                        break
+                if self._redis_down:
+                    logger.info("Redis connection restored. Resuming enrichment worker.")
+                    self._redis_down = False
 
-                    self._process_article(article)
-                    processed_in_batch += 1
+                # Get current cursor position
+                cursor = self._get_cursor()
 
-                # Advance cursor for next batch
-                new_cursor = cursor + len(articles)
-                self._set_cursor(new_cursor)
+                # Fetch and process using the same client instance so entities
+                # created from it aren't used after the client is returned to the pool.
+                client = WISEFOOD.get_client()
+                try:
+                    end_idx = cursor + self.batch_size
+                    try:
+                        articles = client.articles[cursor:end_idx]
+                    except Exception as fetch_err:
+                        if self._is_catalog_unavailable_error(fetch_err):
+                            raise CatalogUnavailable(str(fetch_err)) from fetch_err
+                        raise
+                    logger.debug(f"Fetched {len(articles)} articles (cursor={cursor})")
+                    if self._catalog_down:
+                        logger.info("Data-catalog connection restored. Resuming enrichment worker.")
+                        self._catalog_down = False
 
-                # Wait before next batch
-                logger.debug(f"Batch complete (processed {processed_in_batch}). Stats: {self.stats}")
+                    if not articles:
+                        # No more articles - reset cursor to start over
+                        logger.info("Reached end of catalog, resetting cursor to 0")
+                        self._set_cursor(0)
+                        self._shutdown_event.wait(timeout=self.poll_interval)
+                        continue
+
+                    # Process each article
+                    processed_in_batch = 0
+                    for article in articles:
+                        if not self._running:
+                            break
+
+                        self._process_article(article)
+                        processed_in_batch += 1
+
+                    # Advance cursor for next batch
+                    new_cursor = cursor + len(articles)
+                    self._set_cursor(new_cursor)
+
+                    # Wait before next batch
+                    logger.debug(
+                        f"Batch complete (processed {processed_in_batch}). Stats: {self.stats}"
+                    )
+                    self._shutdown_event.wait(timeout=self.poll_interval)
+                finally:
+                    WISEFOOD.return_client(client)
+
+            except RedisUnavailable:
+                # Redis went away mid-batch; pause and retry later.
+                now = time.monotonic()
+                if (not self._redis_down) or (now - self._redis_last_error_log_at > 30):
+                    logger.error(
+                        "Redis unavailable during processing. Worker paused until Redis recovers."
+                    )
+                    self._redis_last_error_log_at = now
+                self._redis_down = True
+                self._shutdown_event.wait(timeout=self.poll_interval)
+
+            except CatalogUnavailable:
+                now = time.monotonic()
+                if (not self._catalog_down) or (
+                    now - self._catalog_last_error_log_at > 30
+                ):
+                    logger.error(
+                        "Data-catalog unavailable. Worker paused until it recovers."
+                    )
+                    self._catalog_last_error_log_at = now
+                self._catalog_down = True
                 self._shutdown_event.wait(timeout=self.poll_interval)
 
             except Exception as e:
+                self._catalog_down = False
                 logger.error(f"Error in worker loop: {e}")
                 logger.debug(traceback.format_exc())
                 self._shutdown_event.wait(timeout=self.poll_interval)
@@ -420,10 +631,14 @@ class BackgroundEnrichmentWorker:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get current worker statistics."""
+        try:
+            cursor = self._get_cursor()
+        except RedisUnavailable:
+            cursor = None
         return {
             **self.stats,
             "running": self._running,
-            "cursor": self._get_cursor(),
+            "cursor": cursor,
             "uptime_seconds": (
                 (
                     datetime.now() - datetime.fromisoformat(self.stats["started_at"])
