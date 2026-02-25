@@ -1,9 +1,19 @@
 """Groq connection pool for efficient ChatGroq instance management."""
 import os
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from threading import Lock
-from langchain_groq import ChatGroq
+
+if TYPE_CHECKING:  # pragma: no cover
+    from langchain_groq import ChatGroq as ChatGroqType
+else:  # pragma: no cover
+    ChatGroqType = Any
+
+try:
+    from langchain_groq import ChatGroq
+except Exception as e:  # pragma: no cover
+    ChatGroq = None
+    _LANGCHAIN_GROQ_IMPORT_ERROR = e
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +28,7 @@ class GroqConnectionPool:
 
     def __init__(self):
         """Initialize the connection pool."""
-        self._pool: Dict[str, ChatGroq] = {}
+        self._pool: Dict[str, ChatGroqType] = {}
         self._lock = Lock()
         self._api_key = os.getenv("GROQ_API_KEY")
 
@@ -58,7 +68,7 @@ class GroqConnectionPool:
         temperature: float = 0.7,
         api_key: Optional[str] = None,
         **kwargs
-    ) -> ChatGroq:
+    ) -> ChatGroqType:
         """
         Get or create a ChatGroq client from the pool.
 
@@ -71,6 +81,12 @@ class GroqConnectionPool:
         Returns:
             ChatGroq instance from the pool
         """
+        if ChatGroq is None:  # pragma: no cover
+            raise RuntimeError(
+                "langchain_groq is required to create a Groq client. "
+                "Install it (and its dependencies) to enable LLM features."
+            ) from _LANGCHAIN_GROQ_IMPORT_ERROR
+
         # Use provided API key or fall back to environment variable
         used_api_key = api_key or self._api_key
 

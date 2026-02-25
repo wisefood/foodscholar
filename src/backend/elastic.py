@@ -1,13 +1,28 @@
 import os
 import threading
-from elasticsearch import Elasticsearch, NotFoundError
-from typing import Optional, List, Dict, Any
+import random
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 import logging
 
 logger = logging.getLogger(__name__)
 
 ELASTIC_HOST = os.getenv("ELASTIC_HOST", "http://elastic:9200")
 ES_DIM = int(os.getenv("ES_DIM", 384))
+
+if TYPE_CHECKING:  # pragma: no cover
+    from elasticsearch import Elasticsearch as ElasticsearchType
+else:  # pragma: no cover
+    ElasticsearchType = Any
+
+try:
+    from elasticsearch import Elasticsearch, NotFoundError
+except Exception as e:  # pragma: no cover
+    Elasticsearch = None
+
+    class NotFoundError(Exception):
+        pass
+
+    _ELASTICSEARCH_IMPORT_ERROR = e
 
 
 class ElasticsearchClientSingleton:
@@ -21,18 +36,25 @@ class ElasticsearchClientSingleton:
             with cls._lock:
                 if cls._instance is None:
                     instance = super().__new__(cls)
-                    instance._client = Elasticsearch(
-                        hosts=ELASTIC_HOST,
-                        # Optional tuning:
-                        # request_timeout=10,
-                        # max_retries=3,
-                        # retry_on_timeout=True,
-                    )
+                    instance._client = None
                     cls._instance = instance
         return cls._instance
 
     @property
-    def client(self) -> Elasticsearch:
+    def client(self) -> ElasticsearchType:
+        if self._client is None:
+            if Elasticsearch is None:  # pragma: no cover
+                raise RuntimeError(
+                    "elasticsearch is required to use ElasticsearchClientSingleton. "
+                    "Install it (and its dependencies) to enable search features."
+                ) from _ELASTICSEARCH_IMPORT_ERROR
+            self._client = Elasticsearch(
+                hosts=ELASTIC_HOST,
+                # Optional tuning:
+                # request_timeout=10,
+                # max_retries=3,
+                # retry_on_timeout=True,
+            )
         return self._client
 
     # --- Simple helpers -----------------------------------------------------
@@ -71,6 +93,50 @@ class ElasticsearchClientSingleton:
         }
         r = self.client.search(index=index_name, body=body)
         return [hit["_source"] for hit in r["hits"]["hits"]]
+
+    def random_search(
+        self,
+        index_name: str,
+        size: int = 10,
+        *,
+        seed: Optional[int] = None,
+        filter_query: Optional[Dict[str, Any]] = None,
+        source_excludes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return pseudo-random documents from an index.
+
+        Notes:
+        - Uses ES `function_score` + `random_score`.
+        - Provide a seed to make selection deterministic (e.g. daily content).
+        """
+        if seed is None:
+            seed = random.randint(0, 2**31 - 1)
+
+        base_query = filter_query or {"match_all": {}}
+        body = {
+            "size": size,
+            "query": {
+                "function_score": {
+                    "query": base_query,
+                    # Specify a doc_values-backed field to avoid ES needing
+                    # fielddata on `_id` (often disabled by default).
+                    "random_score": {"seed": seed, "field": "_seq_no"},
+                    "boost_mode": "replace",
+                }
+            },
+        }
+
+        source_config = True
+        if source_excludes:
+            source_config = {"excludes": source_excludes}
+
+        try:
+            r = self.client.search(index=index_name, body=body, source=source_config)
+            return [hit["_source"] for hit in r["hits"]["hits"]]
+        except Exception:
+            logger.exception("Error performing random search on %s", index_name)
+            raise
 
     def index_entity(self, index_name: str, document: Dict[str, Any]) -> None:
         doc_id = document.get("urn", document.get("id"))

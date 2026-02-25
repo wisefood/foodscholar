@@ -81,3 +81,57 @@ class QAFeedbackRecord(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class SimpleNutriQuestionsRecord(Base):
+    """Persisted 'starter questions' generations."""
+
+    __tablename__ = "simple_nutri_questions"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    cache_key = Column(String(128), nullable=False, index=True)
+    model = Column(String(64), nullable=True)
+    count = Column(Integer, nullable=False, default=4)
+    questions = Column(JSONB, nullable=False)
+    generated_at = Column(DateTime(timezone=True), nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class TipsOfTheDayRecord(Base):
+    """Persisted 'tips of the day' generations (including evidence details)."""
+
+    __tablename__ = "tips_of_the_day"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    cache_key = Column(String(128), nullable=False, index=True)
+    model = Column(String(64), nullable=True)
+    tips_count = Column(Integer, nullable=False, default=2)
+    did_you_know_count = Column(Integer, nullable=False, default=2)
+
+    tips = Column(JSONB, nullable=False)
+    did_you_know = Column(JSONB, nullable=False)
+    tips_detail = Column(JSONB, nullable=True)
+    did_you_know_detail = Column(JSONB, nullable=True)
+
+    generated_at = Column(DateTime(timezone=True), nullable=False)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

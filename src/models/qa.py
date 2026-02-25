@@ -209,6 +209,32 @@ class SimpleNutriQuestionsResponse(BaseModel):
         description="Whether this result came from cache",
     )
 
+class TipEvidence(BaseModel):
+    """Evidence payload for a generated tip/fact."""
+
+    urn: str = Field(description="Article URN used as evidence")
+    passage: str = Field(
+        description="Short passage from the article abstract/description used for grounding"
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Article title (optional)",
+    )
+    publication_year: Optional[str] = Field(
+        default=None,
+        description="Article publication year (optional)",
+    )
+
+
+class TipWithEvidence(BaseModel):
+    """A tip/fact with optional evidence."""
+
+    text: str = Field(description="Tip/fact text")
+    evidence: Optional[TipEvidence] = Field(
+        default=None,
+        description="Evidence used to create the item; omitted for fallbacks",
+    )
+
 
 class TipsOfTheDayResponse(BaseModel):
     """Response model for nutrition tips/facts of the day."""
@@ -220,6 +246,14 @@ class TipsOfTheDayResponse(BaseModel):
     tips: List[str] = Field(
         default_factory=list,
         description="Exactly 2 short human-focused nutrition tips"
+    )
+    did_you_know_detail: List[TipWithEvidence] = Field(
+        default_factory=list,
+        description="Did-you-know items including (when available) the article URN + passage used",
+    )
+    tips_detail: List[TipWithEvidence] = Field(
+        default_factory=list,
+        description="Tip items including (when available) the article URN + passage used",
     )
     generated_at: str = Field(
         description="ISO timestamp when these tips were generated"

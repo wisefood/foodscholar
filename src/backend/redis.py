@@ -1,13 +1,23 @@
 """Redis client singleton for caching."""
-import redis
 import threading
 import logging
 import json
-from typing import Optional
+from typing import Optional, Any, TYPE_CHECKING
 
 from config import config
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:  # pragma: no cover
+    import redis as redis_type
+else:  # pragma: no cover
+    redis_type = Any
+
+try:
+    import redis
+except Exception as e:  # pragma: no cover
+    redis = None
+    _REDIS_IMPORT_ERROR = e
 
 
 class RedisClientSingleton:
@@ -27,6 +37,12 @@ class RedisClientSingleton:
 
     def _initialize(self):
         """Initialize Redis connection pool."""
+        if redis is None:  # pragma: no cover
+            raise RuntimeError(
+                "redis is required to use RedisClientSingleton. "
+                "Install it (and its dependencies) to enable caching features."
+            ) from _REDIS_IMPORT_ERROR
+
         redis_host = config.settings["REDIS_HOST"]
         redis_port = config.settings["REDIS_PORT"]
 
@@ -41,11 +57,11 @@ class RedisClientSingleton:
         logger.info(f"Initialized Redis connection pool at {redis_host}:{redis_port}")
 
     @property
-    def client(self) -> redis.Redis:
+    def client(self) -> "redis_type.Redis":
         """Get Redis client instance."""
         return self._client
 
-    def set(self, key: str, value: any, ex: Optional[int] = None):
+    def set(self, key: str, value: Any, ex: Optional[int] = None):
         """
         Set a value in Redis.
 
@@ -62,7 +78,7 @@ class RedisClientSingleton:
             logger.error(f"Error setting Redis key {key}: {e}")
             raise
 
-    def setex(self, key: str, time: int, value: any):
+    def setex(self, key: str, time: int, value: Any):
         """
         Set a value with expiration time.
 
@@ -79,7 +95,7 @@ class RedisClientSingleton:
             logger.error(f"Error setting Redis key {key} with expiration: {e}")
             raise
 
-    def get(self, key: str) -> Optional[any]:
+    def get(self, key: str) -> Optional[Any]:
         """
         Get a value from Redis.
 
@@ -159,6 +175,12 @@ class RedisClient:
 
     @classmethod
     def _initialize_redis(cls):
+        if redis is None:  # pragma: no cover
+            raise RuntimeError(
+                "redis is required to use RedisClient. "
+                "Install it (and its dependencies) to enable caching features."
+            ) from _REDIS_IMPORT_ERROR
+
         redis_host = config.settings["REDIS_HOST"]
         redis_port = config.settings["REDIS_PORT"]
 

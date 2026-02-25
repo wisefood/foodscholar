@@ -4,8 +4,17 @@ import logging
 import random
 import re
 import uuid
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
+
+_TIP_PASSAGE_MAX_CHARS = 320
+_TIP_PASSAGE_MIN_CHARS = 60
+
+try:
+    import json5  # type: ignore
+except Exception:  # pragma: no cover
+    json5 = None
 
 from models.qa import (
     QARequest,
@@ -20,12 +29,8 @@ from models.qa import (
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
 )
-from agents.qa_agent import QAAgent
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
-from backend.postgres import POSTGRES_ASYNC_SESSION_FACTORY
-from backend.redis import RedisClientSingleton
-from models.db import QARequestRecord, QAFeedbackRecord
 from utilities.cache import CacheManager
 from exceptions import InvalidError
 
@@ -36,6 +41,8 @@ TTL_QA_FEEDBACK = 2592000  # 30 days
 TTL_SIMPLE_NUTRI_QUESTIONS = 1800  # 30 minutes
 TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
 TIP_GROUNDING_TOP_K = 3
+TIP_SOURCE_ARTICLE_POOL_SIZE = 10
+TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS = 40
 MAX_TIP_REGEN_ATTEMPTS = 3
 MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS = 3
 TIPS_OF_THE_DAY_TIPS_COUNT = 2
@@ -90,6 +97,18 @@ HUMAN_EVIDENCE_TERMS = [
     "adults", "clinical trial", "randomized", "rct", "cohort", "meta-analysis",
     "systematic review", "cross-sectional", "observational study",
 ]
+
+
+def _compile_term_patterns(terms: List[str]) -> List[re.Pattern]:
+    return [
+        re.compile(r"\b" + re.escape(term.lower()) + r"\b")
+        for term in terms
+        if isinstance(term, str) and term.strip()
+    ]
+
+
+_ANIMAL_TERM_PATTERNS = _compile_term_patterns(ANIMAL_EVIDENCE_TERMS)
+_HUMAN_TERM_PATTERNS = _compile_term_patterns(HUMAN_EVIDENCE_TERMS)
 
 AMBIGUITY_KEYWORDS = [
     "better", "worse", "should", "recommend", "best", "opinion",
@@ -146,6 +165,8 @@ class QAService:
     def simple_question_redis(self):
         """Strict Redis client for starter question caching."""
         if self._simple_question_redis is None:
+            from backend.redis import RedisClientSingleton
+
             client = RedisClientSingleton().client
             client.ping()
             self._simple_question_redis = client
@@ -195,6 +216,14 @@ class QAService:
             cache_hit=False,
         )
 
+        self._persist_simple_questions_generation(
+            cache_key=cache_key,
+            questions=response.questions,
+            generated_at=response.generated_at,
+            model=SIMPLE_NUTRI_QUESTION_MODEL,
+            count=4,
+        )
+
         try:
             self.simple_question_redis.setex(
                 cache_key,
@@ -222,7 +251,7 @@ class QAService:
             prefix="qa",
             data={
                 "type": "tips_of_the_day",
-                "version": 2,
+                "version": 4,
                 "tips_count": tips_count,
                 "did_you_know_count": did_you_know_count,
             },
@@ -242,6 +271,13 @@ class QAService:
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
                 ):
+                    did_you_know_detail, tips_detail = self._normalize_tip_details(
+                        payload,
+                        tips_count=tips_count,
+                        did_you_know_count=did_you_know_count,
+                    )
+                    payload["did_you_know_detail"] = did_you_know_detail
+                    payload["tips_detail"] = tips_detail
                     payload["cache_hit"] = True
                     return TipsOfTheDayResponse(**payload)
                 logger.warning(
@@ -267,11 +303,30 @@ class QAService:
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
         )
+        did_you_know_detail, tips_detail = self._normalize_tip_details(
+            generated_payload,
+            tips_count=tips_count,
+            did_you_know_count=did_you_know_count,
+        )
         response = TipsOfTheDayResponse(
             did_you_know=generated_payload["did_you_know"],
             tips=generated_payload["tips"],
+            did_you_know_detail=did_you_know_detail,
+            tips_detail=tips_detail,
             generated_at=datetime.now().isoformat(),
             cache_hit=False,
+        )
+
+        self._persist_tips_generation(
+            cache_key=cache_key,
+            tips=response.tips,
+            did_you_know=response.did_you_know,
+            tips_detail=[d.model_dump() for d in response.tips_detail],
+            did_you_know_detail=[d.model_dump() for d in response.did_you_know_detail],
+            generated_at=response.generated_at,
+            model=SIMPLE_NUTRI_QUESTION_MODEL,
+            tips_count=tips_count,
+            did_you_know_count=did_you_know_count,
         )
 
         try:
@@ -292,6 +347,74 @@ class QAService:
             ) from e
 
         return response
+
+    def _parse_iso_datetime(self, value: str) -> datetime:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _persist_simple_questions_generation(
+        self,
+        *,
+        cache_key: str,
+        questions: List[str],
+        generated_at: str,
+        model: Optional[str],
+        count: int,
+    ) -> None:
+        """Best-effort persistence for starter questions (sync)."""
+        with suppress(Exception):
+            from backend.postgres import POSTGRES_SYNC_SESSION_FACTORY
+            from models.db import SimpleNutriQuestionsRecord
+
+            factory = POSTGRES_SYNC_SESSION_FACTORY()
+            with factory() as session:
+                session.add(
+                    SimpleNutriQuestionsRecord(
+                        cache_key=cache_key,
+                        model=model,
+                        count=count,
+                        questions=questions,
+                        generated_at=self._parse_iso_datetime(generated_at),
+                    )
+                )
+                session.commit()
+
+    def _persist_tips_generation(
+        self,
+        *,
+        cache_key: str,
+        tips: List[str],
+        did_you_know: List[str],
+        tips_detail: List[Dict[str, Any]],
+        did_you_know_detail: List[Dict[str, Any]],
+        generated_at: str,
+        model: Optional[str],
+        tips_count: int,
+        did_you_know_count: int,
+    ) -> None:
+        """Best-effort persistence for tips (sync)."""
+        with suppress(Exception):
+            from backend.postgres import POSTGRES_SYNC_SESSION_FACTORY
+            from models.db import TipsOfTheDayRecord
+
+            factory = POSTGRES_SYNC_SESSION_FACTORY()
+            with factory() as session:
+                session.add(
+                    TipsOfTheDayRecord(
+                        cache_key=cache_key,
+                        model=model,
+                        tips_count=tips_count,
+                        did_you_know_count=did_you_know_count,
+                        tips=tips,
+                        did_you_know=did_you_know,
+                        tips_detail=tips_detail,
+                        did_you_know_detail=did_you_know_detail,
+                        generated_at=self._parse_iso_datetime(generated_at),
+                    )
+                )
+                session.commit()
 
     async def answer_question(self, request: QARequest) -> QAResponse:
         """
@@ -331,6 +454,8 @@ class QAService:
             )
 
         # Primary answer
+        from agents.qa_agent import QAAgent
+
         primary_agent = QAAgent(model=effective_model, temperature=0.3)
         if effective_rag and articles:
             primary_answer, follow_ups = primary_agent.generate_answer_with_rag(
@@ -392,6 +517,9 @@ class QAService:
         dual_strategy: Optional[str] = None,
     ) -> None:
         """Persist the QA request and response to PostgreSQL (best-effort)."""
+        from backend.postgres import POSTGRES_ASYNC_SESSION_FACTORY
+        from models.db import QARequestRecord
+
         try:
             factory = POSTGRES_ASYNC_SESSION_FACTORY()
             async with factory() as session:
@@ -569,18 +697,22 @@ Rules:
         self,
         tips_count: int = TIPS_OF_THE_DAY_TIPS_COUNT,
         did_you_know_count: int = TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT,
-    ) -> Dict[str, List[str]]:
+    ) -> Dict[str, Any]:
         """Generate grounded tips/facts with validation and regeneration."""
         for attempt in range(1, MAX_TIP_REGEN_ATTEMPTS + 1):
             try:
                 payload = self._generate_tips_payload_once(
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
+                    seed_offset=attempt,
                 )
+                # During generation attempts, don't auto-fill missing items with
+                # fallbacks; allow regeneration to kick in.
                 payload = self._normalize_tips_payload(
                     payload,
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
+                    fill_with_fallback=False,
                 )
 
                 if self._is_tips_payload_appropriate(
@@ -588,7 +720,13 @@ Rules:
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
                 ):
-                    return payload
+                    # Final normalize can fill (should be no-op when complete).
+                    return self._normalize_tips_payload(
+                        payload,
+                        tips_count=tips_count,
+                        did_you_know_count=did_you_know_count,
+                        fill_with_fallback=True,
+                    )
 
                 logger.warning(
                     "Tips payload failed guardrails; regenerating (%d/%d).",
@@ -619,47 +757,232 @@ Rules:
         )
 
     def _generate_tips_payload_once(
-        self, tips_count: int, did_you_know_count: int
-    ) -> Dict[str, List[str]]:
+        self, tips_count: int, did_you_know_count: int, *, seed_offset: int = 0
+    ) -> Dict[str, Any]:
         """Single generation pass for tips/facts."""
         total_count = tips_count + did_you_know_count
-        candidate_count = max(total_count * 2, 8)
-        prompt = f"""You create daily nutrition content for a general audience.
+        candidate_count = max(total_count * 3, 12)
 
-Generate exactly {candidate_count} candidate items with a mix of:
+        # Use a daily seed so content varies day-to-day but stays stable within a day.
+        daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + int(seed_offset or 0)
+        source_articles = self._get_random_tip_source_articles(
+            size=max(TIP_SOURCE_ARTICLE_POOL_SIZE, candidate_count),
+            seed=daily_seed,
+        )
+        candidates = self._generate_tip_candidates_from_articles(
+            articles=source_articles,
+            candidate_count=candidate_count,
+        )
+
+        did_you_know_detail: List[Dict[str, Any]] = []
+        tips_detail: List[Dict[str, Any]] = []
+        seen = set()
+
+        for item in candidates:
+            if len(did_you_know_detail) >= did_you_know_count and len(tips_detail) >= tips_count:
+                break
+            if not isinstance(item, dict):
+                continue
+
+            kind = str(item.get("kind", "")).strip().lower()
+            text = str(item.get("text", "")).strip()
+            urn = str(item.get("urn", "")).strip()
+            passage = str(item.get("passage", "")).strip()
+            title = item.get("title", None)
+            publication_year = item.get("publication_year", None)
+
+            if kind not in ("tip", "did_you_know") or not text:
+                continue
+            if not self._is_tip_line_appropriate(text):
+                continue
+            if not urn or not passage:
+                continue
+
+            key = f"{kind}:{text.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            record = {
+                "text": text,
+                "evidence": {
+                    "urn": urn,
+                    "passage": passage,
+                    "title": title if isinstance(title, str) and title.strip() else None,
+                    "publication_year": publication_year if isinstance(publication_year, str) and publication_year.strip() else None,
+                },
+            }
+
+            if kind == "did_you_know" and len(did_you_know_detail) < did_you_know_count:
+                did_you_know_detail.append(record)
+            elif kind == "tip" and len(tips_detail) < tips_count:
+                tips_detail.append(record)
+
+        # No fallback here; allow regeneration to try a different random pool.
+        return {
+            "did_you_know": [d["text"] for d in did_you_know_detail],
+            "tips": [d["text"] for d in tips_detail],
+            "did_you_know_detail": did_you_know_detail,
+            "tips_detail": tips_detail,
+        }
+
+    def _get_random_tip_source_articles(
+        self, *, size: int, seed: int
+    ) -> List[Dict[str, Any]]:
+        """Fetch a randomized pool of source articles for tips/facts."""
+        try:
+            articles = ELASTIC_CLIENT.random_search(
+                index_name=self.INDEX_NAME,
+                size=size,
+                seed=seed,
+                filter_query={
+                    "bool": {"must_not": [{"term": {"status": "deleted"}}]}
+                },
+                source_excludes=["embedding"],
+            )
+        except Exception:
+            logger.exception("Random article fetch failed for tips.")
+            return []
+
+        cleaned: List[Dict[str, Any]] = []
+        for a in articles:
+            if not isinstance(a, dict):
+                continue
+            abstract = a.get("abstract") or a.get("description") or ""
+            if not isinstance(abstract, str):
+                abstract = str(abstract)
+            abstract = abstract.strip()
+            if len(abstract) < TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS:
+                continue
+            if self._mentions_animal_testing(abstract) or self._mentions_animal_testing(
+                a.get("title", "") or ""
+            ):
+                continue
+            cleaned.append(a)
+
+        return cleaned[:size]
+
+    def _generate_tip_candidates_from_articles(
+        self, *, articles: List[Dict[str, Any]], candidate_count: int
+    ) -> List[Dict[str, Any]]:
+        """Generate tip/fact candidates grounded in a randomized article pool."""
+        if not articles:
+            return []
+
+        article_context = self._prepare_tip_article_context(articles)
+        prompt = f"""You create safe daily nutrition content for a general audience.
+
+Using ONLY the evidence in the article abstracts below, generate exactly {candidate_count} items with a mix of:
 - practical nutrition tips
 - "Did you know?" nutrition facts
 
-Rules:
-- Keep each item short (<= 18 words).
-- Keep content general and educational.
-- Avoid diagnosis, treatment, medication, supplement dosage, or disease-management advice.
-- Return ONLY valid JSON in this exact format:
+Safety rules:
+- General education only (no diagnosis, treatment, medication, or disease-management advice).
+- No supplement dosage guidance.
+- Do not mention animals, animal studies, mice, rats, or preclinical models.
+- If an article is animal/preclinical-only or unclear, do NOT use it.
+
+Style rules:
+- Each item must be <= 18 words.
+- One sentence per item.
+- Avoid absolute guarantees (no "cures", "prevents", "always", "never").
+
+Return ONLY valid JSON in this exact format:
 {{
   "items": [
-    {{"kind": "tip", "text": "item text"}},
-    {{"kind": "did_you_know", "text": "item text"}}
+    {{"kind": "tip", "text": "item text", "article": 1}},
+    {{"kind": "did_you_know", "text": "item text", "article": 2}}
   ]
 }}
+
+Evidence:
+{article_context}
 """
         response = self.simple_question_llm.invoke(prompt)
         parsed = self._parse_tip_candidates_json(response.content)
-        candidates = parsed.get("items", [])
-        grounded_items = self._ground_tip_candidates(candidates, count=total_count)
+        items = parsed.get("items", [])
+        if not isinstance(items, list):
+            return []
 
-        if len(grounded_items) < total_count:
-            grounded_items.extend(
-                self._generate_fallback_tips(
-                    tips_count=tips_count,
-                    did_you_know_count=did_you_know_count,
-                )
+        valid: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "tip")).strip().lower()
+            text = str(item.get("text", "")).strip()
+            article_idx = item.get("article", None)
+            if kind not in ("tip", "did_you_know"):
+                continue
+            if not text:
+                continue
+            if not isinstance(article_idx, int) or not (1 <= article_idx <= len(articles)):
+                continue
+            if self._mentions_animal_testing(text) or self._violates_tip_safety_policy(text):
+                continue
+            article = articles[article_idx - 1]
+            urn = str(article.get("urn", article.get("_id", "")) or "").strip()
+            passage = self._extract_tip_passage(article, text)
+            if not urn or not passage:
+                continue
+            valid.append(
+                {
+                    "kind": kind,
+                    "text": text,
+                    "urn": urn,
+                    "passage": passage,
+                    "title": article.get("title", None),
+                    "publication_year": article.get("publication_year", None),
+                }
             )
 
-        return self._format_tips_payload(
-            grounded_items,
-            tips_count=tips_count,
-            did_you_know_count=did_you_know_count,
-        )
+        return valid
+
+    def _extract_tip_passage(self, article: Dict[str, Any], tip_text: str) -> str:
+        """Extract a short, best-matching passage from an article abstract/description."""
+        abstract = article.get("abstract") or article.get("description") or ""
+        if not isinstance(abstract, str):
+            abstract = str(abstract)
+        abstract = " ".join(abstract.split()).strip()
+        if not abstract:
+            return ""
+
+        # Split into sentence-like chunks.
+        chunks = re.split(r"(?<=[.!?])\s+", abstract)
+        chunks = [c.strip() for c in chunks if c and c.strip()]
+        if not chunks:
+            chunks = [abstract]
+
+        # Token overlap scoring (lightweight).
+        stop = {
+            "the", "and", "with", "from", "that", "this", "these", "those", "into", "onto",
+            "are", "was", "were", "been", "being", "for", "to", "of", "in", "on", "at", "as",
+            "a", "an", "or", "by", "it", "its", "their", "they", "them", "we", "you", "your",
+        }
+
+        def tokens(s: str) -> set[str]:
+            return {
+                t
+                for t in re.findall(r"[a-zA-Z]{3,}", s.lower())
+                if t not in stop
+            }
+
+        tip_tokens = tokens(tip_text)
+        best = chunks[0]
+        best_score = -1
+        for c in chunks:
+            c_tokens = tokens(c)
+            if not c_tokens:
+                continue
+            score = len(tip_tokens & c_tokens) if tip_tokens else 0
+            if score > best_score:
+                best_score = score
+                best = c
+
+        passage = best
+        if len(passage) < _TIP_PASSAGE_MIN_CHARS:
+            passage = abstract[:_TIP_PASSAGE_MAX_CHARS]
+        passage = passage[:_TIP_PASSAGE_MAX_CHARS].strip()
+        return passage
 
     def _ground_tip_candidates(
         self, candidates: List[Dict[str, Any]], count: int
@@ -799,8 +1122,8 @@ Evidence:
         if not text:
             return False
 
-        has_human = any(term in text for term in HUMAN_EVIDENCE_TERMS)
-        has_animal = any(term in text for term in ANIMAL_EVIDENCE_TERMS)
+        has_human = any(p.search(text) for p in _HUMAN_TERM_PATTERNS)
+        has_animal = any(p.search(text) for p in _ANIMAL_TERM_PATTERNS)
 
         if has_animal:
             return False
@@ -808,8 +1131,8 @@ Evidence:
 
     def _mentions_animal_testing(self, text: str) -> bool:
         """Guardrail for animal-testing phrasing in output."""
-        normalized = text.lower()
-        return any(term in normalized for term in ANIMAL_EVIDENCE_TERMS)
+        normalized = str(text).lower()
+        return any(p.search(normalized) for p in _ANIMAL_TERM_PATTERNS)
 
     def _violates_tip_safety_policy(self, text: str) -> bool:
         """Basic guardrail against medical advice in tips."""
@@ -831,7 +1154,20 @@ Evidence:
             "diabetes management",
             "cancer",
         ]
-        return any(term in normalized for term in blocked_terms)
+        if any(term in normalized for term in blocked_terms):
+            return True
+
+        # Catch explicit supplement-dose patterns (e.g. "take 500mg") without
+        # blocking common food/nutrition quantities in general tips.
+        has_dose_unit = re.search(r"\b\d+\s?(mg|mcg|μg|iu)\b", normalized) is not None
+        mentions_supplement = any(
+            term in normalized
+            for term in ("supplement", "capsule", "pill", "tablet", "take ")
+        )
+        if has_dose_unit and mentions_supplement:
+            return True
+
+        return False
 
     def _format_tips_payload(
         self,
@@ -887,8 +1223,28 @@ Evidence:
         payload: Dict[str, Any],
         tips_count: int,
         did_you_know_count: int,
+        *,
+        fill_with_fallback: bool = True,
     ) -> Dict[str, Any]:
         """Normalize cached/new payloads to did_you_know + tips shape."""
+        # If detailed items exist, prefer them as the source of truth.
+        details_dyk = payload.get("did_you_know_detail", [])
+        details_tips = payload.get("tips_detail", [])
+        if isinstance(details_dyk, list) and isinstance(details_tips, list) and (
+            details_dyk or details_tips
+        ):
+            did_you_know = []
+            tips = []
+            for item in details_dyk:
+                if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+                    did_you_know.append(item["text"].strip())
+            for item in details_tips:
+                if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+                    tips.append(item["text"].strip())
+            payload["did_you_know"] = did_you_know[:did_you_know_count]
+            payload["tips"] = tips[:tips_count]
+            return payload
+
         raw_did_you_know = payload.get("did_you_know", [])
         raw_tips = payload.get("tips", [])
 
@@ -909,16 +1265,68 @@ Evidence:
             combined_items,
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
+            fill_with_fallback=fill_with_fallback,
         )
         payload["did_you_know"] = did_you_know
         payload["tips"] = tips
         return payload
+
+    def _normalize_tip_details(
+        self,
+        payload: Dict[str, Any],
+        *,
+        tips_count: int,
+        did_you_know_count: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Normalize `*_detail` arrays, and synthesize them for fallback-only payloads."""
+        did_you_know_detail = payload.get("did_you_know_detail", [])
+        tips_detail = payload.get("tips_detail", [])
+
+        def _coerce(items: Any, max_count: int) -> List[Dict[str, Any]]:
+            if not isinstance(items, list):
+                return []
+            out: List[Dict[str, Any]] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                text = it.get("text")
+                evidence = it.get("evidence", None)
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                if evidence is not None and not isinstance(evidence, dict):
+                    evidence = None
+                out.append({"text": text.strip(), "evidence": evidence})
+                if len(out) >= max_count:
+                    break
+            return out
+
+        did_you_know_detail = _coerce(did_you_know_detail, did_you_know_count)
+        tips_detail = _coerce(tips_detail, tips_count)
+
+        # If we don't have detailed evidence (e.g. fallback tips), synthesize entries
+        # with `evidence=None` so clients have a consistent shape.
+        if len(did_you_know_detail) < did_you_know_count:
+            for text in payload.get("did_you_know", [])[:did_you_know_count]:
+                if len(did_you_know_detail) >= did_you_know_count:
+                    break
+                if isinstance(text, str) and text.strip():
+                    did_you_know_detail.append({"text": text.strip(), "evidence": None})
+        if len(tips_detail) < tips_count:
+            for text in payload.get("tips", [])[:tips_count]:
+                if len(tips_detail) >= tips_count:
+                    break
+                if isinstance(text, str) and text.strip():
+                    tips_detail.append({"text": text.strip(), "evidence": None})
+
+        return did_you_know_detail[:did_you_know_count], tips_detail[:tips_count]
 
     def _split_tip_items(
         self,
         items: List[str],
         tips_count: int,
         did_you_know_count: int,
+        *,
+        fill_with_fallback: bool = True,
     ) -> Tuple[List[str], List[str]]:
         """Classify mixed tip strings into fact and tip arrays."""
         did_you_know: List[str] = []
@@ -964,41 +1372,42 @@ Evidence:
             ):
                 break
 
-        missing_did_you_know = max(did_you_know_count - len(did_you_know), 0)
-        missing_tips = max(tips_count - len(tips), 0)
-        if missing_did_you_know > 0 or missing_tips > 0:
-            fallback_items = self._generate_fallback_tips(
-                tips_count=missing_tips,
-                did_you_know_count=missing_did_you_know,
-            )
-            for fallback_item in fallback_items:
-                if not isinstance(fallback_item, str):
-                    continue
-                text = " ".join(fallback_item.split()).strip()
-                if not text:
-                    continue
-                lower_text = text.lower()
-                if lower_text.startswith("did you know?"):
-                    value = text[len("did you know?"):].strip(" :")
-                    key = f"did_you_know:{value.lower()}"
+        if fill_with_fallback:
+            missing_did_you_know = max(did_you_know_count - len(did_you_know), 0)
+            missing_tips = max(tips_count - len(tips), 0)
+            if missing_did_you_know > 0 or missing_tips > 0:
+                fallback_items = self._generate_fallback_tips(
+                    tips_count=missing_tips,
+                    did_you_know_count=missing_did_you_know,
+                )
+                for fallback_item in fallback_items:
+                    if not isinstance(fallback_item, str):
+                        continue
+                    text = " ".join(fallback_item.split()).strip()
+                    if not text:
+                        continue
+                    lower_text = text.lower()
+                    if lower_text.startswith("did you know?"):
+                        value = text[len("did you know?"):].strip(" :")
+                        key = f"did_you_know:{value.lower()}"
+                        if (
+                            value
+                            and key not in seen
+                            and len(did_you_know) < did_you_know_count
+                        ):
+                            did_you_know.append(value)
+                            seen.add(key)
+                    elif lower_text.startswith("tip:"):
+                        value = text[len("tip:"):].strip(" :")
+                        key = f"tip:{value.lower()}"
+                        if value and key not in seen and len(tips) < tips_count:
+                            tips.append(value)
+                            seen.add(key)
                     if (
-                        value
-                        and key not in seen
-                        and len(did_you_know) < did_you_know_count
+                        len(did_you_know) >= did_you_know_count
+                        and len(tips) >= tips_count
                     ):
-                        did_you_know.append(value)
-                        seen.add(key)
-                elif lower_text.startswith("tip:"):
-                    value = text[len("tip:"):].strip(" :")
-                    key = f"tip:{value.lower()}"
-                    if value and key not in seen and len(tips) < tips_count:
-                        tips.append(value)
-                        seen.add(key)
-                if (
-                    len(did_you_know) >= did_you_know_count
-                    and len(tips) >= tips_count
-                ):
-                    break
+                        break
 
         return did_you_know, tips
 
@@ -1012,7 +1421,16 @@ Evidence:
             text = text.split("```", 1)[1].split("```", 1)[0].strip()
 
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except Exception:
+            # Common model failure mode: trailing commas.
+            fixed = re.sub(r",\s*([}\]])", r"\1", text)
+            if fixed != text:
+                return json.loads(fixed)
+            if json5 is None:
+                raise
+            return json5.loads(text)
 
     def _parse_tip_candidates_json(self, content: str) -> Dict[str, Any]:
         """Parse JSON tip candidate payload from model output."""
@@ -1024,7 +1442,16 @@ Evidence:
             text = text.split("```", 1)[1].split("```", 1)[0].strip()
 
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except Exception:
+            # Common model failure mode: trailing commas.
+            fixed = re.sub(r",\s*([}\]])", r"\1", text)
+            if fixed != text:
+                return json.loads(fixed)
+            if json5 is None:
+                raise
+            return json5.loads(text)
 
     def _generate_fallback_questions(self, count: int) -> List[str]:
         """Emergency fallback without a fixed question pool."""
@@ -1165,6 +1592,8 @@ Evidence:
             strategy_name, request_id,
         )
 
+        from agents.qa_agent import QAAgent
+
         secondary_agent = QAAgent(
             model=secondary_model, temperature=secondary_temp
         )
@@ -1210,6 +1639,9 @@ Evidence:
         self, feedback: QAFeedbackRequest
     ) -> QAFeedbackResponse:
         """Store user feedback to PostgreSQL."""
+        from backend.postgres import POSTGRES_ASYNC_SESSION_FACTORY
+        from models.db import QAFeedbackRecord
+
         feedback_mode = (
             "ab_preference" if feedback.preferred_answer is not None else "general"
         )
