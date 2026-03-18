@@ -234,6 +234,16 @@ class GuidelineJobServiceTests(unittest.TestCase):
                 f"pdf:{artifact_uuid}".encode("utf-8"),
             )
 
+    def test_guideline_import_request_normalizes_legacy_action_type(self):
+        from models.guidelines import GuidelineImportRequest
+
+        request = GuidelineImportRequest(
+            guide_id="mediterranean_guide",
+            action_type="encourage",
+        )
+
+        self.assertEqual(request.action_type, "choose")
+
     def test_import_latest_result_to_guide_dry_run_dedupes_existing(self):
         artifact_uuid = "123e4567-e89b-12d3-a456-426614174000"
         guide_id = "mediterranean_guide"
@@ -245,7 +255,7 @@ class GuidelineJobServiceTests(unittest.TestCase):
                     sequence_no=4,
                     rule_text="Eat vegetables daily",
                     page_no=2,
-                    action_type="encourage",
+                    action_type="choose",
                 )
             ]
             service, result_store = self._make_service(
@@ -290,7 +300,6 @@ class GuidelineJobServiceTests(unittest.TestCase):
                     guide_id=guide_id,
                     dry_run=True,
                     dedupe_against_guide=True,
-                    action_type="encourage",
                     existing_scan_limit=100,
                 )
             )
@@ -301,7 +310,9 @@ class GuidelineJobServiceTests(unittest.TestCase):
             self.assertEqual(response.total_created, 0)
             self.assertEqual(response.next_sequence_no_start, 5)
             self.assertEqual(response.items[0].status, "skipped_existing")
+            self.assertEqual(response.items[0].action_type, "choose")
             self.assertEqual(response.items[1].status, "would_create")
+            self.assertEqual(response.items[1].action_type, "choose")
             self.assertEqual(response.items[1].sequence_no, 5)
 
 

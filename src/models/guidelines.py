@@ -1,10 +1,55 @@
 """Request and response models for guideline extraction endpoints."""
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.guideline_extractor import get_default_dpi, get_default_model
+
+GuidelineActionType = Literal[
+    "eat",
+    "drink",
+    "use",
+    "do",
+    "avoid",
+    "prepare",
+    "limit",
+    "choose",
+    "increase",
+    "reduce",
+]
+
+GUIDELINE_ACTION_TYPES: tuple[str, ...] = (
+    "eat",
+    "drink",
+    "use",
+    "do",
+    "avoid",
+    "prepare",
+    "limit",
+    "choose",
+    "increase",
+    "reduce",
+)
+GUIDELINE_ACTION_TYPE_ALIASES: dict[str, GuidelineActionType] = {
+    "encourage": "choose",
+}
+DEFAULT_GUIDELINE_ACTION_TYPE: GuidelineActionType = "choose"
+
+
+def normalize_guideline_action_type(value: str) -> GuidelineActionType:
+    """Normalize legacy action type aliases to the platform-supported enum."""
+    if not isinstance(value, str):
+        raise TypeError("Guideline action_type must be a string.")
+
+    normalized = value.strip().lower()
+    normalized = GUIDELINE_ACTION_TYPE_ALIASES.get(normalized, normalized)
+    if normalized not in GUIDELINE_ACTION_TYPES:
+        allowed = ", ".join(f"'{item}'" for item in GUIDELINE_ACTION_TYPES)
+        raise ValueError(
+            f"Unsupported guideline action_type '{value}'. Use one of: {allowed}."
+        )
+    return cast(GuidelineActionType, normalized)
 
 
 class GuidelineExtractionRunRequest(BaseModel):
@@ -124,9 +169,12 @@ class GuidelineImportRequest(BaseModel):
         default=True,
         description="Skip extracted rules already present on the target guide",
     )
-    action_type: str = Field(
-        default="encourage",
-        description="Action type to use for all newly created guidelines",
+    action_type: GuidelineActionType = Field(
+        default=DEFAULT_GUIDELINE_ACTION_TYPE,
+        description=(
+            "Action type to use for all newly created guidelines. "
+            "Legacy 'encourage' inputs are normalized to 'choose'."
+        ),
     )
     existing_scan_limit: int = Field(
         default=500,
@@ -135,13 +183,21 @@ class GuidelineImportRequest(BaseModel):
         description="Maximum number of existing guide guidelines to scan when deduping and calculating sequence numbers",
     )
 
+    @field_validator("action_type", mode="before")
+    @classmethod
+    def validate_action_type(cls, value: str) -> GuidelineActionType:
+        """Normalize backwards-compatible action type aliases before validation."""
+        return normalize_guideline_action_type(value)
+
 
 class GuidelineImportItemResponse(BaseModel):
     """One guideline candidate or created import result."""
 
     rule_text: str = Field(description="Guideline rule text")
     page_no: Optional[int] = Field(default=None, description="Source PDF page number")
-    action_type: str = Field(description="Action type used for the guideline")
+    action_type: GuidelineActionType = Field(
+        description="Action type used for the guideline"
+    )
     sequence_no: Optional[int] = Field(default=None, description="Assigned or proposed sequence number")
     status: Literal["would_create", "created", "skipped_existing"] = Field(
         description="Import outcome for this guideline"

@@ -13,13 +13,17 @@ from typing import Any, Optional
 
 from config import config
 from models.guidelines import (
+    DEFAULT_GUIDELINE_ACTION_TYPE,
     GuidelineArtifactStorageResponse,
+    GuidelineActionType,
     GuidelineExtractionJobResponse,
     GuidelineExtractionResponse,
     GuidelineImportItemResponse,
     GuidelineImportResponse,
+    normalize_guideline_action_type,
 )
 from services.guideline_extractor import (
+    GuidelineExtractionError,
     GuidelineExtractorService,
     get_default_dpi,
     get_default_model,
@@ -420,7 +424,7 @@ class GuidelineJobService:
     @staticmethod
     def _collect_unique_import_candidates(
         result: GuidelineExtractionResponse,
-        action_type: str,
+        action_type: GuidelineActionType,
     ) -> list[dict[str, Any]]:
         """Collapse extracted guideline rows into unique import candidates."""
         candidates: list[dict[str, Any]] = []
@@ -475,10 +479,15 @@ class GuidelineJobService:
         *,
         dry_run: bool = True,
         dedupe_against_guide: bool = True,
-        action_type: str = "encourage",
+        action_type: str = DEFAULT_GUIDELINE_ACTION_TYPE,
         existing_scan_limit: int = 500,
     ) -> GuidelineImportResponse:
         """Import the latest persisted extraction result into a WiseFood guide."""
+        try:
+            normalized_action_type = normalize_guideline_action_type(action_type)
+        except (TypeError, ValueError) as exc:
+            raise GuidelineExtractionError(str(exc)) from exc
+
         self.get_storage(artifact_uuid)
         result = await self.result_store.fetch_result(artifact_uuid)
         if result is None:
@@ -496,7 +505,9 @@ class GuidelineJobService:
                 f"No completed guideline extraction result found for artifact {artifact_uuid}."
             )
 
-        candidates = self._collect_unique_import_candidates(result, action_type)
+        candidates = self._collect_unique_import_candidates(
+            result, normalized_action_type
+        )
         client = self.platform_pool.get_client()
         created_ids: list[str] = []
 
