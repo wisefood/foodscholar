@@ -50,6 +50,36 @@ class Config:
         self.settings["POSTGRES_MAX_OVERFLOW"] = int(
             os.getenv("POSTGRES_MAX_OVERFLOW", 20)
         )
+        self.settings["GUIDELINE_PDF_WORKSPACE"] = os.getenv(
+            "GUIDELINE_PDF_WORKSPACE", "/tmp/foodscholar/guideline_artifacts"
+        )
+        self.settings["GUIDELINE_ARTIFACT_FILENAME"] = os.getenv(
+            "GUIDELINE_ARTIFACT_FILENAME", "source.pdf"
+        )
+        self.settings["GUIDELINE_EXTRACTION_MODEL"] = os.getenv(
+            "GUIDELINE_EXTRACTION_MODEL", "gpt-5.4"
+        )
+        self.settings["GUIDELINE_RENDER_DPI"] = int(
+            os.getenv("GUIDELINE_RENDER_DPI", "144")
+        )
+        self.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"] = (
+            os.getenv("ENABLE_GUIDELINE_EXTRACTION_WORKER", "true").lower() == "true"
+        )
+        self.settings["GUIDELINE_WORKER_POLL_INTERVAL"] = int(
+            os.getenv("GUIDELINE_WORKER_POLL_INTERVAL", "5")
+        )
+        self.settings["GUIDELINE_JOB_QUEUE_KEY"] = os.getenv(
+            "GUIDELINE_JOB_QUEUE_KEY", "guidelines:queue"
+        )
+        self.settings["GUIDELINE_JOB_STATUS_PREFIX"] = os.getenv(
+            "GUIDELINE_JOB_STATUS_PREFIX", "guidelines:job"
+        )
+        self.settings["GUIDELINE_JOB_LOCK_PREFIX"] = os.getenv(
+            "GUIDELINE_JOB_LOCK_PREFIX", "guidelines:lock"
+        )
+        self.settings["GUIDELINE_JOB_LOCK_TIMEOUT"] = int(
+            os.getenv("GUIDELINE_JOB_LOCK_TIMEOUT", "7200")
+        )
 
 
 # Configure application settings

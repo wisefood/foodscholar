@@ -135,3 +135,24 @@ class TipsOfTheDayRecord(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class GuidelineExtractionRecord(Base):
+    """Latest persisted guideline extraction result for an artifact."""
+
+    __tablename__ = "guideline_extractions"
+    __table_args__ = {"schema": SCHEMA}
+
+    artifact_id = Column(UUID(as_uuid=True), primary_key=True)
+    result_json = Column(JSONB, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

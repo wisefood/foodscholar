@@ -10,12 +10,17 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text
 
 from routers.generic import install_error_handler
-from api.v1 import search, sessions, enrich, qa
+from api.v1 import search, sessions, enrich, qa, guidelines
 from backend.db_init import init_db
 from workers.enrichment_worker import (
     start_background_worker,
     stop_background_worker,
     get_worker,
+)
+from workers.guideline_extraction_worker import (
+    start_guideline_worker,
+    stop_guideline_worker,
+    get_guideline_worker,
 )
 from config import config
 
@@ -39,18 +44,24 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Starting background enrichment worker...")
         start_background_worker()
+    if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
+        logger.info("Starting guideline extraction worker...")
+        start_guideline_worker()
 
     yield
-
-    logger.info("App shutdown: closing DB connections")
-    from backend.postgres import PostgresConnectionSingleton
-    await PostgresConnectionSingleton.close()
-    logger.info("DB connections closed")
 
     # Shutdown
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Stopping background enrichment worker...")
         stop_background_worker()
+    if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
+        logger.info("Stopping guideline extraction worker...")
+        stop_guideline_worker()
+
+    logger.info("App shutdown: closing DB connections")
+    from backend.postgres import PostgresConnectionSingleton
+    await PostgresConnectionSingleton.close()
+    logger.info("DB connections closed")
 
 
 # Initialize FastAPI app
@@ -83,6 +94,7 @@ FoodScholar: AI-powered scientific literature assistant for food science.
 - `/api/v1/search` - Search summarization endpoints
 - `/api/v1/qa` - Question answering endpoints
 - `/api/v1/sessions` - Chat session management
+    - `/api/v1/guidelines` - Guideline extraction from downloaded artifact PDFs
     """,
     version="1.0.0",
     debug=config.settings["DEBUG"],
@@ -105,6 +117,7 @@ app.include_router(search.router, prefix="/api/v1")
 app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(enrich.router, prefix="/api/v1")
 app.include_router(qa.router, prefix="/api/v1")
+app.include_router(guidelines.router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -122,6 +135,11 @@ async def root():
             "qa_models": "/api/v1/qa/models",
             "qa_questions": "/api/v1/qa/questions",
             "qa_tips_of_the_day": "/api/v1/qa/tips",
+            "guideline_extract": "/api/v1/guidelines/extract/{artifact_uuid}",
+            "guideline_extract_status": "/api/v1/guidelines/extract/{artifact_uuid}",
+            "guideline_import": "/api/v1/guidelines/import/{artifact_uuid}",
+            "guideline_storage": "/api/v1/guidelines/storage/{artifact_uuid}",
+            "guideline_worker_status": "/api/v1/guidelines/worker/status",
             "trending": "/api/v1/search/trending",
             "chat": "/api/v1/sessions/chat",
             "docs": "/docs",
@@ -145,6 +163,9 @@ async def health_check():
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         worker = get_worker()
         health_data["background_worker"] = worker.get_stats()
+    if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
+        guideline_worker = get_guideline_worker()
+        health_data["guideline_worker"] = guideline_worker.get_stats()
 
     return health_data
 
