@@ -55,6 +55,18 @@ TIP_SOURCE_ARTICLE_POOL_SIZE = 10
 TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS = 40
 TIP_SOURCE_GUIDELINE_POOL_SIZE = 24
 TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS = 12
+TIP_SOURCE_TOPIC_QUERIES = [
+    "fruit vegetables daily intake healthy eating",
+    "whole grains bread rice pasta dietary guidance",
+    "water drinks sugar beverages hydration guideline",
+    "fish eggs legumes beans protein foods guideline",
+    "milk dairy calcium dietary guide",
+    "salt sodium limit food guide",
+    "saturated fat oils spreads dietary guidance",
+    "red meat processed meat weekly intake guideline",
+    "breakfast cereals fiber wholegrain guideline",
+    "snacks sweets alcohol moderation dietary guide",
+]
 QA_GUIDELINE_RAG_TOP_K_MAX = 5
 MAX_TIP_REGEN_ATTEMPTS = 3
 MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS = 3
@@ -1697,9 +1709,11 @@ Rules:
         daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + int(
             seed_offset or 0
         )
+        guideline_query = self._tip_source_query(daily_seed, branch="guidelines")
         source_guidelines = self._get_random_tip_source_guidelines(
             size=max(TIP_SOURCE_GUIDELINE_POOL_SIZE, candidate_count),
             seed=daily_seed,
+            query=guideline_query,
         )
         candidates = self._generate_tip_candidates_from_guidelines(
             guidelines=source_guidelines,
@@ -1709,9 +1723,11 @@ Rules:
             logger.warning(
                 "No guideline-backed tips could be generated; falling back to article sources."
             )
+            article_query = self._tip_source_query(daily_seed, branch="articles")
             source_articles = self._get_random_tip_source_articles(
                 size=max(TIP_SOURCE_ARTICLE_POOL_SIZE, candidate_count),
                 seed=daily_seed,
+                query=article_query,
             )
             candidates = self._generate_tip_candidates_from_articles(
                 articles=source_articles,
@@ -1781,25 +1797,41 @@ Rules:
             "tips_detail": tips_detail,
         }
 
+    def _tip_source_query(self, seed: int, *, branch: str) -> str:
+        """Select a varied topical query for daily tip source scouting."""
+        offset = 0 if branch == "guidelines" else len(TIP_SOURCE_TOPIC_QUERIES) // 2
+        idx = (int(seed) + offset) % len(TIP_SOURCE_TOPIC_QUERIES)
+        return TIP_SOURCE_TOPIC_QUERIES[idx]
+
     def _get_random_tip_source_guidelines(
-        self, *, size: int, seed: int
+        self, *, size: int, seed: int, query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Fetch a randomized pool of dietary guideline rules for tips/facts."""
         try:
-            guidelines = ELASTIC_CLIENT.random_search(
-                index_name=self.GUIDELINES_INDEX_NAME,
+            guidelines = self._search_tip_source_guidelines(
                 size=size,
                 seed=seed,
-                filter_query={
-                    "bool": {
-                        "must": [{"exists": {"field": "rule_text"}}],
-                        "must_not": [{"term": {"status": "deleted"}}],
-                    }
-                },
+                query=query,
             )
         except Exception:
-            logger.exception("Random guideline fetch failed for tips.")
-            return []
+            logger.exception(
+                "Topic guideline fetch failed for tips; falling back to random search."
+            )
+            try:
+                guidelines = ELASTIC_CLIENT.random_search(
+                    index_name=self.GUIDELINES_INDEX_NAME,
+                    size=size,
+                    seed=seed,
+                    filter_query={
+                        "bool": {
+                            "must": [{"exists": {"field": "rule_text"}}],
+                            "must_not": [{"term": {"status": "deleted"}}],
+                        }
+                    },
+                )
+            except Exception:
+                logger.exception("Random guideline fetch failed for tips.")
+                return []
 
         cleaned: List[Dict[str, Any]] = []
         seen_rules = set()
@@ -1818,6 +1850,56 @@ Rules:
             cleaned.append(guideline)
 
         return cleaned[:size]
+
+    def _search_tip_source_guidelines(
+        self,
+        *,
+        size: int,
+        seed: int,
+        query: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Search a topical-but-randomized guideline pool for daily tips."""
+        if not query:
+            return ELASTIC_CLIENT.random_search(
+                index_name=self.GUIDELINES_INDEX_NAME,
+                size=size,
+                seed=seed,
+                filter_query={
+                    "bool": {
+                        "must": [{"exists": {"field": "rule_text"}}],
+                        "must_not": [{"term": {"status": "deleted"}}],
+                    }
+                },
+            )
+
+        body = {
+            "bool": {
+                "must": [
+                    {"exists": {"field": "rule_text"}},
+                    {
+                        "multi_match": {
+                            "query": query,
+                            "fields": [
+                                "rule_text^4",
+                                "title^2",
+                                "notes",
+                                "food_groups^2",
+                                "target_populations",
+                                "guide_region",
+                            ],
+                            "type": "best_fields",
+                        }
+                    },
+                ],
+                "must_not": [{"term": {"status": "deleted"}}],
+            }
+        }
+        return ELASTIC_CLIENT.random_search(
+            index_name=self.GUIDELINES_INDEX_NAME,
+            size=size,
+            seed=seed,
+            filter_query=body,
+        )
 
     def _generate_tip_candidates_from_guidelines(
         self, *, guidelines: List[Dict[str, Any]], candidate_count: int
@@ -2088,16 +2170,13 @@ Dietary guideline rules:
                 "use ",
             )
         ):
-            text = f"Use dietary guide advice: {text}"
+            text = f"Keep in mind that {text[0].lower()}{text[1:]}" if text else ""
         return self._shorten_tip_sentence(text, max_words=18)
 
     def _guideline_rule_to_fact(self, rule_text: str) -> str:
         """Turn a guideline rule into a concise did-you-know style fact."""
         text = self._clean_guideline_generated_text(rule_text)
-        return self._shorten_tip_sentence(
-            f"Dietary guides advise: {text}",
-            max_words=18,
-        )
+        return self._shorten_tip_sentence(text, max_words=18)
 
     def _clean_guideline_generated_text(self, text: str) -> str:
         """Clean source text before deterministic tip/fact formatting."""
@@ -2140,22 +2219,32 @@ Dietary guideline rules:
         return None
 
     def _get_random_tip_source_articles(
-        self, *, size: int, seed: int
+        self, *, size: int, seed: int, query: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Fetch a randomized pool of source articles for tips/facts."""
         try:
-            articles = ELASTIC_CLIENT.random_search(
-                index_name=self.INDEX_NAME,
+            articles = self._search_tip_source_articles(
                 size=size,
                 seed=seed,
-                filter_query={
-                    "bool": {"must_not": [{"term": {"status": "deleted"}}]}
-                },
-                source_excludes=["embedding"],
+                query=query,
             )
         except Exception:
-            logger.exception("Random article fetch failed for tips.")
-            return []
+            logger.exception(
+                "Topic article fetch failed for tips; falling back to random search."
+            )
+            try:
+                articles = ELASTIC_CLIENT.random_search(
+                    index_name=self.INDEX_NAME,
+                    size=size,
+                    seed=seed,
+                    filter_query={
+                        "bool": {"must_not": [{"term": {"status": "deleted"}}]}
+                    },
+                    source_excludes=["embedding"],
+                )
+            except Exception:
+                logger.exception("Random article fetch failed for tips.")
+                return []
 
         cleaned: List[Dict[str, Any]] = []
         for a in articles:
@@ -2174,6 +2263,52 @@ Dietary guideline rules:
             cleaned.append(a)
 
         return cleaned[:size]
+
+    def _search_tip_source_articles(
+        self,
+        *,
+        size: int,
+        seed: int,
+        query: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Search a topical-but-randomized article pool for daily tips."""
+        if not query:
+            return ELASTIC_CLIENT.random_search(
+                index_name=self.INDEX_NAME,
+                size=size,
+                seed=seed,
+                filter_query={
+                    "bool": {"must_not": [{"term": {"status": "deleted"}}]}
+                },
+                source_excludes=["embedding"],
+            )
+
+        body = {
+            "bool": {
+                "must": [
+                    {
+                        "multi_match": {
+                            "query": query,
+                            "fields": [
+                                "title^3",
+                                "abstract^2",
+                                "description^2",
+                                "tags",
+                            ],
+                            "type": "best_fields",
+                        }
+                    }
+                ],
+                "must_not": [{"term": {"status": "deleted"}}],
+            }
+        }
+        return ELASTIC_CLIENT.random_search(
+            index_name=self.INDEX_NAME,
+            size=size,
+            seed=seed,
+            filter_query=body,
+            source_excludes=["embedding"],
+        )
 
     def _generate_tip_candidates_from_articles(
         self, *, articles: List[Dict[str, Any]], candidate_count: int
@@ -2555,13 +2690,26 @@ Evidence:
             tips = []
             for item in details_dyk:
                 if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+                    item["text"] = self._naturalize_tip_detail_text(
+                        kind="did_you_know",
+                        text=item["text"],
+                        evidence=item.get("evidence"),
+                    )
                     did_you_know.append(item["text"].strip())
             for item in details_tips:
                 if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+                    item["text"] = self._naturalize_tip_detail_text(
+                        kind="tip",
+                        text=item["text"],
+                        evidence=item.get("evidence"),
+                    )
                     tips.append(item["text"].strip())
             payload["did_you_know"] = did_you_know[:did_you_know_count]
             payload["tips"] = tips[:tips_count]
             return payload
+
+        payload["did_you_know_detail"] = details_dyk
+        payload["tips_detail"] = details_tips
 
         raw_did_you_know = payload.get("did_you_know", [])
         raw_tips = payload.get("tips", [])
@@ -2588,6 +2736,40 @@ Evidence:
         payload["did_you_know"] = did_you_know
         payload["tips"] = tips
         return payload
+
+    def _naturalize_tip_detail_text(
+        self,
+        *,
+        kind: str,
+        text: str,
+        evidence: Any,
+    ) -> str:
+        """Clean old mechanical tip/fact wording while leaving evidence intact."""
+        source_text = str(text or "").strip()
+        passage = None
+        if isinstance(evidence, dict):
+            raw_passage = evidence.get("passage")
+            if isinstance(raw_passage, str) and raw_passage.strip():
+                passage = raw_passage.strip()
+
+        lowered = source_text.lower()
+        mechanical_prefixes = (
+            "dietary guides advise:",
+            "use dietary guide advice:",
+            "did you know?",
+            "tip:",
+        )
+        if passage and lowered.startswith(mechanical_prefixes):
+            source_text = passage
+        else:
+            for prefix in mechanical_prefixes:
+                if lowered.startswith(prefix):
+                    source_text = source_text[len(prefix):].strip(" :")
+                    break
+
+        if kind == "did_you_know":
+            return self._guideline_rule_to_fact(source_text)
+        return self._guideline_rule_to_tip(source_text)
 
     def _normalize_tip_details(
         self,

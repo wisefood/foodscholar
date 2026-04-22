@@ -58,7 +58,7 @@ class QAClarifierSafetyAgent:
                     """You are FoodScholar's combined Clarifier and Safety planner.
 
 Return ONLY valid JSON matching this schema:
-{
+{{
   "original_question": "string",
   "canonical_question": "string",
   "article_query": "string",
@@ -68,16 +68,16 @@ Return ONLY valid JSON matching this schema:
   "safety_flags": ["string"],
   "answer_guardrails": ["string"],
   "needs_clarification": true,
-  "clarification": {
+  "clarification": {{
     "id": "stable_snake_case_id",
     "question": "one short question",
     "input_type": "single_choice | multiple_choice | free_text | number | boolean",
-    "options": [{"label": "short label", "value": "stable_value", "description": null}],
+    "options": [{{"label": "short label", "value": "stable_value", "description": null}}],
     "allow_free_text": true,
     "reason": "why this materially changes the answer"
-  },
+  }},
   "reasoning_summary": "short operational note"
-}
+}}
 
 Responsibilities:
 - Ask clarification only when the missing detail materially changes safety, retrieval, or practical advice.

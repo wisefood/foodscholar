@@ -115,6 +115,72 @@ class TipsGenerationTests(unittest.TestCase):
                 payload["did_you_know_detail"][0]["evidence"]["passage"],
                 guidelines[0]["rule_text"],
             )
+            all_text = " ".join(payload["tips"] + payload["did_you_know"])
+            self.assertNotIn("Use dietary guide advice", all_text)
+            self.assertNotIn("Dietary guides advise", all_text)
+
+    def test_cached_tip_details_are_naturalized_without_changing_evidence(self):
+        from services.qa_service import QAService
+
+        service = QAService(cache_enabled=False)
+        evidence = {
+            "urn": "urn:guide:smoothies",
+            "passage": (
+                "Smoothies can count towards your fruit and vegetable intake, "
+                "but choose only fruit- and/or vegetable-based smoothies and "
+                "check the label for sugar and fat."
+            ),
+            "title": "Smoothies can count",
+        }
+        payload = {
+            "did_you_know_detail": [
+                {
+                    "text": "Dietary guides advise: Smoothies can count towards your fruit and vegetable intake.",
+                    "evidence": evidence,
+                }
+            ],
+            "tips_detail": [
+                {
+                    "text": "Use dietary guide advice: Smoothies can count towards your fruit and vegetable intake, but choose only fruit- and/or.",
+                    "evidence": evidence,
+                }
+            ],
+        }
+
+        normalized = service._normalize_tips_payload(
+            payload,
+            tips_count=1,
+            did_you_know_count=1,
+        )
+
+        self.assertNotIn("Dietary guides advise", normalized["did_you_know"][0])
+        self.assertNotIn("Use dietary guide advice", normalized["tips"][0])
+        self.assertIs(normalized["tips_detail"][0]["evidence"], evidence)
+        self.assertIs(normalized["did_you_know_detail"][0]["evidence"], evidence)
+
+    def test_tip_source_queries_are_topical(self):
+        import services.qa_service as qa_service_module
+        from services.qa_service import QAService
+
+        calls = []
+
+        def _random_search(index_name: str, **kwargs):
+            calls.append((index_name, kwargs))
+            return []
+
+        with patch.object(
+            qa_service_module.ELASTIC_CLIENT,
+            "random_search",
+            side_effect=_random_search,
+        ):
+            service = QAService(cache_enabled=False)
+            service._get_random_tip_source_guidelines(size=3, seed=20260422, query="whole grains")
+            service._get_random_tip_source_articles(size=3, seed=20260422, query="fiber")
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("multi_match", str(calls[0][1]["filter_query"]))
+        self.assertIn("whole grains", str(calls[0][1]["filter_query"]))
+        self.assertIn("fiber", str(calls[1][1]["filter_query"]))
 
     def test_generate_tips_uses_generated_items(self):
         import services.qa_service as qa_service_module
