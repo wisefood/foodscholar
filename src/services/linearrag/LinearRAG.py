@@ -637,13 +637,13 @@ class LinearRAG:
                 retrieval_results.append(result)
             except Exception as e:
                 logger.error(f"Error processing question: {question}. Error: {str(e)}")
-                err_str = "Error"
                 result = {
-                    "question": err_str,
-                    "sorted_passage": err_str,
-                    "sorted_passage_scores": err_str,
-                    "sources": err_str,
-                    "gold_answer": err_str
+                    "question": question,
+                    "sorted_passage": [],
+                    "sorted_passage_scores": [],
+                    "sources": [],
+                    "gold_answer": "",
+                    "error": str(e),
                 }
                 retrieval_results.append(result)
                 continue
@@ -1070,6 +1070,8 @@ class LinearRAG:
     def get_seed_entities(self, question):
         question_entities = self.spacy_ner.question_ner(question)
         if len(question_entities) == 0:
+            return [],[],[],[]
+        if self.entity_embeddings.ndim < 2 or self.entity_embeddings.shape[0] == 0:
             return [],[],[],[]
         question_entity_embeddings = self.config.embedding_model.encode(question_entities,normalize_embeddings=True,show_progress_bar=False,batch_size=self.config.batch_size)
         similarities = np.dot(self.entity_embeddings, question_entity_embeddings.T)
