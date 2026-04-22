@@ -163,7 +163,6 @@ class QAService:
         self._simple_question_llm = None
         self._simple_question_redis = None
         self._qa_threads: Dict[str, Dict[str, Any]] = {}
-        self._wisefood_api_client = None
         self._retriever_adapters = QARetrieverAdapters(
             embed_query=self._embed_query,
             articles_index=self.INDEX_NAME,
@@ -981,57 +980,40 @@ class QAService:
 
     def _lookup_member_context(self, member_id: str) -> Dict[str, Any]:
         """Fetch member household context through the WiseFood API client."""
-        client = self._get_wisefood_api_client()
+        from backend.platform import WISEFOOD_PLATFORM
 
-        members_proxy = getattr(client, "members", None) or getattr(
-            client, "member", None
-        )
-        households_proxy = getattr(client, "households", None) or getattr(
-            client, "household", None
-        )
-        if not members_proxy or not households_proxy:
-            raise RuntimeError("WiseFood Client does not expose members/households")
+        client = WISEFOOD_PLATFORM.get_client()
+        try:
+            members_proxy = getattr(client, "members", None) or getattr(
+                client, "member", None
+            )
+            households_proxy = getattr(client, "households", None) or getattr(
+                client, "household", None
+            )
+            if not members_proxy or not households_proxy:
+                raise RuntimeError("WiseFood Client does not expose members/households")
 
-        member = members_proxy.get(member_id)
-        household_id = self._object_value(member, "household_id")
-        household = households_proxy.get(household_id) if household_id else None
+            member = members_proxy.get(member_id)
+            household_id = self._object_value(member, "household_id")
+            household = households_proxy.get(household_id) if household_id else None
 
-        region = self._object_value(household, "region") if household else None
-        profile = self._member_profile_dict(member)
-        experience_group = (
-            profile.get("experience_group")
-            or profile.get("expertise_level")
-            or profile.get("nutrition_experience")
-        )
+            region = self._object_value(household, "region") if household else None
+            profile = self._member_profile_dict(member)
+            experience_group = (
+                profile.get("experience_group")
+                or profile.get("expertise_level")
+                or profile.get("nutrition_experience")
+            )
 
-        return {
-            "country": self._country_from_region(region),
-            "region": region,
-            "experience_group": experience_group,
-            "member_age_group": self._object_value(member, "age_group"),
-            "profile": self._safe_profile_subset(profile),
-        }
-
-    def _get_wisefood_api_client(self):
-        """Lazy-load the systemic WiseFood client, not the data-catalog client."""
-        if self._wisefood_api_client is not None:
-            return self._wisefood_api_client
-
-        from config import config
-        from wisefood.api_client import Client, Credentials
-
-        base_url = config.settings.get("WISEFOOD_API_URL") or config.settings.get(
-            "DATA_API_URL"
-        )
-        credentials = Credentials(
-            client_id=config.settings["KEYCLOAK_CLIENT_ID"],
-            client_secret=config.settings["KEYCLOAK_CLIENT_SECRET"],
-        )
-        self._wisefood_api_client = Client(
-            base_url=base_url,
-            credentials=credentials,
-        )
-        return self._wisefood_api_client
+            return {
+                "country": self._country_from_region(region),
+                "region": region,
+                "experience_group": experience_group,
+                "member_age_group": self._object_value(member, "age_group"),
+                "profile": self._safe_profile_subset(profile),
+            }
+        finally:
+            WISEFOOD_PLATFORM.return_client(client)
 
     @staticmethod
     def _object_value(obj: Any, key: str) -> Optional[Any]:

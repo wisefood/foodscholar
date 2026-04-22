@@ -29,6 +29,9 @@ class Config:
         self.settings["WISEFOOD_API_URL"] = os.getenv(
             "WISEFOOD_API_URL", self.settings["DATA_API_URL"]
         )
+        self.settings["WISEFOOD_PLATFORM_API_URL"] = os.getenv(
+            "WISEFOOD_PLATFORM_API_URL", self.settings["WISEFOOD_API_URL"]
+        )
         self.settings["CACHE_ENABLED"] = (
             os.getenv("CACHE_ENABLED", "false").lower() == "true"
         )
