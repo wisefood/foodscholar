@@ -7,8 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain.prompts import ChatPromptTemplate
 
 from backend.groq import GROQ_CHAT
-from models.qa import QAAnswer, DEFAULT_GROQ_MODEL
-from utilities.citation_validator import create_citation_from_article
+from models.qa import QAAnswer, QACitation, DEFAULT_GROQ_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +36,8 @@ class QAAgent:
         articles: List[Dict[str, Any]],
         expertise_level: str = "intermediate",
         language: str = "en",
+        retriever: str = "rag",
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[QAAnswer, List[str]]:
         """
         Generate an answer using retrieved articles as context (RAG mode).
@@ -46,6 +47,8 @@ class QAAgent:
             articles: Retrieved articles from kNN search
             expertise_level: beginner/intermediate/expert
             language: ISO 639-1 language code
+            retriever: Retrieval strategy that produced the sources
+            user_context: Optional country/member context for personalization
 
         Returns:
             Tuple of (QAAnswer with citations, follow-up suggestions)
@@ -55,7 +58,11 @@ class QAAgent:
             question[:80], len(articles), self.model,
         )
 
-        source_context = self._prepare_article_context(articles)
+        source_context = self._prepare_article_context(articles, retriever=retriever)
+        answer_context = self._format_answer_context(
+            retriever=retriever,
+            user_context=user_context,
+        )
         complexity = COMPLEXITY_INSTRUCTIONS.get(
             expertise_level, COMPLEXITY_INSTRUCTIONS["intermediate"]
         )
@@ -68,6 +75,9 @@ EXPERTISE LEVEL: {expertise_level}
 
 LANGUAGE: Respond in {language}.
 
+ANSWER FORMULATION CONTEXT:
+{answer_context}
+
 CRITICAL RULES:
 1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
@@ -76,9 +86,11 @@ CRITICAL RULES:
 5. If the retrieved sources do not contain sufficient information, say so explicitly.
 6. Do NOT fabricate information beyond what the retrieved sources support.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
-8. Clearly indicate when findings are preliminary vs well-established.
-9. If sources disagree, present both perspectives.
-10. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
+8. LinearRAG sources are passage-level snippets. Only cite them when the provided passage itself supports the claim.
+9. If the user's country/region is known, prefer country- or region-specific guidance when the retrieved evidence supports it; otherwise state that the answer is general.
+10. Clearly indicate when findings are preliminary vs well-established.
+11. If sources disagree, present both perspectives.
+12. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract or passage text. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -120,6 +132,7 @@ Answer the question concisely using the sources above as evidence."""),
         question: str,
         expertise_level: str = "intermediate",
         language: str = "en",
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[QAAnswer, List[str]]:
         """
         Generate an answer using only LLM parametric knowledge (no retrieval).
@@ -128,6 +141,7 @@ Answer the question concisely using the sources above as evidence."""),
             question: User's question
             expertise_level: beginner/intermediate/expert
             language: ISO 639-1 language code
+            user_context: Optional country/member context for personalization
 
         Returns:
             Tuple of (QAAnswer with no article citations, follow-up suggestions)
@@ -140,6 +154,10 @@ Answer the question concisely using the sources above as evidence."""),
         complexity = COMPLEXITY_INSTRUCTIONS.get(
             expertise_level, COMPLEXITY_INSTRUCTIONS["intermediate"]
         )
+        answer_context = self._format_answer_context(
+            retriever="no_rag",
+            user_context=user_context,
+        )
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", f"""You are FoodScholar, a scientific Q&A assistant specializing in food science, nutrition, and food safety. Answer the user's question using your training knowledge.
@@ -149,12 +167,16 @@ EXPERTISE LEVEL: {expertise_level}
 
 LANGUAGE: Respond in {language}.
 
+ANSWER FORMULATION CONTEXT:
+{answer_context}
+
 CRITICAL RULES:
 1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
 2. Be honest about uncertainty. Use hedging language when appropriate.
 3. Since no specific articles are provided, do NOT fabricate citations or article references.
 4. Mention general knowledge sources where applicable (e.g., "according to WHO guidelines").
 5. Clearly distinguish between well-established facts and emerging research.
+6. If the user's country/region is known, localize the answer only when you can do so safely; otherwise say the guidance may vary by country.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -176,7 +198,70 @@ Answer the question concisely using your scientific knowledge."""),
         follow_ups = parsed.get("follow_ups", [])
         return answer, follow_ups
 
-    def _prepare_article_context(self, articles: List[Dict[str, Any]]) -> str:
+    def _format_answer_context(
+        self,
+        *,
+        retriever: str,
+        user_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Format retrieval and user context for the answer-formulation prompt."""
+        context = user_context or {}
+        parts = [f"- Retriever: {retriever}"]
+
+        if retriever == "linearrag":
+            parts.append(
+                "- Evidence shape: graph/passage retrieval; each source text may be a passage rather than a full abstract."
+            )
+        elif retriever == "rag":
+            parts.append(
+                "- Evidence shape: Elastic RAG; sources may mix scientific article abstracts and dietary guideline rules."
+            )
+        else:
+            parts.append(
+                "- Evidence shape: no retrieved evidence; do not create citations."
+            )
+
+        region = context.get("region")
+        country = context.get("country")
+        experience_group = context.get("experience_group")
+        member_age_group = context.get("member_age_group")
+        if country or region:
+            parts.append(
+                f"- User geography: country={country or 'unknown'}, region={region or 'unknown'}."
+            )
+        if experience_group:
+            parts.append(f"- Experience group: {experience_group}.")
+        if member_age_group:
+            parts.append(f"- Member age group: {member_age_group}.")
+
+        profile = context.get("profile") if isinstance(context, dict) else None
+        if isinstance(profile, dict):
+            dietary_groups = profile.get("dietary_groups") or []
+            allergies = profile.get("allergies") or []
+            if dietary_groups:
+                parts.append(f"- Dietary groups: {', '.join(map(str, dietary_groups[:5]))}.")
+            if allergies:
+                parts.append(f"- Allergies: {', '.join(map(str, allergies[:5]))}.")
+
+        safety = context.get("safety") if isinstance(context, dict) else None
+        if isinstance(safety, dict):
+            risk_level = safety.get("risk_level")
+            flags = safety.get("flags") or []
+            guardrails = safety.get("guardrails") or []
+            if risk_level:
+                parts.append(f"- Safety risk level: {risk_level}.")
+            if flags:
+                parts.append(f"- Safety flags: {', '.join(map(str, flags[:6]))}.")
+            for guardrail in guardrails[:4]:
+                parts.append(f"- Guardrail: {guardrail}")
+
+        return "\n".join(parts)
+
+    def _prepare_article_context(
+        self,
+        articles: List[Dict[str, Any]],
+        retriever: str = "rag",
+    ) -> str:
         """Format retrieved RAG sources for the LLM context window."""
         summaries = []
         for idx, article in enumerate(articles, 1):
@@ -188,6 +273,7 @@ Answer the question concisely using your scientific knowledge."""),
                 )
                 summary = f"""Guideline {idx}:
 - Source Type: dietary_guideline
+- Retriever: {article.get('retriever', retriever)}
 - URN: {article.get('urn', article.get('id', article.get('_id', 'N/A')))}
 - Title: {article.get('title', 'Dietary guideline')}
 - Guide URN: {article.get('guide_urn', 'N/A')}
@@ -219,6 +305,7 @@ Answer the question concisely using your scientific knowledge."""),
 
             summary = f"""Article {idx}:
 - Source Type: article
+- Retriever: {article.get('retriever', retriever)}
 - URN: {article.get('urn', 'N/A')}
 - Title: {article.get('title', 'N/A')}
 - Authors: {author_str}
@@ -304,7 +391,7 @@ Answer the question concisely using your scientific knowledge."""),
                     quote = self._coerce_quote_to_source_span(
                         cited.get("quote"), source_text, question=question
                     )
-                    citation = create_citation_from_article(
+                    citation = self._create_source_citation(
                         source,
                         section=cited.get(
                             "section",
@@ -321,7 +408,58 @@ Answer the question concisely using your scientific knowledge."""),
             confidence=parsed.get("overall_confidence", "medium"),
             model_used=self.model,
             rag_used=rag_used,
+            sources_consulted=len(articles) if articles else 0,
             articles_consulted=len(articles) if articles else 0,
+        )
+
+    def _create_source_citation(
+        self,
+        source: Dict[str, Any],
+        section: str,
+        quote: Optional[str] = None,
+        confidence: str = "medium",
+    ) -> QACitation:
+        """Create a type-aware QA citation from retrieved source metadata."""
+        raw_year = source.get("publication_year") or source.get("year")
+        year = None
+        if raw_year:
+            try:
+                year = int(str(raw_year)[:4])
+            except (ValueError, TypeError):
+                pass
+
+        source_type = "guideline" if self._is_guideline_source(source) else "article"
+        source_id = source.get("urn") or source.get("id") or source.get("_id") or ""
+        source_title = source.get("title") or (
+            "Dietary guideline" if source_type == "guideline" else "Unknown Title"
+        )
+        source_url = (
+            f"/guidelines/{source_id}"
+            if source_type == "guideline"
+            else f"/articles/{source_id}"
+        )
+
+        authors = source.get("authors")
+        if isinstance(authors, str):
+            authors = [authors]
+        if source_type == "guideline":
+            authors = None
+
+        return QACitation(
+            source_type=source_type,
+            source_id=source_id,
+            source_title=source_title,
+            source_url=source_url,
+            authors=authors,
+            year=year,
+            venue=source.get("venue")
+            or source.get("journal")
+            or source.get("guide_region")
+            or source.get("country"),
+            section=section,
+            quote=quote,
+            confidence=confidence,
+            relevance_score=source.get("relevance_score") or source.get("_score"),
         )
 
     @staticmethod

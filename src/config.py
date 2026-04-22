@@ -26,6 +26,9 @@ class Config:
         self.settings["DATA_API_URL"] = os.getenv(
             "DATA_API_URL", "http://data-catalog:8000"
         )
+        self.settings["WISEFOOD_API_URL"] = os.getenv(
+            "WISEFOOD_API_URL", self.settings["DATA_API_URL"]
+        )
         self.settings["CACHE_ENABLED"] = (
             os.getenv("CACHE_ENABLED", "false").lower() == "true"
         )

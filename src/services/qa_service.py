@@ -6,7 +6,7 @@ import re
 import uuid
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 _TIP_PASSAGE_MAX_CHARS = 320
 _TIP_PASSAGE_MIN_CHARS = 60
@@ -20,7 +20,10 @@ from models.qa import (
     QARequest,
     QAResponse,
     QAAnswer,
-    RetrievedArticle,
+    RetrievedSource,
+    QAClarifierSafetyPlan,
+    ClarificationRequest,
+    QAUserContext,
     DualAnswerFeedback,
     QAFeedbackRequest,
     QAFeedbackResponse,
@@ -31,6 +34,11 @@ from models.qa import (
 )
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
+from services.qa_retrievers import (
+    QARetrieverAdapters,
+    RetrievalResult,
+    guideline_context_should_clauses,
+)
 from utilities.cache import CacheManager
 from exceptions import InvalidError
 
@@ -38,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 TTL_QA_RESPONSE = 86400  # 1 day
 TTL_QA_FEEDBACK = 2592000  # 30 days
+TTL_QA_CLARIFICATION_THREAD = 1800  # 30 minutes
 TTL_SIMPLE_NUTRI_QUESTIONS = 1800  # 30 minutes
 TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
 TIP_GROUNDING_TOP_K = 3
@@ -144,6 +153,13 @@ class QAService:
         self._embedder = None
         self._simple_question_llm = None
         self._simple_question_redis = None
+        self._qa_threads: Dict[str, Dict[str, Any]] = {}
+        self._wisefood_api_client = None
+        self._retriever_adapters = QARetrieverAdapters(
+            embed_query=self._embed_query,
+            articles_index=self.INDEX_NAME,
+            guidelines_index=self.GUIDELINES_INDEX_NAME,
+        )
 
     @property
     def embedder(self):
@@ -429,59 +445,136 @@ class QAService:
 
     async def answer_question(self, request: QARequest) -> QAResponse:
         """
-        Main orchestration: validate, retrieve, generate, optionally dual-answer.
+        Main orchestration: validate, clarify if needed, retrieve, generate.
 
         Flow:
         1. Validate request (model selection in advanced mode)
-        2. Check cache
-        3. Embed query and kNN search (if RAG enabled)
-        4. Generate primary answer via QAAgent
-        5. Optionally generate secondary answer (dual-answer A/B)
-        6. Cache result
-        7. Return QAResponse
+        2. Resolve member/country/experience context
+        3. Ask one structured clarification only when materially needed
+        4. Check cache
+        5. Retrieve sources, if enabled
+        6. Generate primary answer via QAAgent
+        7. Optionally generate secondary answer (dual-answer A/B)
+        8. Cache and persist result
         """
         request_id = str(uuid.uuid4())
 
         self._validate_request(request)
 
         effective_model = self._resolve_model(request)
-        effective_rag = request.retriever != "no_rag"
-        if request.mode == "advanced":
-            effective_rag = request.rag_enabled
+        effective_retriever = self._resolve_retriever(request)
+        effective_rag = effective_retriever != "no_rag"
+        user_context = self._resolve_user_context(request)
+        thread_context = self._load_qa_thread(request.qa_thread_id)
+        user_context = self._merge_thread_user_context(user_context, thread_context)
+
+        if thread_context and request.clarification_response is None:
+            clarification = ClarificationRequest(**thread_context["clarification"])
+            return self._build_clarification_response(
+                request=request,
+                request_id=request_id,
+                thread_id=thread_context["thread_id"],
+                clarification=clarification,
+                model_used=effective_model,
+                user_context=user_context,
+            )
+
+        effective_question = self._compose_effective_question(
+            request=request,
+            thread_context=thread_context,
+        )
+        user_context = self._apply_clarification_to_user_context(
+            user_context,
+            request.clarification_response,
+        )
+        answered_ids = self._answered_clarification_ids(thread_context, request)
+        plan = self._plan_clarification_safety(
+            question=effective_question,
+            request=request,
+            user_context=user_context,
+            answered_ids=answered_ids,
+            model=effective_model,
+        )
+
+        clarification = plan.clarification if plan.needs_clarification else None
+        if clarification:
+            thread_id = request.qa_thread_id or str(uuid.uuid4())
+            self._store_qa_thread(
+                thread_id=thread_id,
+                question=effective_question,
+                request=request,
+                clarification=clarification,
+                user_context=user_context,
+                answered_ids=answered_ids,
+            )
+            return self._build_clarification_response(
+                request=request,
+                request_id=request_id,
+                thread_id=thread_id,
+                clarification=clarification,
+                model_used=effective_model,
+                user_context=user_context,
+            )
 
         # Cache check
-        cache_key = self._build_cache_key(request)
+        cache_key = self._build_cache_key(
+            request,
+            question=effective_question,
+            effective_retriever=effective_retriever,
+            user_context=user_context,
+        )
         cached = self.cache_manager.get(cache_key)
         if cached:
-            logger.info("Cache hit for QA: %s...", request.question[:50])
+            logger.info("Cache hit for QA: %s...", effective_question[:50])
             cached["cache_hit"] = True
             cached["request_id"] = request_id
+            if request.qa_thread_id and request.clarification_response:
+                self._clear_qa_thread(request.qa_thread_id)
             return QAResponse(**cached)
 
         # Retrieval
-        articles: List[Dict[str, Any]] = []
-        retrieved_articles: List[RetrievedArticle] = []
+        source_payloads: List[Dict[str, Any]] = []
+        retrieved_sources: List[RetrievedSource] = []
+        retrieval_result = self._retrieve_sources(
+            question=effective_question,
+            plan=plan,
+            top_k=request.top_k,
+            retriever=effective_retriever,
+            user_context=user_context,
+        )
         if effective_rag:
-            articles, retrieved_articles = self._retrieve_articles(
-                request.question, request.top_k, retriever=request.retriever
-            )
+            source_payloads = retrieval_result.source_payloads
+            retrieved_sources = retrieval_result.retrieved_sources
 
         # Primary answer
         from agents.qa_agent import QAAgent
 
         primary_agent = QAAgent(model=effective_model, temperature=0.3)
-        if effective_rag and articles:
+        context_payload = user_context.model_dump(exclude_none=True)
+        context_payload["safety"] = {
+            "risk_level": plan.risk_level,
+            "flags": plan.safety_flags,
+            "guardrails": plan.answer_guardrails,
+        }
+        context_payload["retrieval_plan"] = {
+            "article_query": plan.article_query,
+            "guideline_query": plan.guideline_query,
+        }
+        if effective_rag and source_payloads:
             primary_answer, follow_ups = primary_agent.generate_answer_with_rag(
-                question=request.question,
-                articles=articles,
+                question=effective_question,
+                articles=source_payloads,
                 expertise_level=request.expertise_level,
                 language=request.language,
+                retriever=effective_retriever,
+                user_context=context_payload,
             )
         else:
             primary_answer, follow_ups = primary_agent.generate_answer_without_rag(
-                question=request.question,
+                question=effective_question,
                 expertise_level=request.expertise_level,
                 language=request.language,
+                user_context=context_payload,
             )
 
         # Dual-answer logic (simple mode only)
@@ -489,23 +582,34 @@ class QAService:
         dual_feedback: Optional[DualAnswerFeedback] = None
         dual_strategy: Optional[str] = None
         if request.mode == "simple" and self._should_generate_dual_answer(
-            request.question
+            effective_question
         ):
             secondary_answer, dual_feedback, dual_strategy = (
-                self._generate_secondary_answer(request, articles, request_id)
+                self._generate_secondary_answer(
+                    request,
+                    source_payloads,
+                    request_id,
+                    question=effective_question,
+                    retriever=effective_retriever,
+                    user_context=context_payload,
+                )
             )
 
         response = QAResponse(
-            question=request.question,
+            question=effective_question,
             mode=request.mode,
             primary_answer=primary_answer,
             secondary_answer=secondary_answer,
             dual_answer_feedback=dual_feedback,
-            retrieved_articles=retrieved_articles,
+            retrieved_sources=retrieved_sources,
             follow_up_suggestions=follow_ups or None,
             generated_at=datetime.now().isoformat(),
             cache_hit=False,
             request_id=request_id,
+            qa_thread_id=request.qa_thread_id,
+            needs_clarification=False,
+            clarification=None,
+            user_context=user_context,
         )
 
         # Cache only non-dual responses
@@ -515,11 +619,432 @@ class QAService:
             )
 
         # Persist to PostgreSQL
-        await self._persist_request(
-            request, response, effective_model, effective_rag, dual_strategy
+        persist_request = request.model_copy(
+            update={
+                "question": effective_question,
+                "retriever": effective_retriever,
+            }
         )
+        await self._persist_request(
+            persist_request, response, effective_model, effective_rag, dual_strategy
+        )
+        if request.qa_thread_id and request.clarification_response:
+            self._clear_qa_thread(request.qa_thread_id)
 
         return response
+
+    def _resolve_retriever(self, request: QARequest) -> str:
+        """Resolve the effective retriever after advanced-mode toggles."""
+        if request.mode == "advanced" and not request.rag_enabled:
+            return "no_rag"
+        return request.retriever
+
+    def _plan_clarification_safety(
+        self,
+        *,
+        question: str,
+        request: QARequest,
+        user_context: QAUserContext,
+        answered_ids: Set[str],
+        model: str,
+    ) -> QAClarifierSafetyPlan:
+        """Run the single structured clarifier/safety step with fallback."""
+        from agents.qa_clarifier import (
+            QAClarifierSafetyAgent,
+            build_fallback_plan,
+        )
+
+        try:
+            return QAClarifierSafetyAgent(model=model).plan(
+                question=question,
+                request=request,
+                user_context=user_context,
+                answered_ids=answered_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Using fallback QA clarifier/safety plan: %s",
+                exc,
+                exc_info=True,
+            )
+            return build_fallback_plan(
+                question=question,
+                request=request,
+                user_context=user_context,
+                answered_ids=answered_ids,
+            )
+
+    def _retrieve_sources(
+        self,
+        *,
+        question: str,
+        plan: QAClarifierSafetyPlan,
+        top_k: int,
+        retriever: str,
+        user_context: Optional[QAUserContext],
+    ) -> RetrievalResult:
+        """Retrieve evidence through the selected adapter."""
+        self._retriever_adapters = QARetrieverAdapters(
+            embed_query=self._embed_query,
+            articles_index=self.INDEX_NAME,
+            guidelines_index=self.GUIDELINES_INDEX_NAME,
+        )
+        adapter = self._retriever_adapters.get(retriever)
+        result = adapter.retrieve(
+            question=question,
+            plan=plan,
+            top_k=top_k,
+            user_context=user_context,
+        )
+        logger.info("QA retrieval status: %s", result.status)
+        return result
+
+    def _resolve_user_context(self, request: QARequest) -> QAUserContext:
+        """Resolve country/region and audience context for retrieval and answering."""
+        context = QAUserContext(
+            experience_group=request.experience_group or request.expertise_level,
+        )
+
+        if not request.member_id:
+            return context
+
+        try:
+            member_context = self._lookup_member_context(request.member_id)
+        except Exception as exc:
+            logger.warning(
+                "Unable to resolve WiseFood member context for %s: %s",
+                request.member_id,
+                exc,
+                exc_info=True,
+            )
+            return context
+
+        data = context.model_dump()
+        data.update({k: v for k, v in member_context.items() if v is not None})
+        if not data.get("country") and data.get("region"):
+            data["country"] = self._country_from_region(data["region"])
+        return QAUserContext(**data)
+
+    def _lookup_member_context(self, member_id: str) -> Dict[str, Any]:
+        """Fetch member household context through the WiseFood API client."""
+        client = self._get_wisefood_api_client()
+
+        members_proxy = getattr(client, "members", None) or getattr(
+            client, "member", None
+        )
+        households_proxy = getattr(client, "households", None) or getattr(
+            client, "household", None
+        )
+        if not members_proxy or not households_proxy:
+            raise RuntimeError("WiseFood Client does not expose members/households")
+
+        member = members_proxy.get(member_id)
+        household_id = self._object_value(member, "household_id")
+        household = households_proxy.get(household_id) if household_id else None
+
+        region = self._object_value(household, "region") if household else None
+        profile = self._member_profile_dict(member)
+        experience_group = (
+            profile.get("experience_group")
+            or profile.get("expertise_level")
+            or profile.get("nutrition_experience")
+        )
+
+        return {
+            "country": self._country_from_region(region),
+            "region": region,
+            "experience_group": experience_group,
+            "member_age_group": self._object_value(member, "age_group"),
+            "profile": self._safe_profile_subset(profile),
+        }
+
+    def _get_wisefood_api_client(self):
+        """Lazy-load the systemic WiseFood client, not the data-catalog client."""
+        if self._wisefood_api_client is not None:
+            return self._wisefood_api_client
+
+        from config import config
+        from wisefood.api_client import Client, Credentials
+
+        base_url = config.settings.get("WISEFOOD_API_URL") or config.settings.get(
+            "DATA_API_URL"
+        )
+        credentials = Credentials(
+            client_id=config.settings["KEYCLOAK_CLIENT_ID"],
+            client_secret=config.settings["KEYCLOAK_CLIENT_SECRET"],
+        )
+        self._wisefood_api_client = Client(
+            base_url=base_url,
+            credentials=credentials,
+        )
+        return self._wisefood_api_client
+
+    @staticmethod
+    def _object_value(obj: Any, key: str) -> Optional[Any]:
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        if hasattr(obj, key):
+            return getattr(obj, key)
+        data = getattr(obj, "_data", None)
+        if isinstance(data, dict):
+            return data.get(key)
+        return None
+
+    def _member_profile_dict(self, member: Any) -> Dict[str, Any]:
+        try:
+            profile = getattr(member, "profile", None)
+        except Exception:
+            return {}
+        if profile is None:
+            return {}
+        if isinstance(profile, dict):
+            return profile
+        if hasattr(profile, "to_dict"):
+            data = profile.to_dict()
+            return data if isinstance(data, dict) else {}
+        data = getattr(profile, "_data", None)
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _safe_profile_subset(profile: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {
+            "dietary_groups",
+            "allergies",
+            "nutritional_preferences",
+            "properties",
+        }
+        return {key: profile[key] for key in allowed if key in profile}
+
+    @staticmethod
+    def _country_from_region(region: Optional[str]) -> Optional[str]:
+        if not isinstance(region, str) or not region.strip():
+            return None
+        region = region.strip()
+        if "-" in region:
+            return region.split("-", 1)[0].upper()
+        if len(region) <= 3:
+            return region.upper()
+        return region
+
+    def _load_qa_thread(
+        self, thread_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if not thread_id:
+            return None
+
+        now = datetime.now(timezone.utc).timestamp()
+        thread = self._qa_threads.get(thread_id)
+        if thread and thread.get("expires_at", 0) > now:
+            return thread
+        if thread:
+            self._qa_threads.pop(thread_id, None)
+
+        cached = self.cache_manager.get(f"qa_thread:{thread_id}")
+        if isinstance(cached, dict):
+            cached["thread_id"] = thread_id
+            cached.setdefault("expires_at", now + TTL_QA_CLARIFICATION_THREAD)
+            self._qa_threads[thread_id] = cached
+            return cached
+        return None
+
+    def _clear_qa_thread(self, thread_id: str) -> None:
+        self._qa_threads.pop(thread_id, None)
+        self.cache_manager.delete(f"qa_thread:{thread_id}")
+
+    @staticmethod
+    def _merge_thread_user_context(
+        current: QAUserContext,
+        thread_context: Optional[Dict[str, Any]],
+    ) -> QAUserContext:
+        if not thread_context or not isinstance(thread_context.get("user_context"), dict):
+            return current
+
+        stored = {
+            key: value
+            for key, value in thread_context["user_context"].items()
+            if value not in (None, "", [], {})
+        }
+        current_data = current.model_dump()
+        merged = {**stored, **{k: v for k, v in current_data.items() if v not in (None, "", [], {})}}
+        return QAUserContext(**merged)
+
+    @staticmethod
+    def _answered_clarification_ids(
+        thread_context: Optional[Dict[str, Any]],
+        request: QARequest,
+    ) -> Set[str]:
+        answered = set()
+        if thread_context:
+            answered.update(
+                str(item)
+                for item in thread_context.get("answered_ids", [])
+                if item
+            )
+        if request.clarification_response and request.clarification_response.question_id:
+            answered.add(request.clarification_response.question_id)
+        return answered
+
+    def _apply_clarification_to_user_context(
+        self,
+        user_context: QAUserContext,
+        clarification_response: Optional[Any],
+    ) -> QAUserContext:
+        if clarification_response is None or not clarification_response.question_id:
+            return user_context
+
+        data = user_context.model_dump()
+        selected = [
+            value
+            for value in clarification_response.selected_values
+            if isinstance(value, str) and value.strip()
+        ]
+        free_text = (
+            clarification_response.free_text.strip()
+            if isinstance(clarification_response.free_text, str)
+            else None
+        )
+
+        if clarification_response.question_id == "country_or_region":
+            value = selected[0] if selected else free_text
+            if value and value != "general":
+                data["region"] = value
+                data["country"] = self._country_from_region(value)
+
+        if clarification_response.question_id == "target_age_group":
+            value = selected[0] if selected else free_text
+            if value:
+                data["member_age_group"] = value
+
+        return QAUserContext(**data)
+
+    def _store_qa_thread(
+        self,
+        *,
+        thread_id: str,
+        question: str,
+        request: QARequest,
+        clarification: ClarificationRequest,
+        user_context: QAUserContext,
+        answered_ids: Optional[Set[str]] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).timestamp()
+        payload = {
+            "thread_id": thread_id,
+            "question": question,
+            "request": request.model_dump(),
+            "clarification": clarification.model_dump(),
+            "user_context": user_context.model_dump(),
+            "answered_ids": sorted(answered_ids or set()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": now + TTL_QA_CLARIFICATION_THREAD,
+        }
+        self._qa_threads[thread_id] = payload
+        self.cache_manager.set(
+            f"qa_thread:{thread_id}",
+            payload,
+            ttl=TTL_QA_CLARIFICATION_THREAD,
+        )
+
+    def _compose_effective_question(
+        self,
+        *,
+        request: QARequest,
+        thread_context: Optional[Dict[str, Any]],
+    ) -> str:
+        if not thread_context or not request.clarification_response:
+            return request.question
+
+        base_question = thread_context.get("question") or request.question
+        clarification = thread_context.get("clarification") or {}
+        answer_text = self._format_clarification_answer(
+            clarification=clarification,
+            response=request.clarification_response.model_dump(),
+        )
+        if not answer_text:
+            return base_question
+
+        clarification_question = clarification.get("question") or "Clarification"
+        return (
+            f"{base_question}\n\n"
+            f"User clarification - {clarification_question}: {answer_text}"
+        )
+
+    @staticmethod
+    def _format_clarification_answer(
+        *,
+        clarification: Dict[str, Any],
+        response: Dict[str, Any],
+    ) -> str:
+        options = clarification.get("options") or []
+        labels_by_value = {
+            str(option.get("value")): option.get("label", option.get("value"))
+            for option in options
+            if isinstance(option, dict)
+        }
+        selected = [
+            labels_by_value.get(str(value), str(value))
+            for value in response.get("selected_values", [])
+            if value
+        ]
+        free_text = response.get("free_text")
+        parts = selected
+        if isinstance(free_text, str) and free_text.strip():
+            parts.append(free_text.strip())
+        return "; ".join(parts)
+
+    def _build_material_clarification(
+        self,
+        *,
+        question: str,
+        request: QARequest,
+        user_context: QAUserContext,
+        answered_ids: Optional[Set[str]] = None,
+    ) -> Optional[ClarificationRequest]:
+        from agents.qa_clarifier import build_fallback_plan
+
+        plan = build_fallback_plan(
+            question=question,
+            request=request,
+            user_context=user_context,
+            answered_ids=answered_ids,
+        )
+        return plan.clarification if plan.needs_clarification else None
+
+    def _build_clarification_response(
+        self,
+        *,
+        request: QARequest,
+        request_id: str,
+        thread_id: str,
+        clarification: ClarificationRequest,
+        model_used: str,
+        user_context: QAUserContext,
+    ) -> QAResponse:
+        answer = QAAnswer(
+            answer=f"Before answering, FoodScholar needs one detail: {clarification.question}",
+            citations=[],
+            confidence="low",
+            model_used=model_used,
+            rag_used=False,
+            sources_consulted=0,
+            articles_consulted=0,
+        )
+        return QAResponse(
+            question=request.question,
+            mode=request.mode,
+            primary_answer=answer,
+            retrieved_sources=[],
+            follow_up_suggestions=None,
+            generated_at=datetime.now().isoformat(),
+            cache_hit=False,
+            request_id=request_id,
+            qa_thread_id=thread_id,
+            needs_clarification=True,
+            clarification=clarification,
+            user_context=user_context,
+        )
 
     async def _persist_request(
         self,
@@ -555,7 +1080,7 @@ class QAService:
                     ),
                     dual_strategy=dual_strategy,
                     retrieved_article_urns=[
-                        a.urn for a in response.retrieved_articles
+                        a.urn for a in response.retrieved_sources
                     ],
                     confidence=response.primary_answer.confidence,
                     articles_consulted=response.primary_answer.articles_consulted,
@@ -572,69 +1097,73 @@ class QAService:
                 response.request_id, e, exc_info=True,
             )
 
+    def _contextualize_retrieval_question(
+        self,
+        question: str,
+        user_context: Optional[QAUserContext],
+    ) -> str:
+        """Append lightweight context that helps heterogeneous retrievers."""
+        if not user_context:
+            return question
+
+        hints = []
+        if user_context.country:
+            hints.append(f"country {user_context.country}")
+        if user_context.region and user_context.region != user_context.country:
+            hints.append(f"region {user_context.region}")
+        if user_context.member_age_group:
+            hints.append(f"age group {user_context.member_age_group}")
+        if user_context.experience_group:
+            hints.append(f"audience {user_context.experience_group}")
+
+        if not hints:
+            return question
+        return f"{question}\nContext: {', '.join(hints)}"
+
+    @staticmethod
+    def _infer_source_type(source: Dict[str, Any]) -> str:
+        source_type = source.get("source_type")
+        if source_type in {"article", "guideline"}:
+            return source_type
+        if source.get("rule_text") or source.get("guide_region") or source.get("guide_urn"):
+            return "guideline"
+        return "article"
+
+    def _guideline_context_should_clauses(
+        self,
+        user_context: Optional[QAUserContext],
+    ) -> List[Dict[str, Any]]:
+        """Build non-restrictive boosts for region and audience-specific guidance."""
+        return guideline_context_should_clauses(user_context)
+
     def _retrieve_articles(
-        self, question: str, top_k: int, retriever: str = "rag"
-    ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
-        try:
-            if retriever == "linearrag":
-                linearrag_results = _linearrag_retrieve(question, top_k=top_k)
-                articles = []
-                retrieved_models = []
-                for lr in linearrag_results:
-                    article = {
-                        "abstract": lr["text"],
-                        "_score": lr["score"],
-                        "source_type": "article",
-                        **lr["source"],
-                    }
-                    articles.append(article)
-                    retrieved_models.append(
-                        RetrievedArticle(
-                            source_type="article",
-                            urn=lr["source"].get("urn", ""),
-                            title=lr["source"].get("title", ""),
-                            authors=lr["source"].get("authors"),
-                            venue=lr["source"].get("venue"),
-                            publication_year=lr["source"].get("publication_year"),
-                            category=lr["source"].get("category"),
-                            tags=lr["source"].get("tags"),
-                            similarity_score=lr["score"],
-                        )
-                    )
-                logger.info(
-                    "LinearRAG retrieved %d passages for: %s...",
-                    len(articles),
-                    question[:50],
-                )
-                return articles, retrieved_models
-
-            article_sources, article_models = self._retrieve_article_rag_sources(
-                question,
-                top_k,
-            )
-            guideline_top_k = min(max(top_k, 1), QA_GUIDELINE_RAG_TOP_K_MAX)
-            guideline_sources, guideline_models = self._retrieve_guideline_rag_sources(
-                question,
-                guideline_top_k,
-            )
-
-            sources = article_sources + guideline_sources
-            retrieved_models = article_models + guideline_models
-            logger.info(
-                "Elastic RAG retrieved %d articles and %d guidelines for: %s...",
-                len(article_sources),
-                len(guideline_sources),
-                question[:50],
-            )
-            return sources, retrieved_models
-
-        except Exception as e:
-            logger.error("Error retrieving articles: %s", e, exc_info=True)
-            return [], []
+        self,
+        question: str,
+        top_k: int,
+        retriever: str = "rag",
+        user_context: Optional[QAUserContext] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
+        plan = QAClarifierSafetyPlan(
+            original_question=question,
+            canonical_question=question,
+            article_query=question,
+            guideline_query=f"{question} dietary guideline recommendation",
+        )
+        result = self._retrieve_sources(
+            question=question,
+            plan=plan,
+            top_k=top_k,
+            retriever=retriever,
+            user_context=user_context,
+        )
+        return result.source_payloads, result.retrieved_sources
 
     def _retrieve_article_rag_sources(
-        self, question: str, top_k: int
-    ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
+        self,
+        question: str,
+        top_k: int,
+        user_context: Optional[QAUserContext] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
         """Retrieve article sources for default Elasticsearch RAG."""
         try:
             query_vector = self._embed_query(question)
@@ -654,13 +1183,14 @@ class QAService:
             return [], []
 
         articles: List[Dict[str, Any]] = []
-        retrieved_models: List[RetrievedArticle] = []
+        retrieved_models: List[RetrievedSource] = []
         for result in raw_results:
             result["source_type"] = "article"
+            result["retriever"] = "rag"
             result["relevance_score"] = result.get("_score", 0.0)
             articles.append(result)
             retrieved_models.append(
-                RetrievedArticle(
+                RetrievedSource(
                     source_type="article",
                     urn=result.get("urn", result.get("_id", "")),
                     title=result.get("title", ""),
@@ -675,12 +1205,16 @@ class QAService:
         return articles, retrieved_models
 
     def _retrieve_guideline_rag_sources(
-        self, question: str, top_k: int
-    ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
+        self,
+        question: str,
+        top_k: int,
+        user_context: Optional[QAUserContext] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
         """Retrieve dietary guideline rule_text sources for default RAG."""
         if top_k <= 0:
             return [], []
 
+        context_should = self._guideline_context_should_clauses(user_context)
         body = {
             "size": top_k,
             "query": {
@@ -696,6 +1230,8 @@ class QAService:
                                     "food_groups^2",
                                     "target_populations",
                                     "guide_region",
+                                    "country",
+                                    "population",
                                 ],
                                 "type": "best_fields",
                             }
@@ -705,6 +1241,8 @@ class QAService:
                 }
             },
         }
+        if context_should:
+            body["query"]["bool"]["should"] = context_should
 
         try:
             response = ELASTIC_CLIENT.client.search(
@@ -716,7 +1254,7 @@ class QAService:
             return [], []
 
         guidelines: List[Dict[str, Any]] = []
-        retrieved_models: List[RetrievedArticle] = []
+        retrieved_models: List[RetrievedSource] = []
         for hit in response.get("hits", {}).get("hits", []):
             source = hit.get("_source", {})
             if not isinstance(source, dict):
@@ -727,6 +1265,7 @@ class QAService:
                 "_id": hit.get("_id"),
                 "_score": hit.get("_score", 0.0),
                 "source_type": "guideline",
+                "retriever": "rag",
             }
             rule_text = self._extract_guideline_rule_text(guideline)
             if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
@@ -745,7 +1284,7 @@ class QAService:
             tags = self._guideline_tags(guideline)
             guidelines.append(guideline)
             retrieved_models.append(
-                RetrievedArticle(
+                RetrievedSource(
                     source_type="guideline",
                     urn=urn,
                     title=guideline.get("title", "Dietary guideline"),
@@ -2124,22 +2663,32 @@ Evidence:
             return request.model
         return DEFAULT_GROQ_MODEL
 
-    def _build_cache_key(self, request: QARequest) -> str:
+    def _build_cache_key(
+        self,
+        request: QARequest,
+        *,
+        question: Optional[str] = None,
+        effective_retriever: Optional[str] = None,
+        user_context: Optional[QAUserContext] = None,
+    ) -> str:
         """Generate cache key from question + effective settings."""
+        effective_question = question or request.question
+        retriever = effective_retriever or self._resolve_retriever(request)
+        context = user_context.model_dump(exclude_none=True) if user_context else {}
         return self.cache_manager.generate_cache_key(
             prefix="qa",
             data={
-                "version": 2,
-                "question": request.question.strip().lower(),
+                "version": 3,
+                "question": effective_question.strip().lower(),
                 "mode": request.mode,
                 "model": self._resolve_model(request),
-                "rag_enabled": (
-                    request.rag_enabled if request.mode == "advanced" else True
-                ),
-                "retriever": request.retriever,
+                "rag_enabled": retriever != "no_rag",
+                "retriever": retriever,
                 "top_k": request.top_k,
                 "expertise_level": request.expertise_level,
+                "experience_group": request.experience_group,
                 "language": request.language,
+                "user_context": context,
             },
         )
 
@@ -2169,6 +2718,10 @@ Evidence:
         request: QARequest,
         articles: List[Dict[str, Any]],
         request_id: str,
+        *,
+        question: Optional[str] = None,
+        retriever: str = "rag",
+        user_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[QAAnswer, DualAnswerFeedback, str]:
         """Generate a secondary answer using a different configuration.
 
@@ -2180,6 +2733,10 @@ Evidence:
         secondary_model = secondary_cfg.get("model", DEFAULT_GROQ_MODEL)
         secondary_temp = secondary_cfg.get("temperature", 0.3)
         secondary_top_k = secondary_cfg.get("top_k", request.top_k)
+        answer_question = question or request.question
+        retrieval_user_context = (
+            QAUserContext(**user_context) if isinstance(user_context, dict) else None
+        )
 
         logger.info(
             "Generating dual answer (strategy=%s) for request %s",
@@ -2194,23 +2751,33 @@ Evidence:
 
         # If strategy varies top_k, re-retrieve articles
         secondary_articles = articles
-        if "top_k" in secondary_cfg and secondary_cfg["top_k"] != request.top_k:
+        if (
+            retriever != "no_rag"
+            and "top_k" in secondary_cfg
+            and secondary_cfg["top_k"] != request.top_k
+        ):
             secondary_articles, _ = self._retrieve_articles(
-                request.question, secondary_cfg["top_k"]
+                answer_question,
+                secondary_cfg["top_k"],
+                retriever=retriever,
+                user_context=retrieval_user_context,
             )
 
         if secondary_articles:
             secondary_answer, _ = secondary_agent.generate_answer_with_rag(
-                question=request.question,
+                question=answer_question,
                 articles=secondary_articles,
                 expertise_level=request.expertise_level,
                 language=request.language,
+                retriever=retriever,
+                user_context=user_context,
             )
         else:
             secondary_answer, _ = secondary_agent.generate_answer_without_rag(
-                question=request.question,
+                question=answer_question,
                 expertise_level=request.expertise_level,
                 language=request.language,
+                user_context=user_context,
             )
 
         primary_label = (

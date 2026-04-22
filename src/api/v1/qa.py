@@ -32,7 +32,7 @@ async def ask_question(request: QARequest):
     Ask a food science question and get a concise, cited answer.
 
     **Simple Mode (default):**
-    Automatically retrieves relevant articles via semantic search
+    Automatically retrieves relevant sources via semantic search
     and generates a citation-backed answer.
 
     **Advanced Mode:**

@@ -31,7 +31,7 @@ class _FakeGuidelineSearchClient:
 
 class QAGuidelineRagTests(unittest.TestCase):
     def test_default_rag_retrieves_articles_and_guidelines(self):
-        import services.qa_service as qa_service_module
+        import services.qa_retrievers as qa_retrievers_module
         from services.qa_service import QAService
 
         service = QAService(cache_enabled=False)
@@ -47,11 +47,11 @@ class QAGuidelineRagTests(unittest.TestCase):
         }
 
         with patch.object(
-            qa_service_module.ELASTIC_CLIENT,
+            qa_retrievers_module.ELASTIC_CLIENT,
             "knn_search",
             return_value=[article],
         ), patch.object(
-            qa_service_module.ELASTIC_CLIENT,
+            qa_retrievers_module.ELASTIC_CLIENT,
             "_client",
             _FakeGuidelineSearchClient(),
         ):
@@ -113,7 +113,9 @@ class QAGuidelineRagTests(unittest.TestCase):
         )
 
         self.assertEqual(len(answer.citations), 1)
-        self.assertEqual(answer.citations[0].article_urn, "guideline-1")
+        self.assertEqual(answer.citations[0].source_type, "guideline")
+        self.assertEqual(answer.citations[0].source_id, "guideline-1")
+        self.assertEqual(answer.citations[0].source_title, "Healthy eating guide")
         self.assertEqual(answer.citations[0].section, "rule_text")
         self.assertEqual(answer.citations[0].quote, guideline["rule_text"])
 
