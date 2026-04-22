@@ -58,6 +58,10 @@ class QARequest(BaseModel):
         default=None,
         description="Optional member identifier for tracking",
     )
+    retriever: Literal["rag", "no_rag", "linearrag"] = Field(
+        default="rag",
+        description="Retrieval strategy: 'rag' for Elasticsearch kNN, 'linearrag' for graph-based retrieval, 'no_rag' for LLM-only",
+    )
 
 
 class QAAnswer(BaseModel):

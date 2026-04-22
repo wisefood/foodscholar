@@ -16,6 +16,7 @@ try:
 except Exception:  # pragma: no cover
     json5 = None
 
+from services.linearrag_service import retrieve as linearrag_retrieve
 from models.qa import (
     QARequest,
     QAResponse,
@@ -434,7 +435,9 @@ class QAService:
         self._validate_request(request)
 
         effective_model = self._resolve_model(request)
-        effective_rag = request.rag_enabled if request.mode == "advanced" else True
+        effective_rag = request.retriever != "no_rag"
+        if request.mode == "advanced":
+            effective_rag = request.rag_enabled
 
         # Cache check
         cache_key = self._build_cache_key(request)
@@ -450,7 +453,7 @@ class QAService:
         retrieved_articles: List[RetrievedArticle] = []
         if effective_rag:
             articles, retrieved_articles = self._retrieve_articles(
-                request.question, request.top_k
+                request.question, request.top_k, retriever=request.retriever
             )
 
         # Primary answer
@@ -560,12 +563,33 @@ class QAService:
             )
 
     def _retrieve_articles(
-        self, question: str, top_k: int
+        self, question: str, top_k: int, retriever: str = "rag"
     ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
-        """Embed the question and run kNN search against ES."""
         try:
-            query_vector = self._embed_query(question)
+            if retriever == "linearrag":
+                linearrag_results = linearrag_retrieve(question, top_k=top_k)
+                articles = []
+                retrieved_models = []
+                for lr in linearrag_results:
+                    article = {"abstract": lr["text"], "_score": lr["score"], **lr["source"]}
+                    articles.append(article)
+                    retrieved_models.append(
+                        RetrievedArticle(
+                            urn=lr["source"].get("urn", ""),
+                            title=lr["source"].get("title", ""),
+                            authors=lr["source"].get("authors"),
+                            venue=lr["source"].get("venue"),
+                            publication_year=lr["source"].get("publication_year"),
+                            category=lr["source"].get("category"),
+                            tags=lr["source"].get("tags"),
+                            similarity_score=lr["score"],
+                        )
+                    )
+                logger.info("LinearRAG retrieved %d passages for: %s...", len(articles), question[:50])
+                return articles, retrieved_models
 
+            # Default: Elasticsearch kNN
+            query_vector = self._embed_query(question)
             raw_results = ELASTIC_CLIENT.knn_search(
                 index_name=self.INDEX_NAME,
                 query_vector=query_vector,
@@ -577,7 +601,6 @@ class QAService:
                 },
                 source_excludes=["embedding"],
             )
-
             articles = []
             retrieved_models = []
             for r in raw_results:
@@ -594,11 +617,7 @@ class QAService:
                         similarity_score=r.get("_score", 0.0),
                     )
                 )
-
-            logger.info(
-                "Retrieved %d articles for question: %s...",
-                len(articles), question[:50],
-            )
+            logger.info("Elastic retrieved %d articles for: %s...", len(articles), question[:50])
             return articles, retrieved_models
 
         except Exception as e:
@@ -1543,6 +1562,7 @@ Evidence:
                 "rag_enabled": (
                     request.rag_enabled if request.mode == "advanced" else True
                 ),
+                "retriever": request.retriever,
                 "top_k": request.top_k,
                 "expertise_level": request.expertise_level,
                 "language": request.language,
