@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from routers.generic import install_error_handler
 from api.v1 import search, sessions, enrich, qa, guidelines
+from services.linearrag_service import get_retriever
 from backend.db_init import init_db
 from workers.enrichment_worker import (
     start_background_worker,
@@ -34,7 +35,9 @@ async def lifespan(app: FastAPI):
     """Handle startup and shutdown events."""
     # Startup
     init_db()
-
+    # Warm up LinearRAG
+    get_retriever()
+    
     from backend.postgres import POSTGRES_ASYNC_ENGINE
     eng = POSTGRES_ASYNC_ENGINE()
     async with eng.connect() as conn:
