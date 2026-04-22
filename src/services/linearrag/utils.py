@@ -1,10 +1,4 @@
 from hashlib import md5
-from dataclasses import dataclass, field
-from typing import List, Dict
-import httpx
-import ollama
-from collections import defaultdict
-import multiprocessing as mp
 import re
 import string
 import logging
@@ -16,6 +10,15 @@ def compute_mdhash_id(content: str, prefix: str = "") -> str:
 
 class LLM_Model:
     def __init__(self, llm_model):
+        try:
+            import ollama
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "The optional 'ollama' package is required to use "
+                "services.linearrag.utils.LLM_Model. Install it before "
+                "configuring LinearRAG with an Ollama-backed model."
+            ) from exc
+
         self.openai_client = ollama.Client(
             host='http://localhost:11434'
         )
