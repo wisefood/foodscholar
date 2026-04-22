@@ -16,7 +16,6 @@ try:
 except Exception:  # pragma: no cover
     json5 = None
 
-from services.linearrag_service import retrieve as linearrag_retrieve
 from models.qa import (
     QARequest,
     QAResponse,
@@ -44,6 +43,8 @@ TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
 TIP_GROUNDING_TOP_K = 3
 TIP_SOURCE_ARTICLE_POOL_SIZE = 10
 TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS = 40
+TIP_SOURCE_GUIDELINE_POOL_SIZE = 24
+TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS = 12
 MAX_TIP_REGEN_ATTEMPTS = 3
 MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS = 3
 TIPS_OF_THE_DAY_TIPS_COUNT = 2
@@ -111,6 +112,13 @@ def _compile_term_patterns(terms: List[str]) -> List[re.Pattern]:
 _ANIMAL_TERM_PATTERNS = _compile_term_patterns(ANIMAL_EVIDENCE_TERMS)
 _HUMAN_TERM_PATTERNS = _compile_term_patterns(HUMAN_EVIDENCE_TERMS)
 
+
+def _linearrag_retrieve(question: str, top_k: int) -> List[Dict[str, Any]]:
+    """Lazy-load LinearRAG so non-Linearrag paths do not require its dependencies."""
+    from services.linearrag_service import retrieve
+
+    return retrieve(question, top_k=top_k)
+
 AMBIGUITY_KEYWORDS = [
     "better", "worse", "should", "recommend", "best", "opinion",
     "compared", "versus", "vs", "controversial", "debate",
@@ -128,6 +136,7 @@ class QAService:
     """Service for non-contextual Q&A with optional RAG."""
 
     INDEX_NAME = "articles"
+    GUIDELINES_INDEX_NAME = "guidelines"
 
     def __init__(self, cache_enabled: bool = True):
         self.cache_manager = CacheManager(enabled=cache_enabled)
@@ -252,7 +261,7 @@ class QAService:
             prefix="qa",
             data={
                 "type": "tips_of_the_day",
-                "version": 4,
+                "version": 5,
                 "tips_count": tips_count,
                 "did_you_know_count": did_you_know_count,
             },
@@ -567,7 +576,7 @@ class QAService:
     ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
         try:
             if retriever == "linearrag":
-                linearrag_results = linearrag_retrieve(question, top_k=top_k)
+                linearrag_results = _linearrag_retrieve(question, top_k=top_k)
                 articles = []
                 retrieved_models = []
                 for lr in linearrag_results:
@@ -783,22 +792,39 @@ Rules:
         candidate_count = max(total_count * 3, 12)
 
         # Use a daily seed so content varies day-to-day but stays stable within a day.
-        daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + int(seed_offset or 0)
-        source_articles = self._get_random_tip_source_articles(
-            size=max(TIP_SOURCE_ARTICLE_POOL_SIZE, candidate_count),
+        daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + int(
+            seed_offset or 0
+        )
+        source_guidelines = self._get_random_tip_source_guidelines(
+            size=max(TIP_SOURCE_GUIDELINE_POOL_SIZE, candidate_count),
             seed=daily_seed,
         )
-        candidates = self._generate_tip_candidates_from_articles(
-            articles=source_articles,
+        candidates = self._generate_tip_candidates_from_guidelines(
+            guidelines=source_guidelines,
             candidate_count=candidate_count,
         )
+        if not candidates:
+            logger.warning(
+                "No guideline-backed tips could be generated; falling back to article sources."
+            )
+            source_articles = self._get_random_tip_source_articles(
+                size=max(TIP_SOURCE_ARTICLE_POOL_SIZE, candidate_count),
+                seed=daily_seed,
+            )
+            candidates = self._generate_tip_candidates_from_articles(
+                articles=source_articles,
+                candidate_count=candidate_count,
+            )
 
         did_you_know_detail: List[Dict[str, Any]] = []
         tips_detail: List[Dict[str, Any]] = []
         seen = set()
 
         for item in candidates:
-            if len(did_you_know_detail) >= did_you_know_count and len(tips_detail) >= tips_count:
+            if (
+                len(did_you_know_detail) >= did_you_know_count
+                and len(tips_detail) >= tips_count
+            ):
                 break
             if not isinstance(item, dict):
                 continue
@@ -828,11 +854,19 @@ Rules:
                     "urn": urn,
                     "passage": passage,
                     "title": title if isinstance(title, str) and title.strip() else None,
-                    "publication_year": publication_year if isinstance(publication_year, str) and publication_year.strip() else None,
+                    "publication_year": (
+                        publication_year
+                        if isinstance(publication_year, str)
+                        and publication_year.strip()
+                        else None
+                    ),
                 },
             }
 
-            if kind == "did_you_know" and len(did_you_know_detail) < did_you_know_count:
+            if (
+                kind == "did_you_know"
+                and len(did_you_know_detail) < did_you_know_count
+            ):
                 did_you_know_detail.append(record)
             elif kind == "tip" and len(tips_detail) < tips_count:
                 tips_detail.append(record)
@@ -844,6 +878,338 @@ Rules:
             "did_you_know_detail": did_you_know_detail,
             "tips_detail": tips_detail,
         }
+
+    def _get_random_tip_source_guidelines(
+        self, *, size: int, seed: int
+    ) -> List[Dict[str, Any]]:
+        """Fetch a randomized pool of dietary guideline rules for tips/facts."""
+        try:
+            guidelines = ELASTIC_CLIENT.random_search(
+                index_name=self.GUIDELINES_INDEX_NAME,
+                size=size,
+                seed=seed,
+                filter_query={
+                    "bool": {
+                        "must": [{"exists": {"field": "rule_text"}}],
+                        "must_not": [{"term": {"status": "deleted"}}],
+                    }
+                },
+            )
+        except Exception:
+            logger.exception("Random guideline fetch failed for tips.")
+            return []
+
+        cleaned: List[Dict[str, Any]] = []
+        seen_rules = set()
+        for guideline in guidelines:
+            if not isinstance(guideline, dict):
+                continue
+            rule_text = self._extract_guideline_rule_text(guideline)
+            if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
+                continue
+            if self._mentions_animal_testing(rule_text):
+                continue
+            key = rule_text.lower()
+            if key in seen_rules:
+                continue
+            seen_rules.add(key)
+            cleaned.append(guideline)
+
+        return cleaned[:size]
+
+    def _generate_tip_candidates_from_guidelines(
+        self, *, guidelines: List[Dict[str, Any]], candidate_count: int
+    ) -> List[Dict[str, Any]]:
+        """Generate tip/fact candidates grounded in dietary guideline rule_text."""
+        if not guidelines:
+            return []
+
+        guideline_context = self._prepare_tip_guideline_context(guidelines)
+        prompt = f"""You create safe daily nutrition content for a general audience.
+
+Using ONLY the dietary guideline rules below, generate exactly {candidate_count} items with a mix of:
+- practical nutrition tips
+- "Did you know?" nutrition facts
+
+Safety rules:
+- General education only (no diagnosis, treatment, medication, or disease-management advice).
+- No supplement dosage guidance.
+- Use the guideline rule_text as the source of truth.
+
+Style rules:
+- Each item must be <= 18 words.
+- One sentence per item.
+- Avoid absolute guarantees (no "cures", "prevents", "always", "never").
+
+Return ONLY valid JSON in this exact format:
+{{
+  "items": [
+    {{"kind": "tip", "text": "item text", "guideline": 1}},
+    {{"kind": "did_you_know", "text": "item text", "guideline": 2}}
+  ]
+}}
+
+Dietary guideline rules:
+{guideline_context}
+"""
+        items: List[Any] = []
+        try:
+            response = self.simple_question_llm.invoke(prompt)
+            parsed = self._parse_tip_candidates_json(response.content)
+            parsed_items = parsed.get("items", [])
+            if isinstance(parsed_items, list):
+                items = parsed_items
+        except Exception as e:
+            logger.warning(
+                "Guideline tip JSON generation failed; using rule_text fallback: %s",
+                e,
+            )
+
+        valid: List[Dict[str, Any]] = []
+        seen = set()
+        for item in items:
+            if len(valid) >= candidate_count:
+                break
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "tip")).strip().lower()
+            text = str(item.get("text", "")).strip()
+            guideline_idx = self._coerce_source_index(
+                item.get("guideline", item.get("article")),
+                len(guidelines),
+            )
+            if kind not in ("tip", "did_you_know"):
+                continue
+            if not text or guideline_idx is None:
+                continue
+            if self._mentions_animal_testing(
+                text
+            ) or self._violates_tip_safety_policy(text):
+                continue
+
+            guideline = guidelines[guideline_idx - 1]
+            rule_text = self._extract_guideline_rule_text(guideline)
+            if not rule_text:
+                continue
+
+            key = f"{kind}:{text.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            valid.append(
+                {
+                    "kind": kind,
+                    "text": text,
+                    "urn": self._guideline_source_urn(guideline),
+                    "passage": self._extract_guideline_passage(guideline),
+                    "title": guideline.get("title", None),
+                    "publication_year": self._guideline_publication_year(guideline),
+                }
+            )
+
+        if len(valid) < candidate_count:
+            for fallback in self._generate_rule_based_tip_candidates_from_guidelines(
+                guidelines,
+                candidate_count=candidate_count - len(valid),
+            ):
+                key = (
+                    f"{fallback.get('kind')}:"
+                    f"{str(fallback.get('text', '')).lower()}"
+                )
+                if key in seen:
+                    continue
+                valid.append(fallback)
+                seen.add(key)
+                if len(valid) >= candidate_count:
+                    break
+
+        return valid
+
+    def _prepare_tip_guideline_context(
+        self, guidelines: List[Dict[str, Any]]
+    ) -> str:
+        """Prepare compact guideline rule context for tip generation."""
+        snippets = []
+        for idx, guideline in enumerate(guidelines, 1):
+            rule_text = self._extract_guideline_rule_text(guideline)
+            food_groups = guideline.get("food_groups") or []
+            target_populations = guideline.get("target_populations") or []
+            if isinstance(food_groups, list):
+                food_groups_text = ", ".join(str(x) for x in food_groups if x)
+            else:
+                food_groups_text = str(food_groups)
+            if isinstance(target_populations, list):
+                populations_text = ", ".join(str(x) for x in target_populations if x)
+            else:
+                populations_text = str(target_populations)
+            snippet = (
+                f"Guideline {idx}:\n"
+                f"- Title: {guideline.get('title', 'N/A')}\n"
+                f"- Guide: {guideline.get('guide_urn', 'N/A')}\n"
+                f"- Region: {guideline.get('guide_region', 'N/A')}\n"
+                f"- Food groups: {food_groups_text or 'N/A'}\n"
+                f"- Target populations: {populations_text or 'N/A'}\n"
+                f"- Rule text: {rule_text[:500]}"
+            )
+            snippets.append(snippet)
+        return "\n\n".join(snippets)
+
+    def _generate_rule_based_tip_candidates_from_guidelines(
+        self, guidelines: List[Dict[str, Any]], candidate_count: int
+    ) -> List[Dict[str, Any]]:
+        """Create safe guideline-backed items without relying on model JSON."""
+        candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        for guideline in guidelines:
+            if len(candidates) >= candidate_count:
+                break
+            rule_text = self._extract_guideline_rule_text(guideline)
+            if not rule_text:
+                continue
+
+            source_payload = {
+                "urn": self._guideline_source_urn(guideline),
+                "passage": self._extract_guideline_passage(guideline),
+                "title": guideline.get("title", None),
+                "publication_year": self._guideline_publication_year(guideline),
+            }
+            for kind, text in (
+                ("tip", self._guideline_rule_to_tip(rule_text)),
+                ("did_you_know", self._guideline_rule_to_fact(rule_text)),
+            ):
+                if len(candidates) >= candidate_count:
+                    break
+                if not text or not self._is_tip_line_appropriate(text):
+                    continue
+                key = f"{kind}:{text.lower()}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append({"kind": kind, "text": text, **source_payload})
+
+        return candidates[:candidate_count]
+
+    def _extract_guideline_rule_text(self, guideline: Dict[str, Any]) -> str:
+        """Extract normalized rule_text from a guideline document."""
+        rule_text = guideline.get("rule_text") or ""
+        if not isinstance(rule_text, str):
+            rule_text = str(rule_text)
+        return " ".join(rule_text.split()).strip()
+
+    def _extract_guideline_passage(self, guideline: Dict[str, Any]) -> str:
+        """Use guideline rule_text itself as the grounding passage."""
+        rule_text = self._extract_guideline_rule_text(guideline)
+        return rule_text[:_TIP_PASSAGE_MAX_CHARS].strip()
+
+    def _guideline_source_urn(self, guideline: Dict[str, Any]) -> str:
+        """Return the best stable identifier available for a guideline source."""
+        for key in ("guide_urn", "urn", "id", "_id"):
+            value = guideline.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        rule_text = self._extract_guideline_rule_text(guideline)
+        if rule_text:
+            return f"guideline:{uuid.uuid5(uuid.NAMESPACE_URL, rule_text)}"
+        return "guidelines"
+
+    def _guideline_publication_year(self, guideline: Dict[str, Any]) -> Optional[str]:
+        """Best-effort year-like metadata for guideline evidence."""
+        for key in ("applicability_start_date", "created_at", "updated_at"):
+            value = guideline.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _guideline_rule_to_tip(self, rule_text: str) -> str:
+        """Turn a guideline rule into a concise actionable tip."""
+        text = self._clean_guideline_generated_text(rule_text)
+        lowered = text.lower()
+        if lowered.startswith(
+            ("people should ", "adults should ", "children should ")
+        ):
+            text = re.sub(
+                r"^(people|adults|children)\s+should\s+",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            )
+            text = f"Aim to {text[0].lower()}{text[1:]}" if text else ""
+        elif lowered.startswith("it is recommended that "):
+            text = text[len("it is recommended that "):]
+            text = f"Aim to {text[0].lower()}{text[1:]}" if text else ""
+        elif not lowered.startswith(
+            (
+                "add ",
+                "aim ",
+                "avoid ",
+                "choose ",
+                "drink ",
+                "eat ",
+                "have ",
+                "include ",
+                "keep ",
+                "limit ",
+                "make ",
+                "prefer ",
+                "reduce ",
+                "replace ",
+                "select ",
+                "use ",
+            )
+        ):
+            text = f"Use dietary guide advice: {text}"
+        return self._shorten_tip_sentence(text, max_words=18)
+
+    def _guideline_rule_to_fact(self, rule_text: str) -> str:
+        """Turn a guideline rule into a concise did-you-know style fact."""
+        text = self._clean_guideline_generated_text(rule_text)
+        return self._shorten_tip_sentence(
+            f"Dietary guides advise: {text}",
+            max_words=18,
+        )
+
+    def _clean_guideline_generated_text(self, text: str) -> str:
+        """Clean source text before deterministic tip/fact formatting."""
+        text = " ".join(str(text).split()).strip(" -:;")
+        text = re.sub(
+            r"^(guideline|recommendation)\s*[:\-]\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return text
+
+    def _shorten_tip_sentence(self, text: str, *, max_words: int) -> str:
+        """Limit generated fallback text to a short single sentence."""
+        text = " ".join(str(text).split()).strip()
+        if not text:
+            return ""
+
+        sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+        words = sentence.split()
+        if len(words) > max_words:
+            sentence = " ".join(words[:max_words]).rstrip(" ,;:")
+        sentence = sentence.strip()
+        if sentence and sentence[-1] not in ".!?":
+            sentence += "."
+        return sentence
+
+    def _coerce_source_index(self, value: Any, max_index: int) -> Optional[int]:
+        """Coerce model source references like 1 or '1' into a valid index."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            idx = value
+        elif isinstance(value, str) and value.strip().isdigit():
+            idx = int(value.strip())
+        else:
+            return None
+        if 1 <= idx <= max_index:
+            return idx
+        return None
 
     def _get_random_tip_source_articles(
         self, *, size: int, seed: int
@@ -929,14 +1295,19 @@ Evidence:
                 continue
             kind = str(item.get("kind", "tip")).strip().lower()
             text = str(item.get("text", "")).strip()
-            article_idx = item.get("article", None)
+            article_idx = self._coerce_source_index(
+                item.get("article", None),
+                len(articles),
+            )
             if kind not in ("tip", "did_you_know"):
                 continue
             if not text:
                 continue
-            if not isinstance(article_idx, int) or not (1 <= article_idx <= len(articles)):
+            if article_idx is None:
                 continue
-            if self._mentions_animal_testing(text) or self._violates_tip_safety_policy(text):
+            if self._mentions_animal_testing(
+                text
+            ) or self._violates_tip_safety_policy(text):
                 continue
             article = articles[article_idx - 1]
             urn = str(article.get("urn", article.get("_id", "")) or "").strip()
@@ -1454,6 +1825,8 @@ Evidence:
     def _parse_tip_candidates_json(self, content: str) -> Dict[str, Any]:
         """Parse JSON tip candidate payload from model output."""
         text = content.strip()
+        if not text:
+            return {"items": []}
 
         if "```json" in text:
             text = text.split("```json", 1)[1].split("```", 1)[0].strip()
@@ -1461,16 +1834,63 @@ Evidence:
             text = text.split("```", 1)[1].split("```", 1)[0].strip()
 
         text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-        try:
-            return json.loads(text)
-        except Exception:
-            # Common model failure mode: trailing commas.
-            fixed = re.sub(r",\s*([}\]])", r"\1", text)
-            if fixed != text:
-                return json.loads(fixed)
-            if json5 is None:
-                raise
-            return json5.loads(text)
+        candidates = [text]
+        extracted = self._extract_first_json_object(text)
+        if extracted and extracted != text:
+            candidates.append(extracted)
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
+            if not candidate.strip():
+                continue
+            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+            for variant in (candidate, fixed):
+                try:
+                    return json.loads(variant)
+                except Exception as e:
+                    last_error = e
+                if json5 is not None:
+                    try:
+                        return json5.loads(variant)
+                    except Exception as e:
+                        last_error = e
+
+        logger.warning(
+            "Unable to parse tip candidate JSON; using empty candidates: %s",
+            last_error,
+        )
+        return {"items": []}
+
+    def _extract_first_json_object(self, text: str) -> str:
+        """Extract the first balanced JSON object from text when possible."""
+        start = text.find("{")
+        if start < 0:
+            return text
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start, len(text)):
+            char = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+
+        return text[start:]
 
     def _generate_fallback_questions(self, count: int) -> List[str]:
         """Emergency fallback without a fixed question pool."""
@@ -1502,16 +1922,16 @@ Evidence:
     ) -> List[str]:
         """Emergency fallback tip generator."""
         tip_actions = [
-            "Tip: Add one extra vegetable serving to your lunch.",
-            "Tip: Pair fruit with nuts to balance energy and fullness.",
-            "Tip: Choose whole grains more often than refined grains.",
-            "Tip: Keep water nearby so hydration is easier all day.",
+            "Tip: Make vegetables or fruit a visible part of meals.",
+            "Tip: Choose whole-grain breads, rice, or pasta more often.",
+            "Tip: Make water your usual drink with meals.",
+            "Tip: Include beans, lentils, fish, eggs, or lean meats for protein.",
         ]
         did_you_know_facts = [
-            "Did you know? Beans provide both fiber and protein in one food.",
-            "Did you know? Frozen vegetables can retain nutrients very well.",
-            "Did you know? Whole grains usually digest more slowly than refined grains.",
-            "Did you know? Eating protein with meals can improve satiety.",
+            "Did you know? Dietary guides commonly emphasize vegetables, fruit, grains, and protein foods.",
+            "Did you know? Many food guides recommend choosing mostly unsaturated oils and spreads.",
+            "Did you know? Whole-grain foods are a recurring theme across dietary guides.",
+            "Did you know? Food guides often recommend limiting sugary drinks.",
         ]
 
         random.shuffle(tip_actions)

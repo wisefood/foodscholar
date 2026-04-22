@@ -216,17 +216,17 @@ class SimpleNutriQuestionsResponse(BaseModel):
 class TipEvidence(BaseModel):
     """Evidence payload for a generated tip/fact."""
 
-    urn: str = Field(description="Article URN used as evidence")
+    urn: str = Field(description="Source URN/id used as evidence")
     passage: str = Field(
-        description="Short passage from the article abstract/description used for grounding"
+        description="Short passage from the source text used for grounding"
     )
     title: Optional[str] = Field(
         default=None,
-        description="Article title (optional)",
+        description="Source title (optional)",
     )
     publication_year: Optional[str] = Field(
         default=None,
-        description="Article publication year (optional)",
+        description="Source date/year metadata (optional)",
     )
 
 
@@ -253,11 +253,11 @@ class TipsOfTheDayResponse(BaseModel):
     )
     did_you_know_detail: List[TipWithEvidence] = Field(
         default_factory=list,
-        description="Did-you-know items including (when available) the article URN + passage used",
+        description="Did-you-know items including (when available) the source id + passage used",
     )
     tips_detail: List[TipWithEvidence] = Field(
         default_factory=list,
-        description="Tip items including (when available) the article URN + passage used",
+        description="Tip items including (when available) the source id + passage used",
     )
     generated_at: str = Field(
         description="ISO timestamp when these tips were generated"

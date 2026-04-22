@@ -1,3 +1,4 @@
+import os
 from sentence_transformers import SentenceTransformer
 from services.linearrag.config import LinearRAGConfig
 from services.linearrag.LinearRAG import LinearRAG
@@ -14,11 +15,11 @@ def get_retriever() -> LinearRAG:
     return _retriever
 
 def _init_retriever() -> LinearRAG:
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2") 
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     config = LinearRAGConfig(
-        dataset_name="linearrag",        
+        dataset_name="linearrag",
         embedding_model=embedding_model,
-        working_dir="data",             
+        working_dir=os.path.join(os.path.dirname(__file__), "..", "data"),
         retrieval_top_k=5,
         use_vectorized_retrieval=False,
     )

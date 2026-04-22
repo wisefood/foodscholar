@@ -16,6 +16,106 @@ class _FakeLLM:
 
 
 class TipsGenerationTests(unittest.TestCase):
+    def test_generate_tips_prefers_guideline_rules(self):
+        import services.qa_service as qa_service_module
+        from services.qa_service import QAService
+
+        guidelines = [
+            {
+                "id": "guideline-1",
+                "guide_urn": "urn:guide:healthy-eating",
+                "title": "Healthy eating guide",
+                "rule_text": "Eat at least five portions of fruit and vegetables each day.",
+                "guide_region": "EU",
+            },
+            {
+                "id": "guideline-2",
+                "guide_urn": "urn:guide:healthy-eating",
+                "title": "Healthy eating guide",
+                "rule_text": "Choose whole-grain cereals, bread, rice, or pasta more often.",
+                "guide_region": "EU",
+            },
+        ]
+
+        def _random_search(index_name: str, **_kwargs):
+            if index_name == QAService.GUIDELINES_INDEX_NAME:
+                return guidelines
+            raise AssertionError("articles should not be queried when guidelines work")
+
+        with patch.object(
+            qa_service_module.ELASTIC_CLIENT,
+            "random_search",
+            side_effect=_random_search,
+        ):
+            llm_content = """
+            {
+              "items": [
+                {"kind": "tip", "text": "Eat fruit and vegetables daily.", "guideline": 1},
+                {"kind": "did_you_know", "text": "Dietary guides often recommend daily fruit and vegetables.", "guideline": 1},
+                {"kind": "tip", "text": "Choose whole grains more often.", "guideline": 2},
+                {"kind": "did_you_know", "text": "Whole-grain options are part of dietary guide advice.", "guideline": 2}
+              ]
+            }
+            """.strip()
+
+            service = QAService(cache_enabled=False)
+            service._simple_question_llm = _FakeLLM(llm_content)
+
+            payload = service._generate_tips_payload_once(
+                tips_count=2,
+                did_you_know_count=2,
+            )
+            self.assertEqual(len(payload["tips"]), 2)
+            self.assertEqual(len(payload["did_you_know"]), 2)
+            self.assertEqual(
+                payload["tips_detail"][0]["evidence"]["urn"],
+                "urn:guide:healthy-eating",
+            )
+            self.assertEqual(
+                payload["tips_detail"][0]["evidence"]["passage"],
+                guidelines[0]["rule_text"],
+            )
+
+    def test_guideline_rule_text_fallback_handles_invalid_json(self):
+        import services.qa_service as qa_service_module
+        from services.qa_service import QAService
+
+        guidelines = [
+            {
+                "id": "guideline-1",
+                "title": "Food guide",
+                "rule_text": "Eat at least five portions of fruit and vegetables each day.",
+            },
+            {
+                "id": "guideline-2",
+                "title": "Food guide",
+                "rule_text": "Choose whole-grain cereals, bread, rice, or pasta more often.",
+            },
+        ]
+
+        with patch.object(
+            qa_service_module.ELASTIC_CLIENT,
+            "random_search",
+            return_value=guidelines,
+        ):
+            service = QAService(cache_enabled=False)
+            service._simple_question_llm = _FakeLLM('{"items": [')
+
+            payload = service._generate_tips_payload_once(
+                tips_count=2,
+                did_you_know_count=2,
+            )
+            self.assertEqual(len(payload["tips"]), 2)
+            self.assertEqual(len(payload["did_you_know"]), 2)
+            self.assertEqual(
+                payload["tips_detail"][0]["evidence"]["urn"],
+                "guideline-1",
+            )
+            self.assertEqual(
+                payload["did_you_know_detail"][0]["evidence"]["passage"],
+                guidelines[0]["rule_text"],
+            )
+
     def test_generate_tips_uses_generated_items(self):
         import services.qa_service as qa_service_module
         from services.qa_service import QAService
