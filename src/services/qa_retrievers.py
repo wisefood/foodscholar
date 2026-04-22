@@ -243,7 +243,12 @@ class ElasticRagRetrieverAdapter:
             )
         except Exception as exc:
             logger.error("Article RAG retrieval failed: %s", exc, exc_info=True)
-            return [], [], {"ok": False, "error": repr(exc), "used_query": query}
+            return [], [], {
+                "ok": False,
+                "error": repr(exc),
+                "used_query": query,
+                "mode": "vector",
+            }
 
         payloads: List[Dict[str, Any]] = []
         retrieved: List[RetrievedSource] = []
@@ -272,7 +277,12 @@ class ElasticRagRetrieverAdapter:
         return (
             payloads,
             retrieved,
-            {"ok": True, "hit_count": len(payloads), "used_query": query},
+            {
+                "ok": True,
+                "hit_count": len(payloads),
+                "used_query": query,
+                "mode": "vector",
+            },
         )
 
     def _retrieve_guidelines(
@@ -282,7 +292,12 @@ class ElasticRagRetrieverAdapter:
         user_context: Optional[QAUserContext],
     ) -> tuple[List[Dict[str, Any]], List[RetrievedSource], Dict[str, Any]]:
         if top_k <= 0:
-            return [], [], {"ok": True, "hit_count": 0, "used_query": query}
+            return [], [], {
+                "ok": True,
+                "hit_count": 0,
+                "used_query": query,
+                "mode": "keyword",
+            }
 
         body = {
             "size": top_k,
@@ -321,7 +336,12 @@ class ElasticRagRetrieverAdapter:
             )
         except Exception as exc:
             logger.error("Guideline RAG retrieval failed: %s", exc, exc_info=True)
-            return [], [], {"ok": False, "error": repr(exc), "used_query": query}
+            return [], [], {
+                "ok": False,
+                "error": repr(exc),
+                "used_query": query,
+                "mode": "keyword",
+            }
 
         payloads: List[Dict[str, Any]] = []
         retrieved: List[RetrievedSource] = []
@@ -373,7 +393,12 @@ class ElasticRagRetrieverAdapter:
         return (
             payloads,
             retrieved,
-            {"ok": True, "hit_count": len(payloads), "used_query": query},
+            {
+                "ok": True,
+                "hit_count": len(payloads),
+                "used_query": query,
+                "mode": "keyword",
+            },
         )
 
 

@@ -235,6 +235,10 @@ class QACitation(BaseModel):
         default=None,
         description="Relevance score from retrieval",
     )
+    display_label: Optional[str] = Field(
+        default=None,
+        description="Short display label for inline citation, e.g. G1, G2 for guidelines",
+    )
 
 
 class QAAnswer(BaseModel):

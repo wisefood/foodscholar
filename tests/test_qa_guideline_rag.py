@@ -5,6 +5,8 @@ from unittest.mock import patch
 class _FakeGuidelineSearchClient:
     def search(self, index, body):
         assert index == "guidelines"
+        assert "knn" not in str(body).lower()
+        assert "embedding" not in str(body).lower()
         fields = body["query"]["bool"]["must"][0]["multi_match"]["fields"]
         assert "rule_text^4" in fields
         return {

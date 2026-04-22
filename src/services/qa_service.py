@@ -22,6 +22,7 @@ from models.qa import (
     QAAnswer,
     RetrievedSource,
     QAClarifierSafetyPlan,
+    ClarificationOption,
     ClarificationRequest,
     QAUserContext,
     DualAnswerFeedback,
@@ -57,6 +58,14 @@ TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS = 12
 QA_GUIDELINE_RAG_TOP_K_MAX = 5
 MAX_TIP_REGEN_ATTEMPTS = 3
 MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS = 3
+REGION_LABELS = {
+    "EU": "European Union",
+    "GR": "Greece",
+    "HU": "Hungary",
+    "SI": "Slovenia",
+    "UK": "United Kingdom",
+    "US": "United States",
+}
 TIPS_OF_THE_DAY_TIPS_COUNT = 2
 TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT = 2
 SIMPLE_NUTRI_QUESTION_MODEL = "openai/gpt-oss-20b"
@@ -497,7 +506,14 @@ class QAService:
         )
 
         clarification = plan.clarification if plan.needs_clarification else None
-        if clarification:
+        ask_before_scout = (
+            clarification is not None
+            and self._should_ask_clarification_before_scout(
+                clarification,
+                effective_rag=effective_rag,
+            )
+        )
+        if clarification and ask_before_scout:
             thread_id = request.qa_thread_id or str(uuid.uuid4())
             self._store_qa_thread(
                 thread_id=thread_id,
@@ -516,6 +532,7 @@ class QAService:
                 user_context=user_context,
             )
 
+        cache_checked = False
         # Cache check
         cache_key = self._build_cache_key(
             request,
@@ -523,14 +540,16 @@ class QAService:
             effective_retriever=effective_retriever,
             user_context=user_context,
         )
-        cached = self.cache_manager.get(cache_key)
-        if cached:
-            logger.info("Cache hit for QA: %s...", effective_question[:50])
-            cached["cache_hit"] = True
-            cached["request_id"] = request_id
-            if request.qa_thread_id and request.clarification_response:
-                self._clear_qa_thread(request.qa_thread_id)
-            return QAResponse(**cached)
+        if clarification is None:
+            cache_checked = True
+            cached = self.cache_manager.get(cache_key)
+            if cached:
+                logger.info("Cache hit for QA: %s...", effective_question[:50])
+                cached["cache_hit"] = True
+                cached["request_id"] = request_id
+                if request.qa_thread_id and request.clarification_response:
+                    self._clear_qa_thread(request.qa_thread_id)
+                return QAResponse(**cached)
 
         # Retrieval
         source_payloads: List[Dict[str, Any]] = []
@@ -546,6 +565,47 @@ class QAService:
             source_payloads = retrieval_result.source_payloads
             retrieved_sources = retrieval_result.retrieved_sources
 
+        scout_clarification = self._build_scout_clarification(
+            question=effective_question,
+            plan=plan,
+            pending_clarification=clarification,
+            request=request,
+            user_context=user_context,
+            answered_ids=answered_ids,
+            source_payloads=source_payloads,
+            retrieved_sources=retrieved_sources,
+            retrieval_result=retrieval_result,
+            effective_rag=effective_rag,
+        )
+        if scout_clarification:
+            thread_id = request.qa_thread_id or str(uuid.uuid4())
+            self._store_qa_thread(
+                thread_id=thread_id,
+                question=effective_question,
+                request=request,
+                clarification=scout_clarification,
+                user_context=user_context,
+                answered_ids=answered_ids,
+            )
+            return self._build_clarification_response(
+                request=request,
+                request_id=request_id,
+                thread_id=thread_id,
+                clarification=scout_clarification,
+                model_used=effective_model,
+                user_context=user_context,
+            )
+
+        if not cache_checked:
+            cached = self.cache_manager.get(cache_key)
+            if cached:
+                logger.info("Cache hit for QA: %s...", effective_question[:50])
+                cached["cache_hit"] = True
+                cached["request_id"] = request_id
+                if request.qa_thread_id and request.clarification_response:
+                    self._clear_qa_thread(request.qa_thread_id)
+                return QAResponse(**cached)
+
         # Primary answer
         from agents.qa_agent import QAAgent
 
@@ -560,6 +620,10 @@ class QAService:
             "article_query": plan.article_query,
             "guideline_query": plan.guideline_query,
         }
+        context_payload["retrieval_scout"] = self._summarize_retrieval_scout(
+            retrieval_result,
+            source_payloads,
+        )
         if effective_rag and source_payloads:
             primary_answer, follow_ups = primary_agent.generate_answer_with_rag(
                 question=effective_question,
@@ -698,6 +762,196 @@ class QAService:
         )
         logger.info("QA retrieval status: %s", result.status)
         return result
+
+    @staticmethod
+    def _should_ask_clarification_before_scout(
+        clarification: ClarificationRequest,
+        *,
+        effective_rag: bool,
+    ) -> bool:
+        """Only defer clarification types that benefit from evidence scouting."""
+        if clarification.id == "country_or_region" and effective_rag:
+            return False
+        return True
+
+    def _build_scout_clarification(
+        self,
+        *,
+        question: str,
+        plan: QAClarifierSafetyPlan,
+        pending_clarification: Optional[ClarificationRequest],
+        request: QARequest,
+        user_context: QAUserContext,
+        answered_ids: Set[str],
+        source_payloads: List[Dict[str, Any]],
+        retrieved_sources: List[RetrievedSource],
+        retrieval_result: RetrievalResult,
+        effective_rag: bool,
+    ) -> Optional[ClarificationRequest]:
+        """Ask evidence-backed clarifications after the retrieval scout pass."""
+        if not effective_rag or "country_or_region" in answered_ids:
+            return None
+        if user_context.country:
+            return None
+
+        wants_region = (
+            pending_clarification is not None
+            and pending_clarification.id == "country_or_region"
+        ) or self._looks_region_sensitive_question(question, plan)
+        if not wants_region:
+            return None
+
+        options = self._region_options_from_guideline_scout(
+            source_payloads=source_payloads,
+            retrieved_sources=retrieved_sources,
+        )
+        if not options and pending_clarification:
+            options = pending_clarification.options
+        if not options:
+            return None
+
+        if not any(option.value == "general" for option in options):
+            options.append(
+                ClarificationOption(
+                    label="No preference",
+                    value="general",
+                    description="Use the best available evidence across regions.",
+                )
+            )
+
+        status = retrieval_result.status or {}
+        reason = (
+            "Guideline candidates vary by region, and regional dietary "
+            "guidance can change the practical recommendation."
+        )
+        if status.get("guideline_hits") == 0:
+            reason = (
+                "No strong regional guideline candidate was found, so the "
+                "answer can use a general evidence base if preferred."
+            )
+
+        return ClarificationRequest(
+            id="country_or_region",
+            question="Which country or guideline region should the answer use?",
+            input_type="single_choice",
+            options=options[:5],
+            allow_free_text=True,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _looks_region_sensitive_question(
+        question: str,
+        plan: QAClarifierSafetyPlan,
+    ) -> bool:
+        text = " ".join(
+            [
+                question,
+                plan.canonical_question,
+                plan.guideline_query,
+            ]
+        ).lower()
+        terms = [
+            "how much",
+            "how many",
+            "how often",
+            "weekly",
+            "per week",
+            "per day",
+            "should",
+            "recommend",
+            "guideline",
+            "intake",
+            "serving",
+            "portion",
+        ]
+        return any(term in text for term in terms)
+
+    def _region_options_from_guideline_scout(
+        self,
+        *,
+        source_payloads: List[Dict[str, Any]],
+        retrieved_sources: List[RetrievedSource],
+    ) -> List[ClarificationOption]:
+        seen: Set[str] = set()
+        options: List[ClarificationOption] = []
+
+        for source in source_payloads:
+            if source.get("source_type") != "guideline":
+                continue
+            value = self._source_region_value(source)
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            options.append(
+                ClarificationOption(
+                    label=self._region_label(value),
+                    value=value,
+                    description="Found matching guideline candidates for this region.",
+                )
+            )
+            if len(options) >= 4:
+                return options
+
+        for source in retrieved_sources:
+            if source.source_type != "guideline":
+                continue
+            value = self._source_region_value(
+                {
+                    "country": source.venue,
+                    "guide_region": source.venue,
+                    "tags": source.tags,
+                }
+            )
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            options.append(
+                ClarificationOption(
+                    label=self._region_label(value),
+                    value=value,
+                    description="Found matching guideline candidates for this region.",
+                )
+            )
+            if len(options) >= 4:
+                break
+
+        return options
+
+    @staticmethod
+    def _source_region_value(source: Dict[str, Any]) -> Optional[str]:
+        for key in ("country", "guide_region", "venue", "source"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        tags = source.get("tags")
+        if isinstance(tags, list):
+            for tag in tags:
+                if isinstance(tag, str) and 1 < len(tag.strip()) <= 8:
+                    return tag.strip().upper()
+        return None
+
+    @staticmethod
+    def _region_label(value: str) -> str:
+        return REGION_LABELS.get(value.upper(), value)
+
+    @staticmethod
+    def _summarize_retrieval_scout(
+        retrieval_result: RetrievalResult,
+        source_payloads: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        guideline_regions = []
+        for source in source_payloads:
+            if source.get("source_type") != "guideline":
+                continue
+            region = QAService._source_region_value(source)
+            if region and region not in guideline_regions:
+                guideline_regions.append(region)
+        return {
+            "status": retrieval_result.status,
+            "guideline_regions": guideline_regions[:6],
+            "source_count": len(source_payloads),
+        }
 
     def _resolve_user_context(self, request: QARequest) -> QAUserContext:
         """Resolve country/region and audience context for retrieval and answering."""

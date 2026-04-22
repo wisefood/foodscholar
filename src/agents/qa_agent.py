@@ -81,8 +81,8 @@ ANSWER FORMULATION CONTEXT:
 CRITICAL RULES:
 1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
-3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors.
-4. For guideline sources, cite as [Dietary guideline: Title](/guidelines/GUIDELINE_URN).
+3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
+4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
 5. If the retrieved sources do not contain sufficient information, say so explicitly.
 6. Do NOT fabricate information beyond what the retrieved sources support.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
@@ -255,6 +255,24 @@ Answer the question concisely using your scientific knowledge."""),
             for guardrail in guardrails[:4]:
                 parts.append(f"- Guardrail: {guardrail}")
 
+        scout = context.get("retrieval_scout") if isinstance(context, dict) else None
+        if isinstance(scout, dict):
+            status = scout.get("status") or {}
+            regions = scout.get("guideline_regions") or []
+            source_count = scout.get("source_count")
+            if isinstance(status, dict):
+                article_hits = status.get("article_hits")
+                guideline_hits = status.get("guideline_hits")
+                parts.append(
+                    f"- Retrieval scout: article_hits={article_hits}, guideline_hits={guideline_hits}."
+                )
+            if regions:
+                parts.append(
+                    f"- Guideline regions found: {', '.join(map(str, regions[:6]))}."
+                )
+            if source_count is not None:
+                parts.append(f"- Sources available for formulation: {source_count}.")
+
         return "\n".join(parts)
 
     def _prepare_article_context(
@@ -264,6 +282,7 @@ Answer the question concisely using your scientific knowledge."""),
     ) -> str:
         """Format retrieved RAG sources for the LLM context window."""
         summaries = []
+        g_counter = 1
         for idx, article in enumerate(articles, 1):
             if self._is_guideline_source(article):
                 rule_text = self._get_source_text(article)
@@ -271,11 +290,12 @@ Answer the question concisely using your scientific knowledge."""),
                 target_populations = self._join_field_values(
                     article.get("target_populations")
                 )
-                summary = f"""Guideline {idx}:
-- Source Type: dietary_guideline
+                g_label = f"G{g_counter}"
+                g_counter += 1
+                summary = f"""Guideline {idx} [{g_label}]:
+- Source Type: guideline
 - Retriever: {article.get('retriever', retriever)}
 - URN: {article.get('urn', article.get('id', article.get('_id', 'N/A')))}
-- Title: {article.get('title', 'Dietary guideline')}
 - Guide URN: {article.get('guide_urn', 'N/A')}
 - Region: {article.get('guide_region', 'N/A')}
 - Food Groups: {food_groups or 'N/A'}
@@ -375,6 +395,18 @@ Answer the question concisely using your scientific knowledge."""),
                     if isinstance(value, str) and value.strip():
                         source_lookup[value.strip()] = source
 
+            # Pre-compute G-labels in source list order so they match the context
+            g_label_map: Dict[str, str] = {}
+            g_counter = 1
+            for source in articles:
+                if self._is_guideline_source(source):
+                    source_id = (
+                        source.get("urn") or source.get("id") or source.get("_id") or ""
+                    )
+                    if source_id:
+                        g_label_map[source_id] = f"G{g_counter}"
+                    g_counter += 1
+
             cited_sources = parsed.get("cited_sources")
             if not isinstance(cited_sources, list):
                 cited_sources = parsed.get("cited_articles", [])
@@ -400,6 +432,7 @@ Answer the question concisely using your scientific knowledge."""),
                         quote=quote,
                         confidence=cited.get("confidence", "medium"),
                     )
+                    citation.display_label = g_label_map.get(citation.source_id)
                     citations.append(citation)
 
         return QAAnswer(
