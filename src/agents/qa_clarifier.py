@@ -6,8 +6,11 @@ from typing import Any, Dict, Optional, Set
 
 try:
     from langchain.prompts import ChatPromptTemplate
+    from langchain_core.messages import HumanMessage, SystemMessage
 except Exception as exc:  # pragma: no cover
     ChatPromptTemplate = None
+    HumanMessage = None
+    SystemMessage = None
     _CHAT_PROMPT_IMPORT_ERROR = exc
 
 from backend.groq import GROQ_CHAT
@@ -51,62 +54,53 @@ class QAClarifierSafetyAgent:
             answered_ids=answered_ids,
         )
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    """You are FoodScholar's combined Clarifier and Safety planner.
-
-Return ONLY valid JSON matching this schema:
-{{
-  "original_question": "string",
-  "canonical_question": "string",
-  "article_query": "string",
-  "guideline_query": "string",
-  "output_language": "ISO 639-1 code or null",
-  "risk_level": "low | medium | high",
-  "safety_flags": ["string"],
-  "answer_guardrails": ["string"],
-  "needs_clarification": true,
-  "clarification": {{
-    "id": "stable_snake_case_id",
-    "question": "one short question",
-    "input_type": "single_choice | multiple_choice | free_text | number | boolean",
-    "options": [{{"label": "short label", "value": "stable_value", "description": null}}],
-    "allow_free_text": true,
-    "reason": "why this materially changes the answer"
-  }},
-  "reasoning_summary": "short operational note"
-}}
-
-Responsibilities:
-- Ask clarification only when the missing detail materially changes safety, retrieval, or practical advice.
-- Prefer one short clarification with structured options.
-- Do not ask conversational follow-up questions for curiosity.
-- Create article_query for scientific articles and guideline_query for food-based dietary guidance.
-- Consider user country, region, age group, and experience group when present.
-- Flag safety-sensitive cases: infants/children, pregnancy/breastfeeding, chronic disease, kidney/liver disease, diabetes medication, eating disorders, allergies, medication/supplement interactions, severe symptoms.
-- If no clarification is needed, set needs_clarification=false and clarification=null.""",
-                ),
-                (
-                    "human",
-                    json.dumps(
-                        {
-                            "question": question,
-                            "request_language": request.language,
-                            "expertise_level": request.expertise_level,
-                            "retriever": request.retriever,
-                            "user_context": user_context.model_dump(exclude_none=True),
-                            "answered_clarification_ids": sorted(answered_ids),
-                        },
-                        ensure_ascii=False,
-                    ),
-                ),
-            ]
+        system_text = (
+            "You are FoodScholar's combined Clarifier and Safety planner.\n\n"
+            'Return ONLY valid JSON matching this schema:\n'
+            '{\n'
+            '  "original_question": "string",\n'
+            '  "canonical_question": "string",\n'
+            '  "article_query": "string",\n'
+            '  "guideline_query": "string",\n'
+            '  "output_language": "ISO 639-1 code or null",\n'
+            '  "risk_level": "low | medium | high",\n'
+            '  "safety_flags": ["string"],\n'
+            '  "answer_guardrails": ["string"],\n'
+            '  "needs_clarification": true,\n'
+            '  "clarification": {\n'
+            '    "id": "stable_snake_case_id",\n'
+            '    "question": "one short question",\n'
+            '    "input_type": "single_choice | multiple_choice | free_text | number | boolean",\n'
+            '    "options": [{"label": "short label", "value": "stable_value", "description": null}],\n'
+            '    "allow_free_text": true,\n'
+            '    "reason": "why this materially changes the answer"\n'
+            '  },\n'
+            '  "reasoning_summary": "short operational note"\n'
+            '}\n\n'
+            "Responsibilities:\n"
+            "- Ask clarification only when the missing detail materially changes safety, retrieval, or practical advice.\n"
+            "- Prefer one short clarification with structured options.\n"
+            "- Do not ask conversational follow-up questions for curiosity.\n"
+            "- Create article_query for scientific articles and guideline_query for food-based dietary guidance.\n"
+            "- Consider user country, region, age group, and experience group when present.\n"
+            "- Flag safety-sensitive cases: infants/children, pregnancy/breastfeeding, chronic disease, kidney/liver disease, diabetes medication, eating disorders, allergies, medication/supplement interactions, severe symptoms.\n"
+            "- If no clarification is needed, set needs_clarification=false and clarification=null."
         )
+        human_text = json.dumps(
+            {
+                "question": question,
+                "request_language": request.language,
+                "expertise_level": request.expertise_level,
+                "retriever": request.retriever,
+                "user_context": user_context.model_dump(exclude_none=True),
+                "answered_clarification_ids": sorted(answered_ids),
+            },
+            ensure_ascii=False,
+        )
+        messages = [SystemMessage(content=system_text), HumanMessage(content=human_text)]
 
         try:
-            response = self.llm.invoke(prompt.format_messages())
+            response = self.llm.invoke(messages)
             parsed = _parse_json_object(response.content)
             plan = QAClarifierSafetyPlan(**parsed)
             return _merge_with_fallback(plan, fallback, answered_ids)
