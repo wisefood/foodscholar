@@ -45,6 +45,7 @@ TIP_SOURCE_ARTICLE_POOL_SIZE = 10
 TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS = 40
 TIP_SOURCE_GUIDELINE_POOL_SIZE = 24
 TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS = 12
+QA_GUIDELINE_RAG_TOP_K_MAX = 5
 MAX_TIP_REGEN_ATTEMPTS = 3
 MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS = 3
 TIPS_OF_THE_DAY_TIPS_COUNT = 2
@@ -580,10 +581,16 @@ class QAService:
                 articles = []
                 retrieved_models = []
                 for lr in linearrag_results:
-                    article = {"abstract": lr["text"], "_score": lr["score"], **lr["source"]}
+                    article = {
+                        "abstract": lr["text"],
+                        "_score": lr["score"],
+                        "source_type": "article",
+                        **lr["source"],
+                    }
                     articles.append(article)
                     retrieved_models.append(
                         RetrievedArticle(
+                            source_type="article",
                             urn=lr["source"].get("urn", ""),
                             title=lr["source"].get("title", ""),
                             authors=lr["source"].get("authors"),
@@ -594,10 +601,42 @@ class QAService:
                             similarity_score=lr["score"],
                         )
                     )
-                logger.info("LinearRAG retrieved %d passages for: %s...", len(articles), question[:50])
+                logger.info(
+                    "LinearRAG retrieved %d passages for: %s...",
+                    len(articles),
+                    question[:50],
+                )
                 return articles, retrieved_models
 
-            # Default: Elasticsearch kNN
+            article_sources, article_models = self._retrieve_article_rag_sources(
+                question,
+                top_k,
+            )
+            guideline_top_k = min(max(top_k, 1), QA_GUIDELINE_RAG_TOP_K_MAX)
+            guideline_sources, guideline_models = self._retrieve_guideline_rag_sources(
+                question,
+                guideline_top_k,
+            )
+
+            sources = article_sources + guideline_sources
+            retrieved_models = article_models + guideline_models
+            logger.info(
+                "Elastic RAG retrieved %d articles and %d guidelines for: %s...",
+                len(article_sources),
+                len(guideline_sources),
+                question[:50],
+            )
+            return sources, retrieved_models
+
+        except Exception as e:
+            logger.error("Error retrieving articles: %s", e, exc_info=True)
+            return [], []
+
+    def _retrieve_article_rag_sources(
+        self, question: str, top_k: int
+    ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
+        """Retrieve article sources for default Elasticsearch RAG."""
+        try:
             query_vector = self._embed_query(question)
             raw_results = ELASTIC_CLIENT.knn_search(
                 index_name=self.INDEX_NAME,
@@ -610,28 +649,116 @@ class QAService:
                 },
                 source_excludes=["embedding"],
             )
-            articles = []
-            retrieved_models = []
-            for r in raw_results:
-                articles.append(r)
-                retrieved_models.append(
-                    RetrievedArticle(
-                        urn=r.get("urn", r.get("_id", "")),
-                        title=r.get("title", ""),
-                        authors=r.get("authors"),
-                        venue=r.get("venue"),
-                        publication_year=r.get("publication_year"),
-                        category=r.get("category"),
-                        tags=r.get("tags"),
-                        similarity_score=r.get("_score", 0.0),
-                    )
-                )
-            logger.info("Elastic retrieved %d articles for: %s...", len(articles), question[:50])
-            return articles, retrieved_models
-
         except Exception as e:
-            logger.error("Error retrieving articles: %s", e, exc_info=True)
+            logger.error("Article RAG retrieval failed: %s", e, exc_info=True)
             return [], []
+
+        articles: List[Dict[str, Any]] = []
+        retrieved_models: List[RetrievedArticle] = []
+        for result in raw_results:
+            result["source_type"] = "article"
+            result["relevance_score"] = result.get("_score", 0.0)
+            articles.append(result)
+            retrieved_models.append(
+                RetrievedArticle(
+                    source_type="article",
+                    urn=result.get("urn", result.get("_id", "")),
+                    title=result.get("title", ""),
+                    authors=result.get("authors"),
+                    venue=result.get("venue"),
+                    publication_year=result.get("publication_year"),
+                    category=result.get("category"),
+                    tags=result.get("tags"),
+                    similarity_score=result.get("_score", 0.0),
+                )
+            )
+        return articles, retrieved_models
+
+    def _retrieve_guideline_rag_sources(
+        self, question: str, top_k: int
+    ) -> Tuple[List[Dict[str, Any]], List[RetrievedArticle]]:
+        """Retrieve dietary guideline rule_text sources for default RAG."""
+        if top_k <= 0:
+            return [], []
+
+        body = {
+            "size": top_k,
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "multi_match": {
+                                "query": question,
+                                "fields": [
+                                    "rule_text^4",
+                                    "title^2",
+                                    "notes",
+                                    "food_groups^2",
+                                    "target_populations",
+                                    "guide_region",
+                                ],
+                                "type": "best_fields",
+                            }
+                        }
+                    ],
+                    "must_not": [{"term": {"status": "deleted"}}],
+                }
+            },
+        }
+
+        try:
+            response = ELASTIC_CLIENT.client.search(
+                index=self.GUIDELINES_INDEX_NAME,
+                body=body,
+            )
+        except Exception as e:
+            logger.error("Guideline RAG retrieval failed: %s", e, exc_info=True)
+            return [], []
+
+        guidelines: List[Dict[str, Any]] = []
+        retrieved_models: List[RetrievedArticle] = []
+        for hit in response.get("hits", {}).get("hits", []):
+            source = hit.get("_source", {})
+            if not isinstance(source, dict):
+                continue
+
+            guideline = {
+                **source,
+                "_id": hit.get("_id"),
+                "_score": hit.get("_score", 0.0),
+                "source_type": "guideline",
+            }
+            rule_text = self._extract_guideline_rule_text(guideline)
+            if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
+                continue
+
+            urn = self._guideline_document_urn(guideline)
+            guideline["urn"] = urn
+            guideline["abstract"] = rule_text
+            guideline["description"] = rule_text
+            guideline["venue"] = guideline.get("guide_region")
+            guideline["relevance_score"] = guideline.get("_score", 0.0)
+            guideline["publication_year"] = self._guideline_publication_year(
+                guideline
+            )
+
+            tags = self._guideline_tags(guideline)
+            guidelines.append(guideline)
+            retrieved_models.append(
+                RetrievedArticle(
+                    source_type="guideline",
+                    urn=urn,
+                    title=guideline.get("title", "Dietary guideline"),
+                    authors=None,
+                    venue=guideline.get("guide_region"),
+                    publication_year=guideline.get("publication_year"),
+                    category="guideline",
+                    tags=tags,
+                    similarity_score=guideline.get("_score", 0.0),
+                )
+            )
+
+        return guidelines, retrieved_models
 
     def _generate_simple_nutri_questions(self, count: int = 4) -> List[str]:
         """Generate assistant-directed nutrition questions with validation."""
@@ -1114,6 +1241,32 @@ Dietary guideline rules:
         if rule_text:
             return f"guideline:{uuid.uuid5(uuid.NAMESPACE_URL, rule_text)}"
         return "guidelines"
+
+    def _guideline_document_urn(self, guideline: Dict[str, Any]) -> str:
+        """Return a stable identifier for an individual guideline rule."""
+        for key in ("id", "_id", "urn", "guide_urn"):
+            value = guideline.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        rule_text = self._extract_guideline_rule_text(guideline)
+        if rule_text:
+            return f"guideline:{uuid.uuid5(uuid.NAMESPACE_URL, rule_text)}"
+        return "guideline"
+
+    def _guideline_tags(self, guideline: Dict[str, Any]) -> List[str]:
+        """Collect guideline keyword metadata into displayable tags."""
+        tags: List[str] = []
+        for key in ("food_groups", "target_populations"):
+            value = guideline.get(key)
+            if isinstance(value, list):
+                tags.extend(str(item) for item in value if item)
+            elif isinstance(value, str) and value.strip():
+                tags.append(value.strip())
+        region = guideline.get("guide_region")
+        if isinstance(region, str) and region.strip():
+            tags.append(region.strip())
+        return tags
 
     def _guideline_publication_year(self, guideline: Dict[str, Any]) -> Optional[str]:
         """Best-effort year-like metadata for guideline evidence."""
@@ -1976,6 +2129,7 @@ Evidence:
         return self.cache_manager.generate_cache_key(
             prefix="qa",
             data={
+                "version": 2,
                 "question": request.question.strip().lower(),
                 "mode": request.mode,
                 "model": self._resolve_model(request),

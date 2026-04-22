@@ -40,7 +40,7 @@ class QARequest(BaseModel):
         default=5,
         ge=1,
         le=20,
-        description="Number of articles to retrieve via kNN search",
+        description="Number of article sources to retrieve via kNN search",
     )
     expertise_level: Literal["beginner", "intermediate", "expert"] = Field(
         default="intermediate",
@@ -74,7 +74,7 @@ class QAAnswer(BaseModel):
     )
     citations: List[Citation] = Field(
         default_factory=list,
-        description="Citations to articles supporting the answer",
+        description="Citations to retrieved sources supporting the answer",
     )
     confidence: Literal["high", "medium", "low"] = Field(
         description="Overall confidence in the answer"
@@ -87,24 +87,28 @@ class QAAnswer(BaseModel):
     )
     articles_consulted: int = Field(
         default=0,
-        description="Number of articles consulted for this answer",
+        description="Number of retrieved sources consulted for this answer",
     )
 
 
 class RetrievedArticle(BaseModel):
-    """An article retrieved by kNN vector search."""
+    """A source retrieved for RAG context."""
 
-    urn: str = Field(description="Article URN")
-    title: str = Field(description="Article title")
+    source_type: Literal["article", "guideline"] = Field(
+        default="article",
+        description="Type of retrieved source",
+    )
+    urn: str = Field(description="Source URN/id")
+    title: str = Field(description="Source title")
     authors: Optional[List[str]] = Field(default=None, description="Article authors")
     venue: Optional[str] = Field(default=None, description="Publication venue")
     publication_year: Optional[str] = Field(
-        default=None, description="Publication year"
+        default=None, description="Publication year or source date"
     )
-    category: Optional[str] = Field(default=None, description="Article category")
-    tags: Optional[List[str]] = Field(default=None, description="Article tags")
+    category: Optional[str] = Field(default=None, description="Source category")
+    tags: Optional[List[str]] = Field(default=None, description="Source tags")
     similarity_score: float = Field(
-        description="Cosine similarity score from kNN search (0-1)"
+        description="Retriever relevance score"
     )
 
 
@@ -136,7 +140,7 @@ class QAResponse(BaseModel):
     )
     retrieved_articles: List[RetrievedArticle] = Field(
         default_factory=list,
-        description="Articles retrieved by vector search (shown for transparency)",
+        description="Sources retrieved by RAG (shown for transparency)",
     )
     follow_up_suggestions: Optional[List[str]] = Field(
         default=None,

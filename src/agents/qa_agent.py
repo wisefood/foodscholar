@@ -55,13 +55,13 @@ class QAAgent:
             question[:80], len(articles), self.model,
         )
 
-        article_context = self._prepare_article_context(articles)
+        source_context = self._prepare_article_context(articles)
         complexity = COMPLEXITY_INSTRUCTIONS.get(
             expertise_level, COMPLEXITY_INSTRUCTIONS["intermediate"]
         )
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are FoodScholar, a scientific Q&A assistant specializing in food science, nutrition, and food safety. Your task is to answer the user's question concisely and accurately using ONLY the provided article abstracts as evidence.
+            ("system", f"""You are FoodScholar, a scientific Q&A assistant specializing in food science, nutrition, and food safety. Your task is to answer the user's question concisely and accurately using ONLY the provided retrieved sources as evidence. Sources may include scientific article abstracts and dietary guideline rules.
 
 EXPERTISE LEVEL: {expertise_level}
 {complexity}
@@ -70,12 +70,15 @@ LANGUAGE: Respond in {language}.
 
 CRITICAL RULES:
 1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
-2. Every factual claim MUST cite at least one article using a markdown link in the format: [First Author et al. (Year)](/articles/ARTICLE_URN). For example: [Quezada et al. (2017)](/articles/urn:article:physical-activity-and-calorie-intake-med). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors.
-3. If the articles do not contain sufficient information, say so explicitly.
-4. Do NOT fabricate information beyond what the articles support.
-5. Clearly indicate when findings are preliminary vs well-established.
-6. If articles disagree, present both perspectives.
-7. For each cited article, include a "quote" field containing the EXACT verbatim passage from that article's abstract that best supports your answer to the user's question. The quote MUST be copied directly from the provided abstract text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
+2. Every factual claim MUST cite at least one retrieved source using a markdown link.
+3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors.
+4. For guideline sources, cite as [Dietary guideline: Title](/guidelines/GUIDELINE_URN).
+5. If the retrieved sources do not contain sufficient information, say so explicitly.
+6. Do NOT fabricate information beyond what the retrieved sources support.
+7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
+8. Clearly indicate when findings are preliminary vs well-established.
+9. If sources disagree, present both perspectives.
+10. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -84,11 +87,11 @@ Ensure all strings are properly escaped (use \\n for newlines, \\" for quotes).
 JSON structure:
 {{{{
   "answer": "Markdown-formatted concise answer with inline citations as markdown links",
-  "cited_articles": [
+  "cited_sources": [
     {{{{
-      "urn": "the article URN",
-      "section": "abstract",
-      "quote": "verbatim excerpt from the abstract supporting the answer",
+      "urn": "the source URN",
+      "section": "abstract or rule_text",
+      "quote": "verbatim excerpt from the source supporting the answer",
       "confidence": "high"
     }}}}
   ],
@@ -99,10 +102,10 @@ JSON structure:
 IMPORTANT: Return ONLY the JSON object."""),
             ("human", f"""Question: {question}
 
-Retrieved Articles:
-{article_context}
+Retrieved Sources:
+{source_context}
 
-Answer the question concisely using the articles above as evidence."""),
+Answer the question concisely using the sources above as evidence."""),
         ])
 
         parsed = self._invoke_and_parse(prompt)
@@ -174,9 +177,33 @@ Answer the question concisely using your scientific knowledge."""),
         return answer, follow_ups
 
     def _prepare_article_context(self, articles: List[Dict[str, Any]]) -> str:
-        """Format retrieved articles for the LLM context window."""
+        """Format retrieved RAG sources for the LLM context window."""
         summaries = []
         for idx, article in enumerate(articles, 1):
+            if self._is_guideline_source(article):
+                rule_text = self._get_source_text(article)
+                food_groups = self._join_field_values(article.get("food_groups"))
+                target_populations = self._join_field_values(
+                    article.get("target_populations")
+                )
+                summary = f"""Guideline {idx}:
+- Source Type: dietary_guideline
+- URN: {article.get('urn', article.get('id', article.get('_id', 'N/A')))}
+- Title: {article.get('title', 'Dietary guideline')}
+- Guide URN: {article.get('guide_urn', 'N/A')}
+- Region: {article.get('guide_region', 'N/A')}
+- Food Groups: {food_groups or 'N/A'}
+- Target Populations: {target_populations or 'N/A'}
+- Section: rule_text
+- Rule Text: {rule_text}"""
+
+                notes = article.get("notes")
+                if isinstance(notes, str) and notes.strip():
+                    summary += f"\n- Notes: {notes.strip()[:500]}"
+
+                summaries.append(summary)
+                continue
+
             authors = article.get("authors", [])
             if isinstance(authors, str):
                 authors = [authors]
@@ -191,6 +218,7 @@ Answer the question concisely using your scientific knowledge."""),
             )
 
             summary = f"""Article {idx}:
+- Source Type: article
 - URN: {article.get('urn', 'N/A')}
 - Title: {article.get('title', 'N/A')}
 - Authors: {author_str}
@@ -253,19 +281,35 @@ Answer the question concisely using your scientific knowledge."""),
         """Convert parsed LLM JSON into a QAAnswer model."""
         citations = []
         if articles and rag_used:
-            article_lookup = {a.get("urn", ""): a for a in articles}
-            for cited in parsed.get("cited_articles", []):
+            source_lookup: Dict[str, Dict[str, Any]] = {}
+            for source in articles:
+                for key in ("urn", "id", "_id", "guide_urn"):
+                    value = source.get(key)
+                    if isinstance(value, str) and value.strip():
+                        source_lookup[value.strip()] = source
+
+            cited_sources = parsed.get("cited_sources")
+            if not isinstance(cited_sources, list):
+                cited_sources = parsed.get("cited_articles", [])
+
+            for cited in cited_sources:
+                if not isinstance(cited, dict):
+                    continue
                 urn = cited.get("urn", "")
-                if urn in article_lookup:
-                    abstract_text = self._get_article_abstract_text(
-                        article_lookup[urn]
-                    )
-                    quote = self._coerce_quote_to_abstract_span(
-                        cited.get("quote"), abstract_text, question=question
+                if not isinstance(urn, str):
+                    continue
+                source = source_lookup.get(urn.strip())
+                if source:
+                    source_text = self._get_source_text(source)
+                    quote = self._coerce_quote_to_source_span(
+                        cited.get("quote"), source_text, question=question
                     )
                     citation = create_citation_from_article(
-                        article_lookup[urn],
-                        section=cited.get("section", "abstract"),
+                        source,
+                        section=cited.get(
+                            "section",
+                            self._default_source_section(source),
+                        ),
                         quote=quote,
                         confidence=cited.get("confidence", "medium"),
                     )
@@ -281,22 +325,43 @@ Answer the question concisely using your scientific knowledge."""),
         )
 
     @staticmethod
-    def _get_article_abstract_text(article: Dict[str, Any]) -> str:
-        abstract = article.get("abstract") or article.get("description") or ""
-        return abstract if isinstance(abstract, str) else ""
+    def _is_guideline_source(source: Dict[str, Any]) -> bool:
+        if source.get("source_type") == "guideline":
+            return True
+        return bool(source.get("rule_text")) and not source.get("abstract")
 
     @staticmethod
-    def _coerce_quote_to_abstract_span(
-        quote: Any, abstract_text: str, question: Optional[str] = None
+    def _join_field_values(value: Any) -> str:
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value if item)
+        if isinstance(value, str):
+            return value.strip()
+        return ""
+
+    @staticmethod
+    def _get_source_text(source: Dict[str, Any]) -> str:
+        if QAAgent._is_guideline_source(source):
+            text = source.get("rule_text") or source.get("abstract") or ""
+        else:
+            text = source.get("abstract") or source.get("description") or ""
+        return text if isinstance(text, str) else ""
+
+    @staticmethod
+    def _default_source_section(source: Dict[str, Any]) -> str:
+        return "rule_text" if QAAgent._is_guideline_source(source) else "abstract"
+
+    @staticmethod
+    def _coerce_quote_to_source_span(
+        quote: Any, source_text: str, question: Optional[str] = None
     ) -> Optional[str]:
         """
-        Ensure a quote is an exact substring of the provided abstract text.
+        Ensure a quote is an exact substring of the provided source text.
 
         If the LLM returns a quote that differs only in whitespace/casing, attempt to
-        recover the exact matching span from the abstract. If no quote is provided
-        or no match can be found, fall back to a best-effort sentence from the abstract.
+        recover the exact matching span from the source. If no quote is provided
+        or no match can be found, fall back to a best-effort sentence from the source.
         """
-        if not abstract_text:
+        if not source_text:
             return None
 
         if isinstance(quote, str):
@@ -304,34 +369,34 @@ Answer the question concisely using your scientific knowledge."""),
         else:
             candidate = ""
 
-        if candidate and candidate in abstract_text:
+        if candidate and candidate in source_text:
             return candidate
 
         if candidate:
-            # Try to match the candidate in the abstract even if whitespace differs,
-            # then return the exact span as it appears in the abstract for highlighting.
+            # Try to match the candidate even if whitespace differs, then return
+            # the exact span as it appears in the source for highlighting.
             tokens = candidate.split()
             if len(tokens) >= 3:
                 pattern = r"\\s+".join(re.escape(tok) for tok in tokens)
-                match = re.search(pattern, abstract_text)
+                match = re.search(pattern, source_text)
                 if match:
                     return match.group(0)
-                match = re.search(pattern, abstract_text, flags=re.IGNORECASE)
+                match = re.search(pattern, source_text, flags=re.IGNORECASE)
                 if match:
                     return match.group(0)
 
         # Best-effort fallback: pick the most question-relevant sentence.
-        return QAAgent._best_effort_quote_from_abstract(
-            abstract_text=abstract_text, question=question
+        return QAAgent._best_effort_quote_from_source(
+            source_text=source_text, question=question
         )
 
     @staticmethod
-    def _best_effort_quote_from_abstract(
-        abstract_text: str, question: Optional[str]
+    def _best_effort_quote_from_source(
+        source_text: str, question: Optional[str]
     ) -> Optional[str]:
         sentences = [
             s.strip()
-            for s in re.split(r"(?<=[.!?])\\s+", abstract_text.strip())
+            for s in re.split(r"(?<=[.!?])\\s+", source_text.strip())
             if s.strip()
         ]
         if not sentences:
