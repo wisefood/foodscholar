@@ -94,15 +94,17 @@ class SynthesisAgent:
         summaries = []
 
         for idx, article in enumerate(articles, 1):
-            summary = f"""
-Article {idx}:
+            authors = article.get('authors', [])
+            author_str = ', '.join(authors[:3]) + ('...' if len(authors) > 3 else '')
+            raw_year = article.get('publication_year') or article.get('year', 'N/A')
+            year = str(raw_year)[:4] if raw_year and raw_year != 'N/A' else 'N/A'
+            summary = f"""Article {idx}:
 - URN: {article.get('urn', 'N/A')}
 - Title: {article.get('title', 'N/A')}
-- Authors: {', '.join(article.get('authors', [])[:3])}{'...' if len(article.get('authors', [])) > 3 else ''}
-- Year: {article.get('year', 'N/A')}
-- Journal: {article.get('journal', 'N/A')}
-- Abstract: {article.get('abstract', 'No abstract available')[:500]}...
-"""
+- Authors: {author_str}
+- Year: {year}
+- Journal: {article.get('venue') or article.get('journal', 'N/A')}
+- Abstract: {article.get('abstract', 'No abstract available')[:500]}"""
             summaries.append(summary)
 
         return "\n\n".join(summaries)
@@ -123,48 +125,42 @@ Article {idx}:
         }
 
         prompt_template = ChatPromptTemplate.from_messages([
-            ("system", f"""You are a scientific literature synthesis expert. Your task is to analyze multiple scientific articles and create a comprehensive, accurate summary that addresses the user's query.
+            ("system", f"""You are a scientific literature synthesis expert. Your task is to read multiple scientific articles and write a clear, natural summary that addresses the user's query — as if explaining the research landscape to a knowledgeable colleague.
 
 EXPERTISE LEVEL: {expertise_level}
 {complexity_instructions.get(expertise_level, complexity_instructions['intermediate'])}
 
 CRITICAL RULES:
-1. NEVER make claims without citing specific articles
-2. Clearly distinguish between findings from individual studies vs consensus across studies
-3. Note any contradictions or limitations in the research
-4. Be precise about study methodologies (RCT, observational, meta-analysis, etc.)
-5. Highlight strength of evidence (e.g., "preliminary findings suggest..." vs "strong evidence demonstrates...")
+1. Never make claims without grounding them in the provided articles.
+2. Distinguish between findings from a single study and patterns seen across multiple studies.
+3. Surface contradictions, limitations, or gaps honestly.
+4. Be specific about study designs (RCT, observational, meta-analysis, etc.) where it matters.
+5. Calibrate language to the strength of evidence ("preliminary findings suggest..." vs "consistent evidence shows...").
+
+WRITING STYLE:
+- Open directly with the most important finding or answer — never with a title, heading, or phrase like "Introduction to [topic]" or "This summary explores...".
+- Write in flowing, connected prose. Avoid bullet-list padding or mechanical section headers.
+- Let the narrative follow the logic of the evidence, not a fixed template.
+- Use markdown sparingly: **bold** only for the most important terms or conclusions, *italic* for study types or caveats. Avoid decorative formatting.
+- Keep it concise and readable; do not pad with summaries of what you're about to say.
+
+CITATION STYLE:
+- Cite inline using Author et al. (Year) format, e.g. "Smith et al. (2021) found that..." or "...as shown in a large RCT (Jones et al., 2019)."
+- For single-author articles use just the surname: "Lee (2020) reported...".
+- Never use numbered references like [1] or [Article 1]. Never use URNs inline in prose.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
 Ensure all strings are properly escaped (use \\n for newlines, \\t for tabs, \\" for quotes).
 
 JSON structure:
-- "summary": A comprehensive markdown-formatted summary. Use rich markdown formatting:
-  - **Bold** for key terms, important findings, and emphasis
-  - *Italic* for study types, scientific names, and technical terms
-  - Use bullet lists (- ) or numbered lists for clarity
-  - Use headings (###) to organize sections
-  - Use > blockquotes for notable quotes or key takeaways
-  - Separate paragraphs with \\n\\n
-  - Keep it focused and scannable with clear visual hierarchy
+- "summary": A markdown-formatted natural prose summary addressing the query.
 - "findings": Array of objects, each with:
   - "finding": The specific finding or insight (properly escaped string, can use markdown)
   - "category": One of [nutrition, health outcomes, methodology, safety, mechanisms, epidemiology]
   - "confidence": One of [high, medium, low]
   - "supporting_article_urns": Array of URN strings that support this finding
   - "supporting_sections": Array of section names (abstract, methods, results, discussion)
-
-SUMMARY STRUCTURE:
-1. Opening: Direct answer to the query with **key consensus in bold**
-2. Body: Major findings organized with headings and bullet points
-3. Nuance: Conflicting evidence, limitations, or gaps (use *italic* for caveats)
-4. Conclusion: Practical implications with **bold takeaways**
-
-FORMATTING EXAMPLES:
-- "**Natto consumption** showed significant antithrombotic effects in *hypercholesterolemia rats*."
-- "### Key Health Outcomes\\n\\n- Improved blood circulation\\n- Reduced cholesterol levels"
-- "> Important: These findings are based on *animal studies* and may not directly translate to humans."
 
 IMPORTANT: Return ONLY the JSON object. Do not wrap it in code blocks or add any other text."""),
             ("human", f"""Query: {query}
