@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnablePassthrough
 import json
 
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from models.session import (
     SessionStartRequest,
     SessionStartResponse,
@@ -40,7 +41,12 @@ def get_or_create_memory(
     return memories[session_id]
 
 
-def generate_session_title(user_message: str, user_context: str = "") -> str:
+def generate_session_title(
+    user_message: str,
+    user_context: str = "",
+    session_id: str = None,
+    user_id: str = None,
+) -> str:
     """Generate a short title for the session based on the first user message."""
     try:
         llm = GROQ_CHAT.get_client(model="llama-3.3-70b-versatile", temperature=0.3)
@@ -59,7 +65,15 @@ Generate ONLY the title, nothing else. Examples of good titles:
 
 Title:"""
 
-        response = llm.invoke(prompt)
+        response = llm.invoke(
+            prompt,
+            config=build_trace_config(
+                run_name="session-title",
+                session_id=session_id,
+                user_id=user_id,
+                tags=["session-chat", "title"],
+            ),
+        )
         title = response.content.strip().strip('"').strip("'")
 
         if len(title) > 50:
@@ -176,7 +190,13 @@ async def start_session(request: SessionStartRequest):
         chain, memory = create_structured_chain(request.session_id, request.max_history)
 
         greeting_response = chain.invoke(
-            {"input": "Hello! I'd like help with food and nutrition questions."}
+            {"input": "Hello! I'd like help with food and nutrition questions."},
+            config=build_trace_config(
+                run_name="session-greeting",
+                session_id=request.session_id,
+                user_id=request.user_id,
+                tags=["session-chat", "greeting"],
+            ),
         )
 
         memory.save_context(
@@ -230,7 +250,15 @@ async def chat(request: ChatRequest):
 
     try:
         chain, memory = create_structured_chain(request.session_id, request.max_history)
-        response = chain.invoke({"input": request.message})
+        response = chain.invoke(
+            {"input": request.message},
+            config=build_trace_config(
+                run_name="session-chat",
+                session_id=request.session_id,
+                user_id=request.user_id,
+                tags=["session-chat"],
+            ),
+        )
 
         memory.save_context(
             {"input": request.message}, {"output": response.model_dump_json()}
@@ -241,7 +269,10 @@ async def chat(request: ChatRequest):
             and request.message != "Hello! I'd like help with food and nutrition questions."
         ):
             session_title = generate_session_title(
-                request.message, user_contexts.get(request.session_id, "")
+                request.message,
+                user_contexts.get(request.session_id, ""),
+                session_id=request.session_id,
+                user_id=request.user_id,
             )
             session_titles[request.session_id] = session_title
 

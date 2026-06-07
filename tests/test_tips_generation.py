@@ -11,7 +11,9 @@ class _FakeLLM:
     def __init__(self, content: str):
         self._content = content
 
-    def invoke(self, _prompt: str):
+    def invoke(self, _prompt, *args, **kwargs):
+        # Accept (and ignore) a LangChain ``config=`` kwarg so the fake matches
+        # the real client signature used for Langfuse trace attribution.
         return _FakeLLMResponse(self._content)
 
 
@@ -279,6 +281,65 @@ class TipsGenerationTests(unittest.TestCase):
         self.assertTrue(
             service._is_tips_payload_appropriate(payload, tips_count=2, did_you_know_count=2)
         )
+
+
+class TipShorteningTests(unittest.TestCase):
+    def test_shorten_keeps_short_sentence_whole(self):
+        from services.qa_service import QAService
+        service = QAService(cache_enabled=False)
+        out = service._shorten_tip_sentence(
+            "Eat five portions of fruit and vegetables each day.", max_words=18)
+        self.assertEqual(out, "Eat five portions of fruit and vegetables each day.")
+
+    def test_shorten_drops_overlong_sentence_instead_of_mangling(self):
+        """A first sentence longer than the cap must NOT be cut mid-clause and
+        emitted with a trailing dangling word (e.g. '... cereals and.')."""
+        from services.qa_service import QAService
+        service = QAService(cache_enabled=False)
+        long_rule = (
+            "Inactive boys aged 13 to 18 should have four to five daily "
+            "servings from the wholemeal cereals and breads, potatoes, pasta "
+            "and rice shelf of the food pyramid every single day."
+        )
+        out = service._shorten_tip_sentence(long_rule, max_words=18)
+        # Must not produce a mangled fragment ending in a dangling conjunction.
+        self.assertFalse(
+            out.rstrip(".").endswith(" and"),
+            f"mangled mid-clause output: {out!r}",
+        )
+        self.assertFalse(
+            out.rstrip(".").endswith(" the"),
+            f"mangled mid-clause output: {out!r}",
+        )
+        # Drop-if-too-long policy: an over-cap single sentence yields "".
+        self.assertEqual(out, "")
+
+    def test_shorten_takes_first_sentence_when_within_cap(self):
+        from services.qa_service import QAService
+        service = QAService(cache_enabled=False)
+        out = service._shorten_tip_sentence(
+            "Drink water regularly. Avoid sugary drinks throughout the day.",
+            max_words=18)
+        self.assertEqual(out, "Drink water regularly.")
+
+
+class TipsLLMConfigTests(unittest.TestCase):
+    def test_simple_question_llm_has_token_budget_and_low_reasoning(self):
+        """The tips/starter LLM (a reasoning model) must set an explicit token
+        budget and minimal reasoning so JSON output is not truncated."""
+        import os
+        from services.qa_service import QAService
+        from backend.groq import GROQ_CHAT
+        # Constructing a real ChatGroq needs a key; the pool reads it from env.
+        os.environ.setdefault("GROQ_API_KEY", "test-key-not-used")
+        GROQ_CHAT._api_key = GROQ_CHAT._api_key or "test-key-not-used"
+        service = QAService(cache_enabled=False)
+        llm = service.simple_question_llm
+        # max_tokens must be set and generous enough for ~12 JSON items.
+        self.assertIsNotNone(getattr(llm, "max_tokens", None))
+        self.assertGreaterEqual(llm.max_tokens, 1024)
+        # reasoning_effort should be minimized for this structured task.
+        self.assertEqual(getattr(llm, "reasoning_effort", None), "low")
 
 
 if __name__ == "__main__":

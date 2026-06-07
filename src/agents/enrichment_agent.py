@@ -14,6 +14,7 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from backend.prompts import (
     ENRICHMENT_ANNOTATION,
     ENRICHMENT_KEYWORDS_SYSTEM,
@@ -143,7 +144,13 @@ class EnrichmentAgent:
             ]
         )
 
-        response = (prompt | self.keyword_llm).invoke({"abstract": abstract})
+        response = (prompt | self.keyword_llm).invoke(
+            {"abstract": abstract},
+            config=build_trace_config(
+                run_name="enrichment-keywords",
+                tags=["enrichment", "keywords"],
+            ),
+        )
 
         try:
             data = json.loads(response.content)
@@ -367,7 +374,11 @@ class EnrichmentAgent:
                 "title": article.title,
                 "abstract": article.abstract,
                 "authors": article.authors,
-            }
+            },
+            config=build_trace_config(
+                run_name="enrichment-annotation",
+                tags=["enrichment", "annotation"],
+            ),
         )
 
         enriched = self._normalize_enriched(enriched, article.abstract)

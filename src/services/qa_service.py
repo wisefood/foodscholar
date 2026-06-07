@@ -35,12 +35,26 @@ from models.qa import (
 )
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from backend.prompts import (
     QA_STARTER_QUESTIONS,
     QA_TIPS_FROM_GUIDELINES,
     QA_TIPS_FROM_ARTICLES,
     QA_TIP_REWRITE,
 )
+
+
+def _request_trace_context(request: "QARequest") -> Dict[str, Optional[str]]:
+    """Derive Langfuse trace context (session + user) from a QA request.
+
+    ``qa_thread_id`` is the short-horizon conversational thread, so it doubles as
+    the Langfuse session id; ``user_id`` (falling back to ``member_id``) attributes
+    the trace to a user. Only opaque identifiers are surfaced — never PII.
+    """
+    return {
+        "session_id": request.qa_thread_id,
+        "user_id": request.user_id or request.member_id,
+    }
 from services.qa_retrievers import (
     QARetrieverAdapters,
     RetrievalResult,
@@ -208,9 +222,14 @@ class QAService:
     def simple_question_llm(self):
         """Lazy-load Groq client for starter nutrition question generation."""
         if self._simple_question_llm is None:
+            # gpt-oss-20b is a reasoning model: without an explicit token budget
+            # and minimal reasoning it spends the completion on hidden reasoning
+            # and truncates the JSON payload (~12 items), making it unparseable.
             self._simple_question_llm = GROQ_CHAT.get_client(
                 model=SIMPLE_NUTRI_QUESTION_MODEL,
                 temperature=0.8,
+                max_tokens=2048,
+                reasoning_effort="low",
             )
         return self._simple_question_llm
 
@@ -626,7 +645,11 @@ class QAService:
         # Primary answer
         from agents.qa_agent import QAAgent
 
-        primary_agent = QAAgent(model=effective_model, temperature=0.3)
+        primary_agent = QAAgent(
+            model=effective_model,
+            temperature=0.3,
+            trace_context=_request_trace_context(request),
+        )
         context_payload = user_context.model_dump(exclude_none=True)
         context_payload["safety"] = {
             "risk_level": plan.risk_level,
@@ -1585,7 +1608,13 @@ class QAService:
     def _generate_simple_questions_once(self, count: int) -> List[str]:
         """Single pass generation for starter nutrition questions."""
         prompt = QA_STARTER_QUESTIONS.compile(count=count)
-        response = self.simple_question_llm.invoke(prompt)
+        response = self.simple_question_llm.invoke(
+            prompt,
+            config=build_trace_config(
+                run_name="qa-starter-questions",
+                tags=["qa", "generated-content", "starter-questions"],
+            ),
+        )
         parsed = self._parse_questions_json(response.content)
         questions = parsed.get("questions", [])
         if not isinstance(questions, list):
@@ -1904,7 +1933,13 @@ class QAService:
         prompt = QA_TIPS_FROM_GUIDELINES.compile(candidate_count=candidate_count, guideline_context=guideline_context)
         items: List[Any] = []
         try:
-            response = self.simple_question_llm.invoke(prompt)
+            response = self.simple_question_llm.invoke(
+                prompt,
+                config=build_trace_config(
+                    run_name="qa-tips-from-guidelines",
+                    tags=["qa", "generated-content", "tips"],
+                ),
+            )
             parsed = self._parse_tip_candidates_json(response.content)
             parsed_items = parsed.get("items", [])
             if isinstance(parsed_items, list):
@@ -2156,16 +2191,21 @@ class QAService:
         return text
 
     def _shorten_tip_sentence(self, text: str, *, max_words: int) -> str:
-        """Limit generated fallback text to a short single sentence."""
+        """Limit fallback text to a short, whole single sentence.
+
+        Returns the first sentence verbatim when it fits within ``max_words``.
+        If that sentence is longer than the cap, returns "" so the caller drops
+        the candidate rather than emitting a clause cut mid-phrase (e.g.
+        "... wholemeal cereals and."), which is grammatically broken and
+        changes meaning.
+        """
         text = " ".join(str(text).split()).strip()
         if not text:
             return ""
 
         sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
-        words = sentence.split()
-        if len(words) > max_words:
-            sentence = " ".join(words[:max_words]).rstrip(" ,;:")
-        sentence = sentence.strip()
+        if len(sentence.split()) > max_words:
+            return ""
         if sentence and sentence[-1] not in ".!?":
             sentence += "."
         return sentence
@@ -2285,7 +2325,13 @@ class QAService:
 
         article_context = self._prepare_tip_article_context(articles)
         prompt = QA_TIPS_FROM_ARTICLES.compile(candidate_count=candidate_count, article_context=article_context)
-        response = self.simple_question_llm.invoke(prompt)
+        response = self.simple_question_llm.invoke(
+            prompt,
+            config=build_trace_config(
+                run_name="qa-tips-from-articles",
+                tags=["qa", "generated-content", "tips"],
+            ),
+        )
         parsed = self._parse_tip_candidates_json(response.content)
         items = parsed.get("items", [])
         if not isinstance(items, list):
@@ -2433,7 +2479,13 @@ class QAService:
         article_context = self._prepare_tip_article_context(articles)
         prompt = QA_TIP_REWRITE.compile(text=text, style=style, article_context=article_context)
         try:
-            response = self.simple_question_llm.invoke(prompt)
+            response = self.simple_question_llm.invoke(
+                prompt,
+                config=build_trace_config(
+                    run_name="qa-tip-rewrite",
+                    tags=["qa", "generated-content", "tips"],
+                ),
+            )
             output = response.content.strip()
             if "insufficient_evidence" in output.lower():
                 return None
@@ -3080,7 +3132,9 @@ class QAService:
         from agents.qa_agent import QAAgent
 
         secondary_agent = QAAgent(
-            model=secondary_model, temperature=secondary_temp
+            model=secondary_model,
+            temperature=secondary_temp,
+            trace_context=_request_trace_context(request),
         )
 
         # If strategy varies top_k, re-retrieve articles

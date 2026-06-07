@@ -13,9 +13,58 @@ Env vars (read directly by the Langfuse SDK):
 import os
 import logging
 from functools import lru_cache
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def build_trace_config(
+    *,
+    run_name: str,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    extra_metadata: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Build a LangChain ``config`` dict carrying Langfuse trace attributes.
+
+    Returns a ``config`` suitable for passing to ``Runnable.invoke(..., config=...)``
+    so the Langfuse ``CallbackHandler`` (already attached to every pooled ChatGroq
+    client in :mod:`backend.groq`) enriches the resulting trace. It maps to the
+    Langfuse **v3** convention:
+
+        - ``run_name``           -> a descriptive, filterable trace/observation name
+        - ``langfuse_session_id``-> groups multi-turn conversations (Sessions view)
+        - ``langfuse_user_id``   -> user/cost attribution and filtering
+        - ``langfuse_tags``      -> per-feature analytics (e.g. ["qa", "rag"])
+
+    PII policy: only opaque identifiers (``session_id``/``user_id``) and feature
+    tags are attached here. Never pass personal data (allergies, dietary profile,
+    member details) via ``extra_metadata`` — the LLM message payload remains the
+    only place model-relevant context appears, which is the generation input by
+    necessity.
+
+    Works regardless of whether Langfuse is enabled: the returned ``run_name`` is
+    a standard LangChain config key, and the ``langfuse_*`` metadata keys are
+    simply ignored when no handler is present. ``None`` values are omitted, and
+    identifiers are coerced to ``str`` (Langfuse requires string metadata values).
+    """
+    config: Dict[str, Any] = {"run_name": run_name}
+
+    metadata: Dict[str, Any] = {}
+    if session_id is not None:
+        metadata["langfuse_session_id"] = str(session_id)
+    if user_id is not None:
+        metadata["langfuse_user_id"] = str(user_id)
+    if tags:
+        metadata["langfuse_tags"] = list(tags)
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    if metadata:
+        config["metadata"] = metadata
+
+    return config
 
 
 def langfuse_enabled() -> bool:
