@@ -54,14 +54,33 @@ def get_callback_handler() -> Optional[Any]:
         return None
 
 
+@lru_cache(maxsize=1)
+def get_langfuse_client() -> Optional[Any]:
+    """Process-wide Langfuse client (shared connection + prompt cache).
+
+    The Langfuse SDK is a singleton; per-request instantiation is discouraged
+    by the docs to avoid memory leaks. This returns one configure-once client,
+    reused for prompt fetching (and trace flushing) across all requests and
+    threads. Returns None when observability is disabled.
+    """
+    if not langfuse_enabled():
+        return None
+    try:
+        from langfuse import Langfuse
+
+        return Langfuse()  # reads keys + base_url from the environment
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to initialize Langfuse client: %s", exc)
+        return None
+
+
 def flush_langfuse() -> None:
     """Flush buffered traces to Langfuse. Safe to call when disabled."""
-    if not langfuse_enabled():
+    client = get_langfuse_client()
+    if client is None:
         return
     try:
-        from langfuse import get_client
-
-        get_client().flush()
+        client.flush()
         logger.info("Flushed pending Langfuse traces")
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Failed to flush Langfuse traces: %s", exc)
