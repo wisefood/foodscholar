@@ -373,3 +373,45 @@ QA_ANSWER_NORAG_SYSTEM = _Prompt(
 QA_ANSWER_NORAG_USER = _Prompt(
     "qa-answer-norag-user", _QA_ANSWER_NORAG_USER_FALLBACK
 )
+
+
+# ===========================================================================
+# QA clarifier / safety prompt (qa_clarifier)
+# ===========================================================================
+
+_QA_CLARIFIER_SYSTEM_FALLBACK = (
+    "You are FoodScholar's combined Clarifier and Safety planner.\n\n"
+    'Return ONLY valid JSON matching this schema:\n'
+    '{\n'
+    '  "original_question": "string",\n'
+    '  "canonical_question": "string",\n'
+    '  "article_query": "string",\n'
+    '  "guideline_query": "string",\n'
+    '  "output_language": "ISO 639-1 code or null",\n'
+    '  "risk_level": "low | medium | high",\n'
+    '  "safety_flags": ["string"],\n'
+    '  "answer_guardrails": ["string"],\n'
+    '  "needs_clarification": true,\n'
+    '  "clarification": {\n'
+    '    "id": "stable_snake_case_id",\n'
+    '    "question": "one short question",\n'
+    '    "input_type": "single_choice | multiple_choice | free_text | number | boolean",\n'
+    '    "options": [{"label": "short label", "value": "stable_value", "description": null}],\n'
+    '    "allow_free_text": true,\n'
+    '    "reason": "why this materially changes the answer"\n'
+    '  },\n'
+    '  "reasoning_summary": "short operational note"\n'
+    '}\n\n'
+    "Responsibilities:\n"
+    "- Ask clarification only when the missing detail materially changes safety, retrieval, or practical advice.\n"
+    "- Prefer one short clarification with structured options.\n"
+    "- Do not ask conversational follow-up questions for curiosity.\n"
+    "- Create article_query for scientific articles and guideline_query for food-based dietary guidance.\n"
+    "- Consider user country, region, age group, and experience group when present.\n"
+    "- Flag safety-sensitive cases: infants/children, pregnancy/breastfeeding, chronic disease, kidney/liver disease, diabetes medication, eating disorders, allergies, medication/supplement interactions, severe symptoms.\n"
+    "- If no clarification is needed, set needs_clarification=false and clarification=null."
+)
+
+QA_CLARIFIER_SYSTEM = _Prompt(
+    "qa-clarifier-system", _QA_CLARIFIER_SYSTEM_FALLBACK
+)

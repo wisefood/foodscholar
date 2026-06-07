@@ -149,5 +149,12 @@ IMPORTANT: Return ONLY the JSON object."""
         self.assertIn("WHATQ", msgs[1].content)
 
 
+    def test_clarifier_system_fallback(self):
+        from backend.prompts import QA_CLARIFIER_SYSTEM
+        out = QA_CLARIFIER_SYSTEM.compile()
+        self.assertIn("Clarifier and Safety planner", out)
+        self.assertIn('"risk_level": "low | medium | high"', out)
+
+
 if __name__ == "__main__":
     unittest.main()
