@@ -7,6 +7,12 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain.prompts import ChatPromptTemplate
 
 from backend.groq import GROQ_CHAT
+from backend.prompts import (
+    QA_ANSWER_RAG_SYSTEM,
+    QA_ANSWER_RAG_USER,
+    QA_ANSWER_NORAG_SYSTEM,
+    QA_ANSWER_NORAG_USER,
+)
 from models.qa import QAAnswer, QACitation, DEFAULT_GROQ_MODEL
 
 logger = logging.getLogger(__name__)
@@ -68,59 +74,18 @@ class QAAgent:
         )
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are FoodScholar, a scientific Q&A assistant specializing in food science, nutrition, and food safety. Your task is to answer the user's question concisely and accurately using ONLY the provided retrieved sources as evidence. Sources may include scientific article abstracts and dietary guideline rules.
-
-EXPERTISE LEVEL: {expertise_level}
-{complexity}
-
-LANGUAGE: Respond in {language}.
-
-ANSWER FORMULATION CONTEXT:
-{answer_context}
-
-CRITICAL RULES:
-1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
-2. Every factual claim MUST cite at least one retrieved source using a markdown link.
-3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
-4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
-5. If the retrieved sources do not contain sufficient information, say so explicitly.
-6. Do NOT fabricate information beyond what the retrieved sources support.
-7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
-8. LinearRAG sources are passage-level snippets. Only cite them when the provided passage itself supports the claim.
-9. If the user's country/region is known, prefer country- or region-specific guidance when the retrieved evidence supports it; otherwise state that the answer is general.
-10. Clearly indicate when findings are preliminary vs well-established.
-11. If sources disagree, present both perspectives.
-12. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract or passage text. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
-
-OUTPUT FORMAT:
-Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
-Ensure all strings are properly escaped (use \\n for newlines, \\" for quotes).
-
-JSON structure:
-{{{{
-  "answer": "Markdown-formatted concise answer with inline citations as markdown links",
-  "cited_sources": [
-    {{{{
-      "urn": "the source URN",
-      "section": "abstract or rule_text",
-      "quote": "verbatim excerpt from the source supporting the answer",
-      "confidence": "high"
-    }}}}
-  ],
-  "overall_confidence": "high",
-  "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-}}}}
-
-IMPORTANT: Return ONLY the JSON object."""),
-            ("human", f"""Question: {question}
-
-Retrieved Sources:
-{source_context}
-
-Answer the question concisely using the sources above as evidence."""),
+            ("system", QA_ANSWER_RAG_SYSTEM.langchain()),
+            ("human", QA_ANSWER_RAG_USER.langchain()),
         ])
 
-        parsed = self._invoke_and_parse(prompt)
+        parsed = self._invoke_and_parse(prompt, variables={
+            "expertise_level": expertise_level,
+            "complexity": complexity,
+            "language": language,
+            "answer_context": answer_context,
+            "question": question,
+            "source_context": source_context,
+        })
         answer = self._build_qa_answer(
             parsed, question=question, articles=articles, rag_used=True
         )
@@ -160,38 +125,17 @@ Answer the question concisely using the sources above as evidence."""),
         )
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""You are FoodScholar, a scientific Q&A assistant specializing in food science, nutrition, and food safety. Answer the user's question using your training knowledge.
-
-EXPERTISE LEVEL: {expertise_level}
-{complexity}
-
-LANGUAGE: Respond in {language}.
-
-ANSWER FORMULATION CONTEXT:
-{answer_context}
-
-CRITICAL RULES:
-1. Answer CONCISELY - aim for 2-4 paragraphs maximum.
-2. Be honest about uncertainty. Use hedging language when appropriate.
-3. Since no specific articles are provided, do NOT fabricate citations or article references.
-4. Mention general knowledge sources where applicable (e.g., "according to WHO guidelines").
-5. Clearly distinguish between well-established facts and emerging research.
-6. If the user's country/region is known, localize the answer only when you can do so safely; otherwise say the guidance may vary by country.
-
-OUTPUT FORMAT:
-Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
-
-{{{{
-  "answer": "Markdown-formatted concise answer",
-  "overall_confidence": "high or medium or low",
-  "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-}}}}"""),
-            ("human", f"""Question: {question}
-
-Answer the question concisely using your scientific knowledge."""),
+            ("system", QA_ANSWER_NORAG_SYSTEM.langchain()),
+            ("human", QA_ANSWER_NORAG_USER.langchain()),
         ])
 
-        parsed = self._invoke_and_parse(prompt)
+        parsed = self._invoke_and_parse(prompt, variables={
+            "expertise_level": expertise_level,
+            "complexity": complexity,
+            "language": language,
+            "answer_context": answer_context,
+            "question": question,
+        })
         answer = self._build_qa_answer(
             parsed, question=question, articles=None, rag_used=False
         )
@@ -342,10 +286,16 @@ Answer the question concisely using your scientific knowledge."""),
             summaries.append(summary)
         return "\n\n".join(summaries)
 
-    def _invoke_and_parse(self, prompt: ChatPromptTemplate) -> Dict[str, Any]:
-        """Invoke the LLM and parse JSON response."""
+    def _invoke_and_parse(
+        self, prompt: ChatPromptTemplate, variables: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Invoke the LLM and parse JSON response.
+
+        ``variables`` are substituted into the prompt template (registry-backed
+        prompts carry their placeholders); omit for already-formatted prompts.
+        """
         try:
-            response = self.llm.invoke(prompt.format_messages())
+            response = self.llm.invoke(prompt.format_messages(**(variables or {})))
             return self._parse_llm_response(response.content)
         except Exception as e:
             logger.error("Error invoking LLM: %s", e, exc_info=True)
