@@ -35,6 +35,12 @@ from models.qa import (
 )
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
+from backend.prompts import (
+    QA_STARTER_QUESTIONS,
+    QA_TIPS_FROM_GUIDELINES,
+    QA_TIPS_FROM_ARTICLES,
+    QA_TIP_REWRITE,
+)
 from services.qa_retrievers import (
     QARetrieverAdapters,
     RetrievalResult,
@@ -1578,21 +1584,7 @@ class QAService:
 
     def _generate_simple_questions_once(self, count: int) -> List[str]:
         """Single pass generation for starter nutrition questions."""
-        prompt = f"""You are creating starter questions that a user can ask an AI nutrition assistant.
-
-Generate exactly {count} short nutrition-science questions that can be submitted by an average user, not expert.
-
-Rules:
-- Questions must be directed to the ΑΙ, so the user can submit them. Dont us first-person wording.
-- Do NOT ask about the user's habits, preferences, or choices.
-- Do NOT use wording like "do you", "your", "what's your", or "go-to".
-- Do NOT generate meal-planning or food-suggestion content (no lunch/dinner/snack/recipe/menu/prep ideas).
-- Focus on general nutrition science, food composition, and evidence-based concepts.
-- Keep each question <= 16 words.
-- Avoid diagnosis, treatments, and supplement dosage advice.
-- Return ONLY valid JSON in this format:
-{{"questions": ["q1", "q2", "q3", "q4"]}}
-"""
+        prompt = QA_STARTER_QUESTIONS.compile(count=count)
         response = self.simple_question_llm.invoke(prompt)
         parsed = self._parse_questions_json(response.content)
         questions = parsed.get("questions", [])
@@ -1909,33 +1901,7 @@ Rules:
             return []
 
         guideline_context = self._prepare_tip_guideline_context(guidelines)
-        prompt = f"""You create safe daily nutrition content for a general audience.
-
-Using ONLY the dietary guideline rules below, generate exactly {candidate_count} items with a mix of:
-- practical nutrition tips
-- "Did you know?" nutrition facts
-
-Safety rules:
-- General education only (no diagnosis, treatment, medication, or disease-management advice).
-- No supplement dosage guidance.
-- Use the guideline rule_text as the source of truth.
-
-Style rules:
-- Each item must be <= 18 words.
-- One sentence per item.
-- Avoid absolute guarantees (no "cures", "prevents", "always", "never").
-
-Return ONLY valid JSON in this exact format:
-{{
-  "items": [
-    {{"kind": "tip", "text": "item text", "guideline": 1}},
-    {{"kind": "did_you_know", "text": "item text", "guideline": 2}}
-  ]
-}}
-
-Dietary guideline rules:
-{guideline_context}
-"""
+        prompt = QA_TIPS_FROM_GUIDELINES.compile(candidate_count=candidate_count, guideline_context=guideline_context)
         items: List[Any] = []
         try:
             response = self.simple_question_llm.invoke(prompt)
@@ -2318,34 +2284,7 @@ Dietary guideline rules:
             return []
 
         article_context = self._prepare_tip_article_context(articles)
-        prompt = f"""You create safe daily nutrition content for a general audience.
-
-Using ONLY the evidence in the article abstracts below, generate exactly {candidate_count} items with a mix of:
-- practical nutrition tips
-- "Did you know?" nutrition facts
-
-Safety rules:
-- General education only (no diagnosis, treatment, medication, or disease-management advice).
-- No supplement dosage guidance.
-- Do not mention animals, animal studies, mice, rats, or preclinical models.
-- If an article is animal/preclinical-only or unclear, do NOT use it.
-
-Style rules:
-- Each item must be <= 18 words.
-- One sentence per item.
-- Avoid absolute guarantees (no "cures", "prevents", "always", "never").
-
-Return ONLY valid JSON in this exact format:
-{{
-  "items": [
-    {{"kind": "tip", "text": "item text", "article": 1}},
-    {{"kind": "did_you_know", "text": "item text", "article": 2}}
-  ]
-}}
-
-Evidence:
-{article_context}
-"""
+        prompt = QA_TIPS_FROM_ARTICLES.compile(candidate_count=candidate_count, article_context=article_context)
         response = self.simple_question_llm.invoke(prompt)
         parsed = self._parse_tip_candidates_json(response.content)
         items = parsed.get("items", [])
@@ -2492,30 +2431,7 @@ Evidence:
         """Ground a single tip/fact using retrieved article evidence."""
         style = "Did you know?" if kind == "did_you_know" else "Tip:"
         article_context = self._prepare_tip_article_context(articles)
-        prompt = f"""Rewrite the item below as one short, evidence-grounded nutrition line.
-
-Candidate item: {text}
-Style requirement: start with "{style}"
-
-Only use the evidence provided in article abstracts.
-If evidence is weak or unclear, return exactly: INSUFFICIENT_EVIDENCE
-
-Safety rules:
-- Use evidence from human studies only.
-- Exclude animal-model or preclinical-only findings.
-- Do not mention animals, animal studies, mice, rats, or rodent models.
-- No diagnosis or treatment advice.
-- No medication or supplement dosage guidance.
-- No promises of curing or preventing disease.
-
-Output rules:
-- Single line only.
-- Max 22 words.
-- No citations or extra text.
-
-Evidence:
-{article_context}
-"""
+        prompt = QA_TIP_REWRITE.compile(text=text, style=style, article_context=article_context)
         try:
             response = self.simple_question_llm.invoke(prompt)
             output = response.content.strip()

@@ -155,6 +155,95 @@ IMPORTANT: Return ONLY the JSON object."""
         self.assertIn("Clarifier and Safety planner", out)
         self.assertIn('"risk_level": "low | medium | high"', out)
 
+    def test_qa_starter_matches_legacy(self):
+        from backend.prompts import QA_STARTER_QUESTIONS
+        count = 4
+        legacy = f"""You are creating starter questions that a user can ask an AI nutrition assistant.
+
+Generate exactly {count} short nutrition-science questions that can be submitted by an average user, not expert.
+
+Rules:
+- Questions must be directed to the ΑΙ, so the user can submit them. Dont us first-person wording.
+- Do NOT ask about the user's habits, preferences, or choices.
+- Do NOT use wording like "do you", "your", "what's your", or "go-to".
+- Do NOT generate meal-planning or food-suggestion content (no lunch/dinner/snack/recipe/menu/prep ideas).
+- Focus on general nutrition science, food composition, and evidence-based concepts.
+- Keep each question <= 16 words.
+- Avoid diagnosis, treatments, and supplement dosage advice.
+- Return ONLY valid JSON in this format:
+{{"questions": ["q1", "q2", "q3", "q4"]}}
+"""
+        self.assertEqual(QA_STARTER_QUESTIONS.compile(count=count), legacy)
+
+    def test_qa_tips_from_guidelines_matches_legacy(self):
+        from backend.prompts import QA_TIPS_FROM_GUIDELINES
+        candidate_count = 3
+        guideline_context = "RULES_HERE"
+        legacy = f"""You create safe daily nutrition content for a general audience.
+
+Using ONLY the dietary guideline rules below, generate exactly {candidate_count} items with a mix of:
+- practical nutrition tips
+- "Did you know?" nutrition facts
+
+Safety rules:
+- General education only (no diagnosis, treatment, medication, or disease-management advice).
+- No supplement dosage guidance.
+- Use the guideline rule_text as the source of truth.
+
+Style rules:
+- Each item must be <= 18 words.
+- One sentence per item.
+- Avoid absolute guarantees (no "cures", "prevents", "always", "never").
+
+Return ONLY valid JSON in this exact format:
+{{
+  "items": [
+    {{"kind": "tip", "text": "item text", "guideline": 1}},
+    {{"kind": "did_you_know", "text": "item text", "guideline": 2}}
+  ]
+}}
+
+Dietary guideline rules:
+{guideline_context}
+"""
+        self.assertEqual(
+            QA_TIPS_FROM_GUIDELINES.compile(
+                candidate_count=candidate_count,
+                guideline_context=guideline_context),
+            legacy)
+
+    def test_qa_tip_rewrite_matches_legacy(self):
+        from backend.prompts import QA_TIP_REWRITE
+        text, style, article_context = "ITEM", "Tip:", "EV"
+        legacy = f"""Rewrite the item below as one short, evidence-grounded nutrition line.
+
+Candidate item: {text}
+Style requirement: start with "{style}"
+
+Only use the evidence provided in article abstracts.
+If evidence is weak or unclear, return exactly: INSUFFICIENT_EVIDENCE
+
+Safety rules:
+- Use evidence from human studies only.
+- Exclude animal-model or preclinical-only findings.
+- Do not mention animals, animal studies, mice, rats, or rodent models.
+- No diagnosis or treatment advice.
+- No medication or supplement dosage guidance.
+- No promises of curing or preventing disease.
+
+Output rules:
+- Single line only.
+- Max 22 words.
+- No citations or extra text.
+
+Evidence:
+{article_context}
+"""
+        self.assertEqual(
+            QA_TIP_REWRITE.compile(text=text, style=style,
+                                   article_context=article_context),
+            legacy)
+
 
 if __name__ == "__main__":
     unittest.main()
