@@ -19,5 +19,20 @@ class TestLangfuseClient(unittest.TestCase):
         self.assertIsNone(get_langfuse_client())
 
 
+class TestPromptRegistry(unittest.TestCase):
+    def setUp(self):
+        _disable_langfuse()
+
+    def test_disabled_returns_fallback_no_vars(self):
+        from backend.prompts import ENRICHMENT_KEYWORDS_SYSTEM
+        out = ENRICHMENT_KEYWORDS_SYSTEM.compile()
+        self.assertIn("nutrition science expert", out)
+
+    def test_compile_substitutes_variables(self):
+        from backend.prompts import _Prompt
+        p = _Prompt("test-x", fallback="Hello {{name}}!")
+        self.assertEqual(p.compile(name="World"), "Hello World!")
+
+
 if __name__ == "__main__":
     unittest.main()
