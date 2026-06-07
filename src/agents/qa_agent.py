@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from langchain.prompts import ChatPromptTemplate
 
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from backend.prompts import (
     QA_ANSWER_RAG_SYSTEM,
     QA_ANSWER_RAG_USER,
@@ -31,10 +32,15 @@ class QAAgent:
         self,
         model: str = DEFAULT_GROQ_MODEL,
         temperature: float = 0.3,
+        trace_context: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.temperature = temperature
         self.llm = GROQ_CHAT.get_client(model=model, temperature=temperature)
+        # Optional Langfuse trace context: {session_id, user_id}. Applied to every
+        # LLM invocation so traces are grouped by conversation and attributed to a
+        # user. Safe no-op when Langfuse is disabled.
+        self.trace_context = trace_context or {}
 
     def generate_answer_with_rag(
         self,
@@ -78,14 +84,19 @@ class QAAgent:
             ("human", QA_ANSWER_RAG_USER.langchain()),
         ])
 
-        parsed = self._invoke_and_parse(prompt, variables={
-            "expertise_level": expertise_level,
-            "complexity": complexity,
-            "language": language,
-            "answer_context": answer_context,
-            "question": question,
-            "source_context": source_context,
-        })
+        parsed = self._invoke_and_parse(
+            prompt,
+            variables={
+                "expertise_level": expertise_level,
+                "complexity": complexity,
+                "language": language,
+                "answer_context": answer_context,
+                "question": question,
+                "source_context": source_context,
+            },
+            run_name="qa-answer-rag",
+            tags=["qa", "answer", "rag"],
+        )
         answer = self._build_qa_answer(
             parsed, question=question, articles=articles, rag_used=True
         )
@@ -129,13 +140,18 @@ class QAAgent:
             ("human", QA_ANSWER_NORAG_USER.langchain()),
         ])
 
-        parsed = self._invoke_and_parse(prompt, variables={
-            "expertise_level": expertise_level,
-            "complexity": complexity,
-            "language": language,
-            "answer_context": answer_context,
-            "question": question,
-        })
+        parsed = self._invoke_and_parse(
+            prompt,
+            variables={
+                "expertise_level": expertise_level,
+                "complexity": complexity,
+                "language": language,
+                "answer_context": answer_context,
+                "question": question,
+            },
+            run_name="qa-answer-norag",
+            tags=["qa", "answer", "no_rag"],
+        )
         answer = self._build_qa_answer(
             parsed, question=question, articles=None, rag_used=False
         )
@@ -287,15 +303,28 @@ class QAAgent:
         return "\n\n".join(summaries)
 
     def _invoke_and_parse(
-        self, prompt: ChatPromptTemplate, variables: Optional[Dict[str, Any]] = None
+        self,
+        prompt: ChatPromptTemplate,
+        variables: Optional[Dict[str, Any]] = None,
+        run_name: str = "qa-answer",
+        tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Invoke the LLM and parse JSON response.
 
         ``variables`` are substituted into the prompt template (registry-backed
         prompts carry their placeholders); omit for already-formatted prompts.
+        ``run_name``/``tags`` name and tag the resulting Langfuse trace.
         """
+        config = build_trace_config(
+            run_name=run_name,
+            session_id=self.trace_context.get("session_id"),
+            user_id=self.trace_context.get("user_id"),
+            tags=tags,
+        )
         try:
-            response = self.llm.invoke(prompt.format_messages(**(variables or {})))
+            response = self.llm.invoke(
+                prompt.format_messages(**(variables or {})), config=config
+            )
             return self._parse_llm_response(response.content)
         except Exception as e:
             logger.error("Error invoking LLM: %s", e, exc_info=True)

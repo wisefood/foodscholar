@@ -14,6 +14,7 @@ except Exception as exc:  # pragma: no cover
     _CHAT_PROMPT_IMPORT_ERROR = exc
 
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from backend.prompts import QA_CLARIFIER_SYSTEM
 from models.qa import (
     ClarificationOption,
@@ -69,8 +70,18 @@ class QAClarifierSafetyAgent:
         )
         messages = [SystemMessage(content=system_text), HumanMessage(content=human_text)]
 
+        # Attribute the trace to the user/conversation and tag it as the
+        # clarifier/safety step. user_context (which may include allergies) is the
+        # model input by necessity but is never copied into trace metadata.
+        config = build_trace_config(
+            run_name="qa-clarifier-safety",
+            session_id=request.qa_thread_id,
+            user_id=request.user_id or request.member_id,
+            tags=["qa", "clarifier", "safety"],
+        )
+
         try:
-            response = self.llm.invoke(messages)
+            response = self.llm.invoke(messages, config=config)
             parsed = _parse_json_object(response.content)
             plan = QAClarifierSafetyPlan(**parsed)
             return _merge_with_fallback(plan, fallback, answered_ids)

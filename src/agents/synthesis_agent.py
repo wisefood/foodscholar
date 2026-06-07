@@ -6,6 +6,7 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools import tool
 from langchain import hub
 from backend.groq import GROQ_CHAT
+from backend.langfuse import build_trace_config
 from models.search import (
     Citation,
     SynthesizedFinding,
@@ -172,7 +173,13 @@ Generate a synthesis that answers the query comprehensively.""")
         ])
 
         try:
-            response = self.llm.invoke(prompt_template.format_messages())
+            response = self.llm.invoke(
+                prompt_template.format_messages(),
+                config=build_trace_config(
+                    run_name="search-synthesis",
+                    tags=["search", "synthesis"],
+                ),
+            )
 
             # Parse the JSON response
             import json
@@ -291,7 +298,13 @@ Return ONLY a JSON array of 3 strings, each a specific question. Example:
 ["What are the long-term effects?", "How does this compare to alternatives?", "What are the recommended dosages?"]
 """
 
-            response = self.llm.invoke(prompt)
+            response = self.llm.invoke(
+                prompt,
+                config=build_trace_config(
+                    run_name="search-followups",
+                    tags=["search", "followups"],
+                ),
+            )
             content = response.content.strip()
 
             # Extract JSON array
