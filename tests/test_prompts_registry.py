@@ -266,12 +266,14 @@ class TestPromptSync(unittest.TestCase):
             def __init__(self, prompt):
                 self.prompt = prompt
 
+        ns = P._PROMPT_NAMESPACE  # prompts are stored under the namespace
+
         class FakeClient:
             def __init__(self):
                 self.created = []
                 self.store = {
-                    "p-existing-same": "SAME",       # exists -> skip
-                    "p-existing-diff": "UI EDIT",    # exists & differs -> STILL skip
+                    ns + "p-existing-same": "SAME",     # exists -> skip
+                    ns + "p-existing-diff": "UI EDIT",  # exists & differs -> STILL skip
                     # p-missing absent -> create
                 }
 
@@ -286,10 +288,10 @@ class TestPromptSync(unittest.TestCase):
         fake = FakeClient()
         result = P.sync_prompts(client=fake, registry=self._registry())
 
-        # Only the genuinely-missing prompt is created.
-        self.assertEqual(fake.created, ["p-missing"])
+        # Only the genuinely-missing prompt is created (namespaced).
+        self.assertEqual(fake.created, [ns + "p-missing"])
         # The UI-edited existing prompt is left untouched.
-        self.assertNotIn("p-existing-diff", fake.created)
+        self.assertNotIn(ns + "p-existing-diff", fake.created)
         self.assertEqual(result["created"], 1)
         self.assertEqual(result["skipped"], 2)
 
