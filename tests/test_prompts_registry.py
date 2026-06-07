@@ -256,7 +256,10 @@ class TestPromptSync(unittest.TestCase):
             _Prompt("p-missing", fallback="FRESH"),
         ]
 
-    def test_sync_creates_missing_and_changed_only(self):
+    def test_sync_creates_only_missing_never_overwrites(self):
+        """Langfuse is the source of truth: seed a prompt only when it does not
+        exist. NEVER overwrite an existing prompt, even if its text differs from
+        the in-code fallback (that text may be a deliberate UI edit)."""
         from backend import prompts as P
 
         class FakeManaged:
@@ -267,8 +270,8 @@ class TestPromptSync(unittest.TestCase):
             def __init__(self):
                 self.created = []
                 self.store = {
-                    "p-existing-same": "SAME",      # identical -> skip
-                    "p-existing-diff": "OLD TEXT",  # differs -> recreate
+                    "p-existing-same": "SAME",       # exists -> skip
+                    "p-existing-diff": "UI EDIT",    # exists & differs -> STILL skip
                     # p-missing absent -> create
                 }
 
@@ -283,11 +286,12 @@ class TestPromptSync(unittest.TestCase):
         fake = FakeClient()
         result = P.sync_prompts(client=fake, registry=self._registry())
 
-        self.assertIn("p-missing", fake.created)
-        self.assertIn("p-existing-diff", fake.created)
-        self.assertNotIn("p-existing-same", fake.created)
-        self.assertEqual(result["created"], 2)
-        self.assertEqual(result["skipped"], 1)
+        # Only the genuinely-missing prompt is created.
+        self.assertEqual(fake.created, ["p-missing"])
+        # The UI-edited existing prompt is left untouched.
+        self.assertNotIn("p-existing-diff", fake.created)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["skipped"], 2)
 
     def test_sync_noop_when_client_none(self):
         from backend import prompts as P
