@@ -27,8 +27,16 @@ This builds on the opt-in observability already added in
 | `qa-answer-norag-system`   | `qa_agent.py` no-RAG answer system f-string          | text | (static JSON skeleton) |
 | `qa-answer-norag-user`     | `qa_agent.py` no-RAG answer human f-string           | text | `question` |
 | `qa-clarifier-system`      | `qa_clarifier.py` combined clarifier/safety system   | text | — |
-| `qa-starter-questions`     | `qa_service.py` starter-question generation f-string | text | (vars TBD at impl) |
-| `qa-tips`                  | `qa_service.py` tips/did-you-know generation f-string| text | (vars TBD at impl) |
+| `qa-starter-questions`     | `qa_service.py:1581` starter-question generation     | text | `count` |
+| `qa-tips-from-guidelines`  | `qa_service.py:1912` tips from guideline rules       | text | `candidate_count`, `guideline_context` |
+| `qa-tips-from-articles`    | `qa_service.py:2321` tips from article abstracts     | text | `candidate_count`, `article_context` |
+| `qa-tip-rewrite`           | `qa_service.py:2495` single-item evidence rewrite    | text | `text`, `style`, `article_context` |
+
+**Note:** The qa_agent answer system prompts also interpolate
+`expertise_level`, `complexity`, `language`, `answer_context` (not only the
+human prompt). All become Langfuse variables. The f-strings use `{{{{ }}}}`
+(quadruple braces) because they are f-strings nested in `ChatPromptTemplate`;
+these become literal `{ }` in the stored prompt.
 
 Out of scope for this pass: synthesis_agent, sessions chat prompt, guideline_extractor.
 (They can follow the same pattern later.)
@@ -57,9 +65,38 @@ class _Prompt:
 `get()` behavior:
 - If `langfuse_enabled()` is False → return a lightweight local wrapper around
   the fallback text (no network, no import cost beyond the guard).
-- If enabled → `get_client().get_prompt(name, fallback=<text>, label="production",
-  cache_ttl_seconds=60)`. The SDK caches client-side (stale-while-revalidate) and
-  uses `fallback` only when the local cache is empty AND the API is unreachable.
+- If enabled → `get_langfuse_client().get_prompt(name, fallback=<text>,
+  label="production", cache_ttl_seconds=60)`. The SDK caches client-side
+  (stale-while-revalidate) and uses `fallback` only when the local cache is
+  empty AND the API is unreachable.
+
+### Shared Langfuse client ("connection pool" analog)
+
+The Langfuse Python SDK v3 is a **process-wide singleton** ("singleton per
+public key") and the docs explicitly discourage per-request instantiation:
+*"instantiating a handler or client per request is discouraged—create each
+client/handler once and reuse it to avoid memory leaks."* A ChatGroq-style
+multi-instance pool is therefore an anti-pattern here. The correct analog of a
+connection pool is **one configured-once, cached, shared client** — a single
+httpx connection and a single shared prompt cache reused across all requests
+and threads.
+
+Add to `src/backend/langfuse.py`:
+```python
+@lru_cache(maxsize=1)
+def get_langfuse_client():
+    """Process-wide Langfuse client (shared connection + prompt cache).
+    Returns None when disabled."""
+    if not langfuse_enabled():
+        return None
+    from langfuse import Langfuse
+    return Langfuse()          # reads keys + base_url from env
+```
+- The existing `get_callback_handler()` is updated to rely on this client being
+  configured (handler reads config from the singleton).
+- Configured implicitly via env on first use; lazy (no startup pre-warm —
+  first request pays a one-time ~40ms fetch per prompt, deemed acceptable).
+- `flush_langfuse()` flushes this same singleton on shutdown.
 
 The fallback text constants are grouped:
 ```python
