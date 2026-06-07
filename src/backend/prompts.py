@@ -29,8 +29,20 @@ def _compile_fallback(text: str, variables: Dict[str, Any]) -> str:
 
 
 def _to_langchain(text: str) -> str:
-    """Convert remaining Langfuse {{var}} to LangChain {var} (fallback path)."""
-    return _VAR_RE.sub(lambda m: "{" + m.group(1) + "}", text)
+    """Convert a Langfuse-style fallback to LangChain template syntax.
+
+    Langfuse uses ``{{var}}`` for variables and treats single braces as
+    literal. LangChain (``PromptTemplate``) is the inverse: ``{var}`` is a
+    variable and literal braces must be doubled as ``{{`` / ``}}``. So we:
+    protect ``{{var}}`` tokens, double every remaining literal brace, then
+    restore the protected tokens as single-brace ``{var}``.
+    """
+    sentinel_open, sentinel_close = "\x00", "\x01"
+    protected = _VAR_RE.sub(
+        lambda m: sentinel_open + m.group(1) + sentinel_close, text
+    )
+    escaped = protected.replace("{", "{{").replace("}", "}}")
+    return escaped.replace(sentinel_open, "{").replace(sentinel_close, "}")
 
 
 class _Prompt:

@@ -48,20 +48,31 @@ class TestPromptRegistry(unittest.TestCase):
         self.assertIn('"reader_group": "General Public"', out)
         self.assertNotIn("{{", out)
 
-    def test_annotation_matches_legacy_format_output(self):
-        from agents.enrichment_agent import ANNOTATION_PROMPT
+    def test_annotation_langchain_renders_via_prompttemplate(self):
+        """langchain() must be a valid LangChain template: vars substitute,
+        JSON skeleton braces survive as literal braces."""
+        from langchain_core.prompts import PromptTemplate
         from backend.prompts import ENRICHMENT_ANNOTATION
-        legacy = ANNOTATION_PROMPT.format(title="T", authors="A", abstract="B")
-        new = ENRICHMENT_ANNOTATION.compile(title="T", authors="A", abstract="B")
-        self.assertEqual(new, legacy)
+        tmpl = PromptTemplate(
+            input_variables=["title", "authors", "abstract"],
+            template=ENRICHMENT_ANNOTATION.langchain(),
+        )
+        rendered = tmpl.format(title="TT", authors="AA", abstract="BB")
+        self.assertIn("Title: TT", rendered)
+        self.assertIn("Abstract: BB", rendered)
+        self.assertIn('"reader_group": "General Public"', rendered)
 
-    def test_keywords_user_matches_legacy(self):
-        from agents.enrichment_agent import KEYWORD_EXTRACTION_PROMPT
-        from backend.prompts import ENRICHMENT_KEYWORDS_USER
-        legacy = KEYWORD_EXTRACTION_PROMPT["user_prompt"].format(abstract="XYZ")
-        new = ENRICHMENT_KEYWORDS_USER.compile(abstract="XYZ")
-        self.assertEqual(new, legacy)
-
+    def test_keywords_langchain_renders_via_chatprompttemplate(self):
+        from langchain.prompts import ChatPromptTemplate
+        from backend.prompts import (
+            ENRICHMENT_KEYWORDS_SYSTEM, ENRICHMENT_KEYWORDS_USER)
+        tmpl = ChatPromptTemplate.from_messages([
+            ("system", ENRICHMENT_KEYWORDS_SYSTEM.langchain()),
+            ("human", ENRICHMENT_KEYWORDS_USER.langchain()),
+        ])
+        msgs = tmpl.format_messages(abstract="MYABSTRACT")
+        self.assertIn("MYABSTRACT", msgs[1].content)
+        self.assertIn("nutrition science expert", msgs[0].content)
 
 if __name__ == "__main__":
     unittest.main()
