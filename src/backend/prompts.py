@@ -10,7 +10,7 @@ use with ``ChatPromptTemplate``.
 """
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.langfuse import get_langfuse_client
 
@@ -529,3 +529,96 @@ QA_TIPS_FROM_ARTICLES = _Prompt(
     "qa-tips-from-articles", _QA_TIPS_FROM_ARTICLES_FALLBACK
 )
 QA_TIP_REWRITE = _Prompt("qa-tip-rewrite", _QA_TIP_REWRITE_FALLBACK)
+
+
+# ===========================================================================
+# Registry list + idempotent startup sync
+# ===========================================================================
+
+ALL_PROMPTS: List["_Prompt"] = [
+    ENRICHMENT_ANNOTATION,
+    ENRICHMENT_KEYWORDS_SYSTEM,
+    ENRICHMENT_KEYWORDS_USER,
+    QA_ANSWER_RAG_SYSTEM,
+    QA_ANSWER_RAG_USER,
+    QA_ANSWER_NORAG_SYSTEM,
+    QA_ANSWER_NORAG_USER,
+    QA_CLARIFIER_SYSTEM,
+    QA_STARTER_QUESTIONS,
+    QA_TIPS_FROM_GUIDELINES,
+    QA_TIPS_FROM_ARTICLES,
+    QA_TIP_REWRITE,
+]
+
+
+def _managed_prompt_text(managed: Any) -> Optional[str]:
+    """Best-effort extraction of the raw template text from a managed prompt.
+
+    Langfuse text prompts expose the template via ``.prompt``; we fall back to
+    ``str`` so a comparison is always possible.
+    """
+    text = getattr(managed, "prompt", None)
+    if isinstance(text, str):
+        return text
+    return None
+
+
+def sync_prompts(
+    *, client: Optional[Any] = None, registry: Optional[List["_Prompt"]] = None
+) -> Dict[str, int]:
+    """Idempotently push registry prompts to Langfuse.
+
+    For each prompt: create it when missing, OR when the live ``production``
+    text differs from the in-code fallback (code is the source of truth).
+    Identical prompts are skipped, so calling this on every startup does NOT
+    spam new versions (``create_prompt`` itself is not idempotent).
+
+    Note: when the in-code fallback differs from a prompt that was edited in
+    the Langfuse UI, this OVERWRITES the UI edit with a new version. That is
+    the chosen "code is source of truth" policy and is logged explicitly.
+
+    Safe no-op when ``client`` is None (Langfuse disabled). Per-prompt failures
+    are logged and counted, never raised, so startup is never blocked.
+    """
+    if client is None:
+        client = get_langfuse_client()
+    if registry is None:
+        registry = ALL_PROMPTS
+
+    counts = {"created": 0, "skipped": 0, "failed": 0}
+    if client is None:
+        return counts
+
+    for prompt in registry:
+        try:
+            try:
+                managed = client.get_prompt(
+                    prompt.name, label=prompt.label, cache_ttl_seconds=0
+                )
+            except Exception:
+                managed = None  # treated as "missing"
+
+            if managed is not None:
+                live = _managed_prompt_text(managed)
+                if live is not None and live == prompt.fallback:
+                    counts["skipped"] += 1
+                    continue
+                logger.info(
+                    "Prompt '%s' differs from code fallback; creating new "
+                    "version (code is source of truth).",
+                    prompt.name,
+                )
+
+            client.create_prompt(
+                name=prompt.name,
+                type="text",
+                prompt=prompt.fallback,
+                labels=[prompt.label],
+            )
+            counts["created"] += 1
+            logger.info("Synced prompt '%s' to Langfuse.", prompt.name)
+        except Exception as exc:  # pragma: no cover - defensive
+            counts["failed"] += 1
+            logger.warning("Failed to sync prompt '%s': %s", prompt.name, exc)
+
+    return counts

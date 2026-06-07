@@ -18,22 +18,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from backend.langfuse import langfuse_enabled, get_langfuse_client  # noqa: E402
-from backend import prompts as P  # noqa: E402
-
-_REGISTRY = [
-    P.ENRICHMENT_ANNOTATION,
-    P.ENRICHMENT_KEYWORDS_SYSTEM,
-    P.ENRICHMENT_KEYWORDS_USER,
-    P.QA_ANSWER_RAG_SYSTEM,
-    P.QA_ANSWER_RAG_USER,
-    P.QA_ANSWER_NORAG_SYSTEM,
-    P.QA_ANSWER_NORAG_USER,
-    P.QA_CLARIFIER_SYSTEM,
-    P.QA_STARTER_QUESTIONS,
-    P.QA_TIPS_FROM_GUIDELINES,
-    P.QA_TIPS_FROM_ARTICLES,
-    P.QA_TIP_REWRITE,
-]
+from backend.prompts import sync_prompts, ALL_PROMPTS  # noqa: E402
 
 
 def main() -> int:
@@ -49,18 +34,16 @@ def main() -> int:
         print("Could not initialize Langfuse client.")
         return 1
 
-    for prompt in _REGISTRY:
-        client.create_prompt(
-            name=prompt.name,
-            type="text",
-            prompt=prompt.fallback,
-            labels=[prompt.label],
-        )
-        print(f"seeded {prompt.name}")
-
+    # Idempotent: creates missing prompts and re-creates only those whose live
+    # text differs from the in-code fallback; identical prompts are skipped.
+    result = sync_prompts(client=client)
     client.flush()
-    print(f"Done: {len(_REGISTRY)} prompts seeded.")
-    return 0
+    print(
+        f"Done ({len(ALL_PROMPTS)} registry prompts): "
+        f"created={result['created']} skipped={result['skipped']} "
+        f"failed={result['failed']}"
+    )
+    return 1 if result["failed"] else 0
 
 
 if __name__ == "__main__":

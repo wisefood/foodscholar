@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 import logsys
+import threading
 import uvicorn
 from contextlib import asynccontextmanager
 from sqlalchemy import text
@@ -50,6 +51,22 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         logger.info("Starting guideline extraction worker...")
         start_guideline_worker()
+
+    # Idempotently sync prompts to Langfuse in the background. Non-blocking:
+    # app startup never waits on (or fails due to) Langfuse availability.
+    # No-op when Langfuse is disabled. Safe to run on every pod start.
+    def _seed_prompts() -> None:
+        try:
+            from backend.prompts import sync_prompts
+            result = sync_prompts()
+            if any(result.values()):
+                logger.info("Langfuse prompt sync: %s", result)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Langfuse prompt sync failed: %s", exc)
+
+    threading.Thread(
+        target=_seed_prompts, name="langfuse-prompt-sync", daemon=True
+    ).start()
 
     yield
 

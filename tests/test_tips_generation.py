@@ -11,7 +11,9 @@ class _FakeLLM:
     def __init__(self, content: str):
         self._content = content
 
-    def invoke(self, _prompt: str):
+    def invoke(self, _prompt, *args, **kwargs):
+        # Accept (and ignore) a LangChain ``config=`` kwarg so the fake matches
+        # the real client signature used for Langfuse trace attribution.
         return _FakeLLMResponse(self._content)
 
 

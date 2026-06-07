@@ -245,5 +245,55 @@ Evidence:
             legacy)
 
 
+class TestPromptSync(unittest.TestCase):
+    """Idempotent startup sync: create when missing OR when fallback changed."""
+
+    def _registry(self):
+        from backend.prompts import _Prompt
+        return [
+            _Prompt("p-existing-same", fallback="SAME"),
+            _Prompt("p-existing-diff", fallback="NEW TEXT"),
+            _Prompt("p-missing", fallback="FRESH"),
+        ]
+
+    def test_sync_creates_missing_and_changed_only(self):
+        from backend import prompts as P
+
+        class FakeManaged:
+            def __init__(self, prompt):
+                self.prompt = prompt
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.store = {
+                    "p-existing-same": "SAME",      # identical -> skip
+                    "p-existing-diff": "OLD TEXT",  # differs -> recreate
+                    # p-missing absent -> create
+                }
+
+            def get_prompt(self, name, **kwargs):
+                if name not in self.store:
+                    raise Exception(f"Prompt not found: '{name}'")
+                return FakeManaged(self.store[name])
+
+            def create_prompt(self, *, name, type, prompt, labels):
+                self.created.append(name)
+
+        fake = FakeClient()
+        result = P.sync_prompts(client=fake, registry=self._registry())
+
+        self.assertIn("p-missing", fake.created)
+        self.assertIn("p-existing-diff", fake.created)
+        self.assertNotIn("p-existing-same", fake.created)
+        self.assertEqual(result["created"], 2)
+        self.assertEqual(result["skipped"], 1)
+
+    def test_sync_noop_when_client_none(self):
+        from backend import prompts as P
+        result = P.sync_prompts(client=None, registry=self._registry())
+        self.assertEqual(result, {"created": 0, "skipped": 0, "failed": 0})
+
+
 if __name__ == "__main__":
     unittest.main()
