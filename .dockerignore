@@ -1,0 +1,29 @@
+# Version control
+.git
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/dev cruft
+.codex
+.claude/
+prototype.py
+docs/
+tests/
+*.log
+
+# Environments
+.env
+.venv/
+venv/
+
+# Docker
+Dockerfile
+docker-compose.yaml
+.dockerignore
