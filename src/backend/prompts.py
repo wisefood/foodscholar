@@ -45,6 +45,12 @@ def _to_langchain(text: str) -> str:
     return escaped.replace(sentinel_open, "{").replace(sentinel_close, "}")
 
 
+# All FoodScholar prompts live under this namespace so multiple WiseFood apps
+# can share a single Langfuse project without name collisions. Langfuse renders
+# each slash-delimited segment as a folder in the UI (requires SDK >= 3.0.2).
+_PROMPT_NAMESPACE = "foodscholar/"
+
+
 class _Prompt:
     """A single registered prompt: Langfuse-managed with an in-code fallback."""
 
@@ -55,7 +61,9 @@ class _Prompt:
         label: str = "production",
         cache_ttl_seconds: int = 60,
     ):
-        self.name = name
+        # Registrations pass the short name; the namespace is applied here so the
+        # call sites stay readable and the prefix is defined in exactly one place.
+        self.name = name if name.startswith(_PROMPT_NAMESPACE) else _PROMPT_NAMESPACE + name
         self.fallback = fallback
         self.label = label
         self.cache_ttl_seconds = cache_ttl_seconds
