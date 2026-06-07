@@ -208,9 +208,14 @@ class QAService:
     def simple_question_llm(self):
         """Lazy-load Groq client for starter nutrition question generation."""
         if self._simple_question_llm is None:
+            # gpt-oss-20b is a reasoning model: without an explicit token budget
+            # and minimal reasoning it spends the completion on hidden reasoning
+            # and truncates the JSON payload (~12 items), making it unparseable.
             self._simple_question_llm = GROQ_CHAT.get_client(
                 model=SIMPLE_NUTRI_QUESTION_MODEL,
                 temperature=0.8,
+                max_tokens=2048,
+                reasoning_effort="low",
             )
         return self._simple_question_llm
 
@@ -2156,16 +2161,21 @@ class QAService:
         return text
 
     def _shorten_tip_sentence(self, text: str, *, max_words: int) -> str:
-        """Limit generated fallback text to a short single sentence."""
+        """Limit fallback text to a short, whole single sentence.
+
+        Returns the first sentence verbatim when it fits within ``max_words``.
+        If that sentence is longer than the cap, returns "" so the caller drops
+        the candidate rather than emitting a clause cut mid-phrase (e.g.
+        "... wholemeal cereals and."), which is grammatically broken and
+        changes meaning.
+        """
         text = " ".join(str(text).split()).strip()
         if not text:
             return ""
 
         sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
-        words = sentence.split()
-        if len(words) > max_words:
-            sentence = " ".join(words[:max_words]).rstrip(" ,;:")
-        sentence = sentence.strip()
+        if len(sentence.split()) > max_words:
+            return ""
         if sentence and sentence[-1] not in ".!?":
             sentence += "."
         return sentence
