@@ -66,6 +66,10 @@ async def lifespan(app: FastAPI):
     await PostgresConnectionSingleton.close()
     logger.info("DB connections closed")
 
+    # Flush any buffered Langfuse traces (no-op when observability is disabled)
+    from backend.langfuse import flush_langfuse
+    flush_langfuse()
+
 
 # Initialize FastAPI app
 app = FastAPI(

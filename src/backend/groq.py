@@ -93,6 +93,17 @@ class GroqConnectionPool:
         # Generate pool key (excluding api_key from key for security)
         pool_key = self._get_pool_key(model, temperature, **kwargs)
 
+        # Attach the Langfuse callback handler when observability is enabled.
+        # It is a stateless, process-constant object, so it is appended to any
+        # caller-provided callbacks and deliberately excluded from the pool key.
+        from backend.langfuse import get_callback_handler
+
+        langfuse_handler = get_callback_handler()
+        if langfuse_handler is not None:
+            callbacks = list(kwargs.pop("callbacks", []) or [])
+            callbacks.append(langfuse_handler)
+            kwargs["callbacks"] = callbacks
+
         # Thread-safe check and creation
         with self._lock:
             if pool_key not in self._pool:

@@ -87,6 +87,16 @@ class Config:
             os.getenv("GUIDELINE_JOB_LOCK_TIMEOUT", "7200")
         )
 
+        # Langfuse observability (opt-in). Tracing activates only when both
+        # the public and secret keys are provided. The Langfuse SDK reads
+        # these from the environment directly; they are registered here for
+        # centralization and documentation.
+        self.settings["LANGFUSE_PUBLIC_KEY"] = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+        self.settings["LANGFUSE_SECRET_KEY"] = os.getenv("LANGFUSE_SECRET_KEY", "")
+        self.settings["LANGFUSE_BASE_URL"] = os.getenv(
+            "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
+        )
+
 
 # Configure application settings
 config = Config()

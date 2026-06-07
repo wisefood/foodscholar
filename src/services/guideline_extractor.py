@@ -202,6 +202,19 @@ def _load_pymupdf():
 
 
 def _load_openai_client():
+    # Use the Langfuse drop-in wrapper when observability is enabled so that
+    # guideline-extraction OpenAI calls are traced. Falls back to the plain
+    # SDK when Langfuse is disabled or unavailable.
+    try:
+        from backend.langfuse import langfuse_enabled
+
+        if langfuse_enabled():
+            from langfuse.openai import OpenAI  # type: ignore[import-not-found]
+
+            return OpenAI
+    except Exception:  # pragma: no cover - fall back to the plain SDK
+        pass
+
     try:
         from openai import OpenAI  # type: ignore[import-not-found]
     except ImportError as exc:
