@@ -1,7 +1,15 @@
-"""Session management API endpoints (refactored from app.py)."""
+"""Session management API endpoints.
+
+Session state lives in the Redis-backed SESSION_STORE (see
+services/session_store.py) with a sliding TTL, so sessions survive restarts,
+work across replicas, and expire automatically — a requirement for ephemeral
+guest users. Every session-scoped endpoint enforces that the supplied user_id
+matches the session owner; sessions can no longer be created or read without
+an owner.
+"""
 import logging
 from fastapi import APIRouter, HTTPException
-from typing import Dict, List
+from typing import List, Optional
 from datetime import datetime
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -17,28 +25,57 @@ from models.session import (
     ChatResponse,
     FoodFactsResponse,
 )
+from services.session_store import SESSION_STORE
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
 
-# In-memory storage for conversation memories and contexts
-memories: Dict[str, ConversationBufferWindowMemory] = {}
-user_contexts: Dict[str, str] = {}
-user_sessions: Dict[str, List[str]] = {}  # user_id -> [session_ids]
-session_metadata: Dict[str, Dict] = {}  # session_id -> {user_id, created_at, last_active, title}
-session_titles: Dict[str, str] = {}  # session_id -> title
+GREETING_MESSAGE = "Hello! I'd like help with food and nutrition questions."
 
 
-def get_or_create_memory(
-    session_id: str, max_history: int = 20
-) -> ConversationBufferWindowMemory:
-    """Get existing memory or create new one."""
-    if session_id not in memories:
-        memories[session_id] = ConversationBufferWindowMemory(
-            k=max_history, return_messages=True, memory_key="chat_history"
+def _new_session_doc(user_id: str, user_context: str = "") -> dict:
+    now = datetime.now().isoformat()
+    return {
+        "user_id": user_id,
+        "created_at": now,
+        "last_active": now,
+        "title": None,
+        "user_context": user_context or "",
+        "messages": [],
+    }
+
+
+def _require_owner(session_data: dict, user_id: Optional[str], session_id: str) -> None:
+    """Reject any access where the caller's user_id does not match the owner."""
+    if not user_id or session_data.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied. Session '{session_id}' belongs to another user.",
         )
-    return memories[session_id]
+
+
+def _build_memory(
+    messages: List[dict], max_history: int = 20
+) -> ConversationBufferWindowMemory:
+    """Rebuild a windowed conversation memory from stored messages."""
+    memory = ConversationBufferWindowMemory(
+        k=max_history, return_messages=True, memory_key="chat_history"
+    )
+    for msg in messages:
+        if msg.get("type") == "human":
+            memory.chat_memory.add_user_message(msg.get("content", ""))
+        else:
+            memory.chat_memory.add_ai_message(msg.get("content", ""))
+    return memory
+
+
+def _is_first_user_message(messages: List[dict]) -> bool:
+    """Check if this is the first real user message (excluding automated greeting)."""
+    return not any(
+        msg.get("type") == "human" and msg.get("content") != GREETING_MESSAGE
+        for msg in messages
+    )
 
 
 def generate_session_title(
@@ -85,31 +122,13 @@ Title:"""
         return "Food Facts Conversation"
 
 
-def is_first_user_message(session_id: str) -> bool:
-    """Check if this is the first real user message (excluding automated greeting)."""
-    if session_id not in memories:
-        return True
-    memory = memories[session_id]
-    history = memory.load_memory_variables({})
-    messages = history.get("chat_history", [])
-
-    human_messages = [
-        msg
-        for msg in messages
-        if msg.type == "human"
-        and msg.content != "Hello! I'd like help with food and nutrition questions."
-    ]
-
-    return len(human_messages) == 0
-
-
-def create_structured_chain(session_id: str, max_history: int = 20):
+def create_structured_chain(session_data: dict, max_history: int = 20):
     """Create a chain that returns structured output."""
     llm = GROQ_CHAT.get_client(model="llama-3.3-70b-versatile", temperature=0.7)
 
     structured_llm = llm.with_structured_output(FoodFactsResponse)
-    memory = get_or_create_memory(session_id, max_history)
-    user_context = user_contexts.get(session_id, "")
+    memory = _build_memory(session_data.get("messages", []), max_history)
+    user_context = session_data.get("user_context", "")
     context_section = f"\n\nUser Context:\n{user_context}" if user_context else ""
 
     system_message = f"""You are a helpful food facts assistant, named FoodScholar. Provide accurate, interesting
@@ -157,40 +176,27 @@ if provided without making them feel uncomfortable by repeating it. Ask them wha
         | structured_llm
     )
 
-    return chain, memory
+    return chain
 
 
 @router.post("/start", response_model=SessionStartResponse)
 async def start_session(request: SessionStartRequest):
     """Start a new session with user context and get a greeting."""
-    if request.session_id in session_metadata:
-        existing_user_id = session_metadata[request.session_id].get("user_id")
-        if existing_user_id != request.user_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Session ID '{request.session_id}' already exists for another user.",
-            )
+    existing = SESSION_STORE.get(request.session_id)
+    if existing is not None and existing.get("user_id") != request.user_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Session ID '{request.session_id}' already exists for another user.",
+        )
 
-    user_contexts[request.session_id] = request.user_context
-
-    if request.user_id not in user_sessions:
-        user_sessions[request.user_id] = []
-    if request.session_id not in user_sessions[request.user_id]:
-        user_sessions[request.user_id].append(request.session_id)
-
-    session_metadata[request.session_id] = {
-        "user_id": request.user_id,
-        "created_at": datetime.now().isoformat(),
-        "last_active": datetime.now().isoformat(),
-    }
-
-    get_or_create_memory(request.session_id, request.max_history)
+    session_data = existing or _new_session_doc(request.user_id, request.user_context)
+    session_data["user_context"] = request.user_context
 
     try:
-        chain, memory = create_structured_chain(request.session_id, request.max_history)
+        chain = create_structured_chain(session_data, request.max_history)
 
         greeting_response = chain.invoke(
-            {"input": "Hello! I'd like help with food and nutrition questions."},
+            {"input": GREETING_MESSAGE},
             config=build_trace_config(
                 run_name="session-greeting",
                 session_id=request.session_id,
@@ -199,10 +205,12 @@ async def start_session(request: SessionStartRequest):
             ),
         )
 
-        memory.save_context(
-            {"input": "Hello! I'd like help with food and nutrition questions."},
-            {"output": greeting_response.model_dump_json()},
+        session_data["messages"].append({"type": "human", "content": GREETING_MESSAGE})
+        session_data["messages"].append(
+            {"type": "ai", "content": greeting_response.model_dump_json()}
         )
+        session_data["last_active"] = datetime.now().isoformat()
+        SESSION_STORE.save(request.session_id, session_data)
 
         return SessionStartResponse(
             session_id=request.session_id,
@@ -218,38 +226,27 @@ async def start_session(request: SessionStartRequest):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Send a message and get a structured response from the food facts assistant."""
-    if request.session_id in session_metadata and request.user_id:
-        existing_user_id = session_metadata[request.session_id].get("user_id")
-        if existing_user_id != request.user_id:
+    session_data = SESSION_STORE.get(request.session_id)
+
+    if session_data is None:
+        if not request.user_id:
             raise HTTPException(
-                status_code=403,
-                detail=f"Access denied. Session '{request.session_id}' belongs to another user.",
+                status_code=400,
+                detail="user_id is required to start a session via /chat.",
             )
+        session_data = _new_session_doc(request.user_id, request.user_context or "")
+    else:
+        _require_owner(session_data, request.user_id, request.session_id)
+        if request.user_context and not session_data.get("user_context"):
+            session_data["user_context"] = request.user_context
 
-    if request.user_context and request.session_id not in user_contexts:
-        user_contexts[request.session_id] = request.user_context
+    session_data["last_active"] = datetime.now().isoformat()
 
-    if request.user_id:
-        if request.user_id not in user_sessions:
-            user_sessions[request.user_id] = []
-        if request.session_id not in user_sessions[request.user_id]:
-            user_sessions[request.user_id].append(request.session_id)
-
-        if request.session_id not in session_metadata:
-            session_metadata[request.session_id] = {
-                "user_id": request.user_id,
-                "created_at": datetime.now().isoformat(),
-                "last_active": datetime.now().isoformat(),
-            }
-
-    if request.session_id in session_metadata:
-        session_metadata[request.session_id]["last_active"] = datetime.now().isoformat()
-
-    first_message = is_first_user_message(request.session_id)
+    first_message = _is_first_user_message(session_data["messages"])
     session_title = None
 
     try:
-        chain, memory = create_structured_chain(request.session_id, request.max_history)
+        chain = create_structured_chain(session_data, request.max_history)
         response = chain.invoke(
             {"input": request.message},
             config=build_trace_config(
@@ -260,24 +257,21 @@ async def chat(request: ChatRequest):
             ),
         )
 
-        memory.save_context(
-            {"input": request.message}, {"output": response.model_dump_json()}
+        session_data["messages"].append({"type": "human", "content": request.message})
+        session_data["messages"].append(
+            {"type": "ai", "content": response.model_dump_json()}
         )
 
-        if (
-            first_message
-            and request.message != "Hello! I'd like help with food and nutrition questions."
-        ):
+        if first_message and request.message != GREETING_MESSAGE:
             session_title = generate_session_title(
                 request.message,
-                user_contexts.get(request.session_id, ""),
+                session_data.get("user_context", ""),
                 session_id=request.session_id,
                 user_id=request.user_id,
             )
-            session_titles[request.session_id] = session_title
+            session_data["title"] = session_title
 
-            if request.session_id in session_metadata:
-                session_metadata[request.session_id]["title"] = session_title
+        SESSION_STORE.save(request.session_id, session_data)
 
         return ChatResponse(
             session_id=request.session_id,
@@ -287,6 +281,8 @@ async def chat(request: ChatRequest):
             session_title=session_title,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing chat message: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
@@ -295,19 +291,29 @@ async def chat(request: ChatRequest):
 @router.get("/users/{user_id}")
 async def get_user_sessions(user_id: str):
     """Get all sessions for a specific user."""
-    if user_id not in user_sessions:
-        raise HTTPException(status_code=404, detail="User not found")
-
     sessions = []
-    for session_id in user_sessions[user_id]:
-        session_info = {
-            "session_id": session_id,
-            "metadata": session_metadata.get(session_id, {}),
-            "user_context": user_contexts.get(session_id, None),
-            "session_title": session_titles.get(session_id, None),
-            "message_count": 0,
-        }
-        sessions.append(session_info)
+    for session_id in SESSION_STORE.list_user_sessions(user_id):
+        session_data = SESSION_STORE.get(session_id)
+        if session_data is None:
+            continue
+        sessions.append(
+            {
+                "session_id": session_id,
+                "metadata": {
+                    "user_id": session_data.get("user_id"),
+                    "created_at": session_data.get("created_at"),
+                    "last_active": session_data.get("last_active"),
+                    "title": session_data.get("title"),
+                },
+                "user_context": session_data.get("user_context") or None,
+                "session_title": session_data.get("title"),
+                "message_count": sum(
+                    1
+                    for m in session_data.get("messages", [])
+                    if m.get("type") == "human"
+                ),
+            }
+        )
 
     return {"user_id": user_id, "total_sessions": len(sessions), "sessions": sessions}
 
@@ -315,48 +321,40 @@ async def get_user_sessions(user_id: str):
 @router.get("/{session_id}/context")
 async def get_context(session_id: str, user_id: str):
     """Retrieve user context for a session."""
-    if session_id not in user_contexts:
+    session_data = SESSION_STORE.get(session_id)
+    if session_data is None:
         raise HTTPException(status_code=404, detail="Session context not found")
 
-    if session_id in session_metadata:
-        owner_id = session_metadata[session_id].get("user_id")
-        if owner_id != user_id:
-            raise HTTPException(status_code=403, detail="Access denied.")
+    _require_owner(session_data, user_id, session_id)
 
-    return {"session_id": session_id, "user_context": user_contexts[session_id]}
+    return {"session_id": session_id, "user_context": session_data.get("user_context", "")}
 
 
 @router.get("/{session_id}/history")
 async def get_history(session_id: str, user_id: str):
     """Retrieve conversation history for a session."""
-    if session_id not in memories:
+    session_data = SESSION_STORE.get(session_id)
+    if session_data is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session_id in session_metadata:
-        owner_id = session_metadata[session_id].get("user_id")
-        if owner_id != user_id:
-            raise HTTPException(status_code=403, detail="Access denied.")
-
-    memory = memories[session_id]
-    history = memory.load_memory_variables({})
+    _require_owner(session_data, user_id, session_id)
 
     messages = []
-    for msg in history.get("chat_history", []):
-        message_data = {"type": msg.type, "content": msg.content}
+    for msg in session_data.get("messages", []):
+        message_data = {"type": msg.get("type"), "content": msg.get("content")}
 
-        if msg.type == "ai":
+        if msg.get("type") == "ai":
             try:
-                structured_content = json.loads(msg.content)
-                message_data["structured_response"] = structured_content
-            except:
-                message_data["content"] = msg.content
+                message_data["structured_response"] = json.loads(msg.get("content"))
+            except (TypeError, json.JSONDecodeError):
+                pass
 
         messages.append(message_data)
 
     return {
         "session_id": session_id,
-        "user_context": user_contexts.get(session_id, None),
-        "session_title": session_titles.get(session_id, None),
+        "user_context": session_data.get("user_context") or None,
+        "session_title": session_data.get("title"),
         "messages": messages,
     }
 
@@ -364,51 +362,29 @@ async def get_history(session_id: str, user_id: str):
 @router.delete("/{session_id}/history")
 async def clear_history(session_id: str, user_id: str):
     """Clear conversation history for a session."""
-    if session_id not in memories:
+    session_data = SESSION_STORE.get(session_id)
+    if session_data is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session_id in session_metadata:
-        owner_id = session_metadata[session_id].get("user_id")
-        if owner_id != user_id:
-            raise HTTPException(status_code=403, detail="Access denied.")
+    _require_owner(session_data, user_id, session_id)
 
-    memories[session_id].clear()
+    session_data["messages"] = []
+    session_data["last_active"] = datetime.now().isoformat()
+    SESSION_STORE.save(session_id, session_data)
     return {"message": f"History cleared for session {session_id}"}
 
 
 @router.delete("/{session_id}")
 async def delete_session(session_id: str, user_id: str):
     """Delete entire session including context."""
-    if session_id in session_metadata:
-        owner_id = session_metadata[session_id].get("user_id")
-        if owner_id != user_id:
-            raise HTTPException(status_code=403, detail="Access denied.")
+    session_data = SESSION_STORE.get(session_id)
+    if session_data is None:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    deleted_items = []
+    _require_owner(session_data, user_id, session_id)
 
-    if session_id in session_metadata:
-        del session_metadata[session_id]
-        deleted_items.append("metadata")
-
-    if user_id and user_id in user_sessions:
-        if session_id in user_sessions[user_id]:
-            user_sessions[user_id].remove(session_id)
-            if not user_sessions[user_id]:
-                del user_sessions[user_id]
-
-    if session_id in memories:
-        del memories[session_id]
-        deleted_items.append("memory")
-
-    if session_id in user_contexts:
-        del user_contexts[session_id]
-        deleted_items.append("context")
-
-    if session_id in session_titles:
-        del session_titles[session_id]
-        deleted_items.append("title")
-
-    if deleted_items:
-        return {"message": f"Session {session_id} deleted", "deleted": deleted_items}
-
-    raise HTTPException(status_code=404, detail="Session not found")
+    SESSION_STORE.delete(session_id, user_id=session_data.get("user_id"))
+    return {
+        "message": f"Session {session_id} deleted",
+        "deleted": ["metadata", "memory", "context", "title"],
+    }

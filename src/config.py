@@ -39,6 +39,13 @@ class Config:
         self.settings["REDIS_HOST"] = os.getenv("REDIS_HOST", "redis")
         self.settings["REDIS_PORT"] = int(os.getenv("REDIS_PORT", "6379"))
 
+        # Chat sessions are kept in Redis and expire after this many seconds
+        # of inactivity (default 7 days). Ephemeral/guest users rely on this
+        # to have their conversational state reaped automatically.
+        self.settings["SESSION_TTL_SECONDS"] = int(
+            os.getenv("SESSION_TTL_SECONDS", str(7 * 24 * 3600))
+        )
+
         # Background worker configuration
         self.settings["ENABLE_BACKGROUND_WORKER"] = (
             os.getenv("ENABLE_BACKGROUND_WORKER", "false").lower() == "true"
