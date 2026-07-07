@@ -18,6 +18,8 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 COPY . .
 
-EXPOSE 8005
+# PORT env (deployment sets it; default 8000 in src/config.py) decides the
+# listen port — this EXPOSE is documentation and must match the deployment.
+EXPOSE 8001
 
 ENTRYPOINT ["python", "src/app.py"]
