@@ -372,10 +372,10 @@ class MemorySuggestion(BaseModel):
     shape as FoodChat's nudges so the UI renders both identically)."""
 
     id: str = Field(description="Client-echoed suggestion id")
-    kind: Literal["like", "dislike", "cuisine", "allergy_hint"] = Field(
-        description="What profile field an acceptance writes to"
-    )
-    value: str = Field(description="Canonical lowercase item")
+    kind: Literal[
+        "like", "dislike", "cuisine", "allergy_hint", "goal", "dietary_pattern"
+    ] = Field(description="What profile field an acceptance writes to")
+    value: str = Field(description="Canonical lowercase item / goal slug / pattern")
     statement: str = Field(description="The nudge question shown to the user")
 
 

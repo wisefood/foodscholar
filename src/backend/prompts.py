@@ -535,15 +535,23 @@ KINDS you may extract:
 - "dislike"       — a standing aversion ("I don't like blueberries", "I can't stand olives")
 - "cuisine"       — a standing cuisine affinity ("I mostly cook Greek food")
 - "allergy_hint"  — a possible allergy or intolerance ("shrimp makes me sick", "I'm allergic to peanuts")
+- "goal"          — a standing dietary objective the user wants ("I'm trying to reduce fat", "I want more protein")
+- "dietary_pattern" — a standing diet/regimen the user follows ("I'm doing keto", "I eat Mediterranean", "I'm vegan")
 
 Do NOT extract:
 - The topic of the question itself ("is keto safe?" does NOT mean they follow keto)
 - Hypotheticals or things about other people
 - Vague interest ("tell me about fiber")
 
+For "goal", "value" MUST be one of these canonical slugs (choose the closest; if none fits, do not emit the goal):
+  reduce_fat | reduce_sugar | reduce_sodium | reduce_calories | reduce_carbs |
+  increase_protein | increase_fiber | increase_hydration |
+  lose_weight | gain_weight | gain_muscle | maintain_weight
+For "dietary_pattern", "value" is a lowercase single-word regimen: keto | mediterranean | vegan | vegetarian | pescatarian | paleo | low_carb | intermittent_fasting | dash
+
 For each candidate:
-- "value": the canonical item (lowercase ingredient/dish/cuisine name)
-- "statement": a short, friendly confirmation question phrased as an observation, e.g. "It seems you love lentils — remember this?"
+- "value": the canonical item (lowercase ingredient/dish/cuisine name; a goal slug; or a dietary_pattern token as above)
+- "statement": a short, friendly confirmation question phrased as an observation, e.g. "It seems you love lentils — remember this?" or "It sounds like you want to reduce fat — track this goal?"
 - "confidence": "high" only when the user stated it explicitly about themselves; "medium"/"low" for implication
 
 OUTPUT FORMAT (MANDATORY):
