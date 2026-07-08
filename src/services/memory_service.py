@@ -35,7 +35,9 @@ from backend.prompts import QA_MEMORY_EXTRACTOR
 
 logger = logging.getLogger(__name__)
 
-VALID_KINDS = {"like", "dislike", "cuisine", "allergy_hint"}
+VALID_KINDS = {
+    "like", "dislike", "cuisine", "allergy_hint", "goal", "dietary_pattern"
+}
 MAX_SUGGESTIONS_PER_TURN = 2
 EXTRACTOR_MODEL = "llama-3.3-70b-versatile"
 
@@ -102,11 +104,20 @@ class MemoryService:
         dislikes = {str(v).lower() for v in (prefs.get("food_dislikes") or [])}
         allergies = {str(v).lower() for v in (profile.get("allergies") or [])}
         optouts = {str(v).lower() for v in (props.get("memory_optouts") or [])}
+        # dietary_groups holds standing regimens FoodChat already reads.
+        patterns = {str(v).lower() for v in (profile.get("dietary_groups") or [])}
+        # Goals are stored as {"slug", "label"} dicts under properties.
+        goals = {
+            str((g or {}).get("slug", "")).lower()
+            for g in (props.get("dietary_goals") or [])
+        }
         # Same-KIND dedupe only — see the module docstring.
         known_by_kind = {
             "like": likes, "cuisine": likes,
             "dislike": dislikes,
             "allergy_hint": allergies,
+            "goal": goals,
+            "dietary_pattern": patterns,
         }
 
         suggestions: List[Dict[str, Any]] = []
@@ -205,6 +216,21 @@ class MemoryService:
                 if value not in [str(a).lower() for a in allergies]:
                     allergies.append(value)
                 profile.allergies = allergies
+            elif kind == "goal":
+                # value is a canonical slug (e.g. "reduce_fat"). Stored under
+                # properties.dietary_goals as {slug, label} so FoodChat's meal
+                # planner can switch on the slug. FoodChat MUST read this key.
+                goals = list(props.get("dietary_goals") or [])
+                if value not in [str((g or {}).get("slug", "")).lower() for g in goals]:
+                    goals.append({"slug": value, "label": value.replace("_", " ")})
+                props["dietary_goals"] = goals
+            elif kind == "dietary_pattern":
+                # Standing regimen (keto, mediterranean, vegan...). Stored in
+                # dietary_groups, which FoodChat already reads.
+                groups = list(profile.dietary_groups or [])
+                if value not in [str(g).lower() for g in groups]:
+                    groups.append(value)
+                profile.dietary_groups = groups
 
             log = list(props.get("memory_log") or [])
             log.append({

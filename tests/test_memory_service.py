@@ -12,7 +12,11 @@ PROFILE = {
         "food_dislikes": ["olives"],
     },
     "allergies": ["peanuts"],
-    "properties": {"memory_optouts": ["cilantro"]},
+    "dietary_groups": ["vegetarian"],
+    "properties": {
+        "memory_optouts": ["cilantro"],
+        "dietary_goals": [{"slug": "reduce_sugar", "label": "cut back on sugar"}],
+    },
 }
 
 
@@ -80,6 +84,53 @@ class MemoryPolicyTests(unittest.TestCase):
             self.service.decide("member-1", "standing_seed", "pastitsio", "accept")
         with self.assertRaises(ValueError):
             self.service.decide("member-1", "like", "  ", "accept")
+
+    # --- goal kind -------------------------------------------------------- #
+
+    def test_high_confidence_goal_nudges(self):
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "reduce_fat", "confidence": "high",
+             "statement": "It sounds like you want to reduce fat — track this goal?"},
+        ])
+        self.assertEqual([(s["kind"], s["value"]) for s in out],
+                         [("goal", "reduce_fat")])
+
+    def test_known_goal_deduped(self):
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "reduce_sugar", "confidence": "high"},  # already a goal
+        ])
+        self.assertEqual(out, [])
+
+    def test_low_confidence_goal_dropped(self):
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "lose_weight", "confidence": "medium"},
+        ])
+        self.assertEqual(out, [])
+
+    # --- dietary_pattern kind -------------------------------------------- #
+
+    def test_high_confidence_pattern_nudges(self):
+        out = _suggest(self.service, [
+            {"kind": "dietary_pattern", "value": "keto", "confidence": "high"},
+        ])
+        self.assertEqual([(s["kind"], s["value"]) for s in out],
+                         [("dietary_pattern", "keto")])
+
+    def test_known_pattern_deduped(self):
+        out = _suggest(self.service, [
+            {"kind": "dietary_pattern", "value": "vegetarian", "confidence": "high"},  # in dietary_groups
+        ])
+        self.assertEqual(out, [])
+
+    def test_new_kinds_accepted_by_decide(self):
+        # decide() must not reject the new kinds as invalid payloads.
+        with patch.object(self.service, "_apply", return_value=True) as ap:
+            self.assertTrue(
+                self.service.decide("m", "goal", "reduce_fat", "accept"))
+            ap.assert_called_once()
+        with patch.object(self.service, "_apply", return_value=True):
+            self.assertTrue(
+                self.service.decide("m", "dietary_pattern", "keto", "accept"))
 
 
 if __name__ == "__main__":
