@@ -315,18 +315,36 @@ class QAService:
 
         return response
 
-    def get_tips_of_the_day(self) -> TipsOfTheDayResponse:
-        """Return 2 tips + 2 did-you-know facts with strict Redis caching."""
+    def get_tips_of_the_day(
+        self, member_id: Optional[str] = None
+    ) -> TipsOfTheDayResponse:
+        """Return 2 tips + 2 did-you-know facts with strict Redis caching.
+
+        Generic for everyone by default; when ``member_id`` resolves to a
+        profile with accumulated preferences (likes, diets, standing seeds),
+        the guideline source pool is biased toward those topics and tips that
+        mention the member's allergens/dislikes are dropped. Members without
+        profile signal share the global generic cache entry.
+        """
         tips_count = TIPS_OF_THE_DAY_TIPS_COUNT
         did_you_know_count = TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT
+        member_context = self._tip_member_context(member_id)
+        cache_data = {
+            "type": "tips_of_the_day",
+            # v6: evidence urns switched from guide_urn to the guideline's own
+            # id (page-level deep links) — invalidates v5 payloads.
+            "version": 6,
+            "tips_count": tips_count,
+            "did_you_know_count": did_you_know_count,
+        }
+        if member_context:
+            # Personalized entries are cached per topic/avoid fingerprint —
+            # same profile → same key, so the daily-seed stability holds.
+            cache_data["member_topics"] = member_context["topics"]
+            cache_data["member_avoid"] = member_context["avoid"]
         cache_key = self.cache_manager.generate_cache_key(
             prefix="qa",
-            data={
-                "type": "tips_of_the_day",
-                "version": 5,
-                "tips_count": tips_count,
-                "did_you_know_count": did_you_know_count,
-            },
+            data=cache_data,
         )
 
         try:
@@ -369,6 +387,7 @@ class QAService:
         generated_payload = self._generate_tips_of_the_day(
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
+            member_context=member_context,
         )
         generated_payload = self._normalize_tips_payload(
             generated_payload,
@@ -1656,10 +1675,70 @@ class QAService:
             return False
         return True
 
+    def _tip_member_context(
+        self, member_id: Optional[str]
+    ) -> Optional[Dict[str, List[str]]]:
+        """Profile-derived tip steering for a member, or None for generic tips.
+
+        topics — likes, dietary groups, standing seeds: biases which guideline
+        rules seed the generation. avoid — allergies + dislikes: tips whose
+        text mentions these are dropped outright. Best-effort: any lookup
+        failure degrades to the generic (None) path.
+        """
+        if not member_id:
+            return None
+        try:
+            context = self._lookup_member_context(member_id)
+        except Exception as exc:
+            logger.warning(
+                "Tips personalization skipped — member lookup failed for %s: %s",
+                member_id,
+                exc,
+            )
+            return None
+
+        profile = context.get("profile") or {}
+        prefs = profile.get("nutritional_preferences") or {}
+        props = profile.get("properties") or {}
+
+        def clean(values) -> List[str]:
+            out = []
+            for value in values or []:
+                text = str(value).strip().lower()
+                if text and text not in out:
+                    out.append(text)
+            return out
+
+        topics = clean(
+            list(prefs.get("food_likes") or [])
+            + list(profile.get("dietary_groups") or [])
+            + [s.get("name") for s in (props.get("standing_seeds") or [])
+               if isinstance(s, dict)]
+        )[:8]
+        avoid = clean(
+            list(profile.get("allergies") or [])
+            + list(prefs.get("food_dislikes") or [])
+        )[:12]
+
+        if not topics and not avoid:
+            return None
+        return {"topics": topics, "avoid": avoid}
+
+    @staticmethod
+    def _mentions_any_term(text: str, terms: List[str]) -> bool:
+        """Word-boundary check of any term (or simple plural) in the text."""
+        haystack = (text or "").lower()
+        for term in terms or []:
+            cleaned = str(term).strip().lower()
+            if cleaned and re.search(r"\b" + re.escape(cleaned) + r"s?\b", haystack):
+                return True
+        return False
+
     def _generate_tips_of_the_day(
         self,
         tips_count: int = TIPS_OF_THE_DAY_TIPS_COUNT,
         did_you_know_count: int = TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT,
+        member_context: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
         """Generate grounded tips/facts with validation and regeneration."""
         for attempt in range(1, MAX_TIP_REGEN_ATTEMPTS + 1):
@@ -1668,6 +1747,7 @@ class QAService:
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
                     seed_offset=attempt,
+                    member_context=member_context,
                 )
                 # During generation attempts, don't auto-fill missing items with
                 # fallbacks; allow regeneration to kick in.
@@ -1720,7 +1800,12 @@ class QAService:
         )
 
     def _generate_tips_payload_once(
-        self, tips_count: int, did_you_know_count: int, *, seed_offset: int = 0
+        self,
+        tips_count: int,
+        did_you_know_count: int,
+        *,
+        seed_offset: int = 0,
+        member_context: Optional[Dict[str, List[str]]] = None,
     ) -> Dict[str, Any]:
         """Single generation pass for tips/facts."""
         total_count = tips_count + did_you_know_count
@@ -1730,7 +1815,15 @@ class QAService:
         daily_seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + int(
             seed_offset or 0
         )
-        guideline_query = self._tip_source_query(daily_seed, branch="guidelines")
+        member_topics = (member_context or {}).get("topics") or []
+        avoid_terms = (member_context or {}).get("avoid") or []
+        # Profile topics steer the source pool toward the member's context;
+        # without them the rotating daily topic keeps tips generic.
+        guideline_query = (
+            " ".join(member_topics)
+            if member_topics
+            else self._tip_source_query(daily_seed, branch="guidelines")
+        )
         source_guidelines = self._get_random_tip_source_guidelines(
             size=max(TIP_SOURCE_GUIDELINE_POOL_SIZE, candidate_count),
             seed=daily_seed,
@@ -1740,6 +1833,23 @@ class QAService:
             guidelines=source_guidelines,
             candidate_count=candidate_count,
         )
+        if member_topics and len(candidates) < total_count:
+            # Lexical guideline matching runs dry on niche profile topics
+            # ("pastitsio", "fakes") — top up SEMANTICALLY: kNN over the
+            # articles index with the embedded topics, so personalization
+            # degrades to related content, not to generic tips. (Guideline
+            # docs carry no embeddings, so semantic runs on articles only.)
+            semantic_articles = self._get_semantic_tip_source_articles(
+                topics=member_topics,
+                size=max(TIP_SOURCE_ARTICLE_POOL_SIZE, candidate_count),
+            )
+            if semantic_articles:
+                candidates.extend(
+                    self._generate_tip_candidates_from_articles(
+                        articles=semantic_articles,
+                        candidate_count=candidate_count - len(candidates),
+                    )
+                )
         if not candidates:
             logger.warning(
                 "No guideline-backed tips could be generated; falling back to article sources."
@@ -1754,6 +1864,20 @@ class QAService:
                 articles=source_articles,
                 candidate_count=candidate_count,
             )
+
+        if avoid_terms:
+            # Never serve a member a tip promoting their allergen or a
+            # declared dislike — drop, don't rewrite.
+            before = len(candidates)
+            candidates = [
+                c for c in candidates
+                if not self._mentions_any_term(str(c.get("text", "")), avoid_terms)
+            ]
+            if len(candidates) < before:
+                logger.info(
+                    "Dropped %d tip candidate(s) mentioning member avoid-terms.",
+                    before - len(candidates),
+                )
 
         did_you_know_detail: List[Dict[str, Any]] = []
         tips_detail: List[Dict[str, Any]] = []
@@ -1986,7 +2110,11 @@ class QAService:
                 {
                     "kind": kind,
                     "text": text,
-                    "urn": self._guideline_source_urn(guideline),
+                    # The guideline's OWN id (not guide_urn): the UI resolves it
+                    # via the catalog to deep-link to the exact guide page the
+                    # rule came from (page_no/source_refs). With guide_urn it
+                    # could only ever land on page 1.
+                    "urn": self._guideline_document_urn(guideline),
                     "passage": self._extract_guideline_passage(guideline),
                     "title": guideline.get("title", None),
                     "publication_year": self._guideline_publication_year(guideline),
@@ -2055,7 +2183,8 @@ class QAService:
                 continue
 
             source_payload = {
-                "urn": self._guideline_source_urn(guideline),
+                # Guideline id, not guide_urn — see the LLM branch above.
+                "urn": self._guideline_document_urn(guideline),
                 "passage": self._extract_guideline_passage(guideline),
                 "title": guideline.get("title", None),
                 "publication_year": self._guideline_publication_year(guideline),
@@ -2223,6 +2352,36 @@ class QAService:
         if 1 <= idx <= max_index:
             return idx
         return None
+
+    def _get_semantic_tip_source_articles(
+        self, *, topics: List[str], size: int
+    ) -> List[Dict[str, Any]]:
+        """kNN article pool matching the member's topics semantically.
+
+        Uses the same MiniLM embedder as QA retrieval, so "fakes" surfaces
+        legume/lentil literature even with zero lexical overlap. Best-effort:
+        any failure returns [] and the caller's lexical path takes over.
+        """
+        if not topics:
+            return []
+        try:
+            vector = self._embed_query("; ".join(topics))
+            return ELASTIC_CLIENT.knn_search(
+                index_name=self.INDEX_NAME,
+                query_vector=vector,
+                k=size,
+                num_candidates=max(size * 10, 100),
+                field="embedding",
+                filter_query={
+                    "bool": {"must_not": [{"term": {"status": "deleted"}}]}
+                },
+                source_excludes=["embedding"],
+            )
+        except Exception:
+            logger.exception(
+                "Semantic tip source retrieval failed; lexical fallback only."
+            )
+            return []
 
     def _get_random_tip_source_articles(
         self, *, size: int, seed: int, query: Optional[str] = None

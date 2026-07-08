@@ -147,10 +147,19 @@ async def get_simple_nutri_questions():
 
 
 @router.get("/tips", response_model=TipsOfTheDayResponse)
-async def get_tips_of_the_day():
+async def get_tips_of_the_day(
+    member_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional WiseFood member id. When the member's profile has "
+            "accumulated preferences, tips are biased toward their context "
+            "and never mention their allergens/dislikes; otherwise generic."
+        ),
+    ),
+):
     """Get 2 did_you_know facts and 2 tips, cached for 30 minutes."""
     try:
-        return qa_service.get_tips_of_the_day()
+        return qa_service.get_tips_of_the_day(member_id=member_id)
     except Exception as e:
         logger.error("Error getting nutrition tips of the day: %s", e, exc_info=True)
         raise InternalError(
