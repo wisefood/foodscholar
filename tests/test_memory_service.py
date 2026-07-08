@@ -132,6 +132,45 @@ class MemoryPolicyTests(unittest.TestCase):
             self.assertTrue(
                 self.service.decide("m", "dietary_pattern", "keto", "accept"))
 
+    def test_vegetarian_pattern_writes_dietary_groups_not_food_likes(self):
+        """Regression: accepting dietary_pattern 'vegetarian' must update
+        dietary_groups, NEVER food_likes (the reported bug)."""
+        import sys
+        from unittest.mock import MagicMock
+
+        class _Prof:
+            def __init__(self):
+                self.nutritional_preferences = {}
+                self.allergies = []
+                self.dietary_groups = ["omnivore"]
+                self.properties = {}
+
+        prof = _Prof()
+        member = MagicMock()
+        member.profile = prof
+        client = MagicMock()
+        client.members.get.return_value = member
+        plat = MagicMock()
+        plat.WISEFOOD_PLATFORM.get_client.return_value = client
+
+        saved = sys.modules.get("backend.platform")
+        sys.modules["backend.platform"] = plat
+        try:
+            from services.memory_service import MemoryService
+            MemoryService().decide("m", "dietary_pattern", "vegetarian", "accept")
+        finally:
+            if saved is not None:
+                sys.modules["backend.platform"] = saved
+            else:
+                sys.modules.pop("backend.platform", None)
+
+        self.assertIn("vegetarian", prof.dietary_groups)
+        # The bug: it must NOT have gone into food_likes.
+        self.assertNotIn(
+            "vegetarian",
+            [str(v).lower() for v in prof.nutritional_preferences.get("food_likes", [])],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

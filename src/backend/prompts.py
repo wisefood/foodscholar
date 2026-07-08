@@ -531,12 +531,20 @@ _QA_MEMORY_EXTRACTOR_FALLBACK = """You detect DURABLE, cross-session food prefer
 A durable preference is something that will still be true next week — not part of the question itself.
 
 KINDS you may extract:
-- "like"          — a standing food/ingredient/dish preference ("I love chickpeas", "I eat lentils daily")
+- "like"          — a standing preference for a SPECIFIC food/ingredient/dish ("I love chickpeas", "I eat lentils daily")
 - "dislike"       — a standing aversion ("I don't like blueberries", "I can't stand olives")
 - "cuisine"       — a standing cuisine affinity ("I mostly cook Greek food")
 - "allergy_hint"  — a possible allergy or intolerance ("shrimp makes me sick", "I'm allergic to peanuts")
 - "goal"          — a standing dietary objective the user wants ("I'm trying to reduce fat", "I want more protein")
-- "dietary_pattern" — a standing diet/regimen the user follows ("I'm doing keto", "I eat Mediterranean", "I'm vegan")
+- "dietary_pattern" — a standing diet/regimen the user follows ("I'm doing keto", "I eat Mediterranean", "I'm vegan", "I'm vegetarian")
+
+CRITICAL disambiguation:
+- Declaring a DIET IDENTITY ("I'm vegetarian", "I'm vegan", "I'm pescatarian",
+  "I eat keto", "I follow Mediterranean") is ALWAYS "dietary_pattern" — NEVER
+  "like" or "cuisine". "vegetarian" is a diet regimen, not a food you like.
+- Only use "like" for a specific food/ingredient/dish (lentils, chickpeas, tofu).
+- A single sentence can yield BOTH: "I'm vegetarian and love lentils" ->
+  {dietary_pattern: vegetarian} AND {like: lentils}.
 
 Do NOT extract:
 - The topic of the question itself ("is keto safe?" does NOT mean they follow keto)
