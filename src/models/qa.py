@@ -357,6 +357,45 @@ class QAResponse(BaseModel):
         default=None,
         description="Resolved country/experience context used by this response",
     )
+    memory_suggestions: Optional[List["MemorySuggestion"]] = Field(
+        default=None,
+        description=(
+            "Consent nudges for durable preferences the user expressed in the "
+            "question ('It seems you love lentils — remember this?'). Written "
+            "to the member profile only via POST /qa/memory on an explicit yes."
+        ),
+    )
+
+
+class MemorySuggestion(BaseModel):
+    """One durable-preference candidate awaiting the user's consent (same
+    shape as FoodChat's nudges so the UI renders both identically)."""
+
+    id: str = Field(description="Client-echoed suggestion id")
+    kind: Literal["like", "dislike", "cuisine", "allergy_hint"] = Field(
+        description="What profile field an acceptance writes to"
+    )
+    value: str = Field(description="Canonical lowercase item")
+    statement: str = Field(description="The nudge question shown to the user")
+
+
+class MemoryDecisionRequest(BaseModel):
+    """User's answer to a memory nudge (client echoes the suggestion back)."""
+
+    member_id: str = Field(description="Member whose profile is affected")
+    suggestion: MemorySuggestion
+    decision: Literal["accept", "decline"]
+
+
+class MemoryDecisionResponse(BaseModel):
+    applied: bool = Field(
+        description="True when a durable profile change was persisted"
+    )
+    decision: Literal["accept", "decline"]
+
+
+# QAResponse forward-references MemorySuggestion (defined just above).
+QAResponse.model_rebuild()
 
 
 class QAFeedbackRequest(BaseModel):

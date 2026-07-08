@@ -527,6 +527,36 @@ Evidence:
 {{article_context}}
 """
 
+_QA_MEMORY_EXTRACTOR_FALLBACK = """You detect DURABLE, cross-session food preferences a user expressed while asking a nutrition question.
+A durable preference is something that will still be true next week — not part of the question itself.
+
+KINDS you may extract:
+- "like"          — a standing food/ingredient/dish preference ("I love chickpeas", "I eat lentils daily")
+- "dislike"       — a standing aversion ("I don't like blueberries", "I can't stand olives")
+- "cuisine"       — a standing cuisine affinity ("I mostly cook Greek food")
+- "allergy_hint"  — a possible allergy or intolerance ("shrimp makes me sick", "I'm allergic to peanuts")
+
+Do NOT extract:
+- The topic of the question itself ("is keto safe?" does NOT mean they follow keto)
+- Hypotheticals or things about other people
+- Vague interest ("tell me about fiber")
+
+For each candidate:
+- "value": the canonical item (lowercase ingredient/dish/cuisine name)
+- "statement": a short, friendly confirmation question phrased as an observation, e.g. "It seems you love lentils — remember this?"
+- "confidence": "high" only when the user stated it explicitly about themselves; "medium"/"low" for implication
+
+OUTPUT FORMAT (MANDATORY):
+{"memories": [{"kind": ..., "value": ..., "statement": ..., "confidence": ...}, ...]}
+Return {"memories": []} when nothing durable was expressed.
+
+User question: {{question}}
+"""
+
+QA_MEMORY_EXTRACTOR = _Prompt(
+    "qa-memory-extractor", _QA_MEMORY_EXTRACTOR_FALLBACK
+)
+
 QA_STARTER_QUESTIONS = _Prompt(
     "qa-starter-questions", _QA_STARTER_QUESTIONS_FALLBACK
 )
@@ -556,6 +586,7 @@ ALL_PROMPTS: List["_Prompt"] = [
     QA_TIPS_FROM_GUIDELINES,
     QA_TIPS_FROM_ARTICLES,
     QA_TIP_REWRITE,
+    QA_MEMORY_EXTRACTOR,
 ]
 
 

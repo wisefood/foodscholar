@@ -1,4 +1,5 @@
 """Q&A API endpoints for non-contextual question answering."""
+import asyncio
 import logging
 import os
 from fastapi import APIRouter, Query
@@ -9,12 +10,16 @@ from models.qa import (
     QAResponse,
     QAFeedbackRequest,
     QAFeedbackResponse,
+    MemoryDecisionRequest,
+    MemoryDecisionResponse,
+    MemorySuggestion,
     SimpleNutriQuestionsResponse,
     TipsOfTheDayResponse,
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
 )
 from services.qa_service import QAService
+from services.memory_service import MEMORY_SERVICE
 from exceptions import InvalidError, InternalError
 
 logger = logging.getLogger(__name__)
@@ -69,6 +74,23 @@ async def ask_question(request: QARequest):
             request.mode, request.question[:80],
         )
         result = await qa_service.answer_question(request)
+
+        # Consent nudges: durable preferences phrased inside the question
+        # ("I love lentils — enough protein?") become suggestions the user
+        # answers via POST /qa/memory. Best-effort and off the event loop —
+        # a failed nudge must never break an answered question.
+        if request.member_id and not result.needs_clarification:
+            try:
+                suggestions = await asyncio.to_thread(
+                    MEMORY_SERVICE.suggest, request.member_id, request.question
+                )
+                if suggestions:
+                    result.memory_suggestions = [
+                        MemorySuggestion(**s) for s in suggestions
+                    ]
+            except Exception as e:
+                logger.warning("Memory suggestion skipped: %s", e)
+
         return result
     except InvalidError:
         raise
@@ -76,6 +98,33 @@ async def ask_question(request: QARequest):
         logger.error("Error in ask_question: %s", e, exc_info=True)
         raise InternalError(
             detail="Error generating answer. Please try again.",
+            extra={"cause": e.__class__.__name__},
+        )
+
+
+@router.post("/memory", response_model=MemoryDecisionResponse)
+async def decide_memory(request: MemoryDecisionRequest):
+    """Apply or decline a memory nudge from a QA turn.
+
+    Acceptance writes the preference to the shared member profile with
+    ``source: "foodscholar"`` provenance; a decline is recorded in
+    ``memory_optouts`` so neither FoodScholar nor FoodChat re-asks.
+    """
+    try:
+        applied = await asyncio.to_thread(
+            MEMORY_SERVICE.decide,
+            request.member_id,
+            request.suggestion.kind,
+            request.suggestion.value,
+            request.decision,
+        )
+        return MemoryDecisionResponse(applied=applied, decision=request.decision)
+    except ValueError as e:
+        raise InvalidError(detail=str(e))
+    except Exception as e:
+        logger.error("Error in decide_memory: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error recording your choice. Please try again.",
             extra={"cause": e.__class__.__name__},
         )
 

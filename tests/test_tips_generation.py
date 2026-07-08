@@ -69,9 +69,11 @@ class TipsGenerationTests(unittest.TestCase):
             )
             self.assertEqual(len(payload["tips"]), 2)
             self.assertEqual(len(payload["did_you_know"]), 2)
+            # Evidence carries the guideline's OWN id (not guide_urn) so the
+            # UI can resolve page references and deep-link to the exact page.
             self.assertEqual(
                 payload["tips_detail"][0]["evidence"]["urn"],
-                "urn:guide:healthy-eating",
+                "guideline-1",
             )
             self.assertEqual(
                 payload["tips_detail"][0]["evidence"]["passage"],
