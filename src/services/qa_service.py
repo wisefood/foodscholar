@@ -1714,6 +1714,10 @@ class QAService:
             + list(profile.get("dietary_groups") or [])
             + [s.get("name") for s in (props.get("standing_seeds") or [])
                if isinstance(s, dict)]
+            # Consented dietary goals (e.g. reduce_fat captured from a QA
+            # concern) bias the tips too — the demo's learning→planning loop.
+            + [str(g.get("label") or g.get("slug") or "").replace("_", " ")
+               for g in (props.get("dietary_goals") or []) if isinstance(g, dict)]
         )[:8]
         avoid = clean(
             list(profile.get("allergies") or [])
