@@ -547,14 +547,21 @@ CRITICAL disambiguation:
   {dietary_pattern: vegetarian} AND {like: lentils}.
 
 Do NOT extract:
-- The topic of the question itself ("is keto safe?" does NOT mean they follow keto)
+- A diet or regimen the user merely asks about ("is keto safe?" does NOT mean they follow keto)
 - Hypotheticals or things about other people outside the user's own household
-- Vague interest ("tell me about fiber")
+- Vague interest or neutral curiosity ("tell me about fiber", "what does protein do?")
 
-Concern vs topic: a bare topic question ("is red meat harmful?") extracts NOTHING,
-but the same question with a stated personal or family concern ("we're worried
-about heart health — is red meat harmful?") extracts the implied goal
-(reduce_fat, confidence "high" — the concern itself was stated explicitly).
+Health-interest questions: asking whether a SPECIFIC food or nutrient is harmful
+or unhealthy expresses a health interest in moderating it — extract the matching
+goal with confidence "high":
+- red meat / processed meat / fatty or fried food / butter → reduce_fat
+- salt / sodium → reduce_sodium
+- sugar / sweets / soft drinks → reduce_sugar
+A stated personal or family concern ("we're worried about our heart health",
+"my cholesterol came back high") maps the same way. This NEVER applies to diets
+or regimens ("is keto safe?", "is intermittent fasting healthy?" extract
+NOTHING) and never to foods asked about positively ("is salmon good for me?"
+extracts nothing).
 
 For "goal", "value" MUST be one of these canonical slugs (choose the closest; if none fits, do not emit the goal):
   reduce_fat | reduce_sugar | reduce_sodium | reduce_calories | reduce_carbs |
@@ -564,7 +571,7 @@ For "dietary_pattern", "value" is a lowercase single-word regimen: keto | medite
 
 For each candidate:
 - "value": the canonical item (lowercase ingredient/dish/cuisine name; a goal slug; or a dietary_pattern token as above)
-- "statement": a short, friendly confirmation question phrased as an observation that names the consequence, e.g. "It seems you love lentils — remember this?", "It sounds like you want to reduce fat — track this goal?", or for a concern-derived goal: "You mentioned your family's heart health — should meal plans aim for less saturated fat?"
+- "statement": a short, friendly confirmation question phrased as an observation that names the consequence, e.g. "It seems you love lentils — remember this?", "It sounds like you want to reduce fat — track this goal?", for a concern-derived goal: "You mentioned your family's heart health — should meal plans aim for less saturated fat?", or for a harm question: "You asked about red meat and your health — should meal plans aim for less saturated fat?"
 - "confidence": "high" only when the user stated it explicitly about themselves; "medium"/"low" for implication
 
 OUTPUT FORMAT (MANDATORY):
