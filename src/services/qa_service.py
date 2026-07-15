@@ -560,7 +560,17 @@ class QAService:
             model=effective_model,
         )
 
-        clarification = plan.clarification if plan.needs_clarification else None
+        # ONE clarification per thread. Re-planning after each answer could
+        # demand ever more detail ("caloric goal?" → "none" → same question
+        # rephrased) — an interrogation loop, not a conversation. Once the
+        # user has answered or declined anything, we answer with reasonable
+        # assumptions instead of asking again.
+        clarification_exhausted = bool(request.clarification_response) or bool(answered_ids)
+        clarification = (
+            plan.clarification
+            if plan.needs_clarification and not clarification_exhausted
+            else None
+        )
         ask_before_scout = (
             clarification is not None
             and self._should_ask_clarification_before_scout(
@@ -620,7 +630,7 @@ class QAService:
             source_payloads = retrieval_result.source_payloads
             retrieved_sources = retrieval_result.retrieved_sources
 
-        scout_clarification = self._build_scout_clarification(
+        scout_clarification = None if clarification_exhausted else self._build_scout_clarification(
             question=effective_question,
             plan=plan,
             pending_clarification=clarification,
