@@ -183,10 +183,15 @@ async def list_available_models():
 
 
 @router.get("/questions", response_model=SimpleNutriQuestionsResponse)
-async def get_simple_nutri_questions():
+async def get_simple_nutri_questions(
+    language: str = Query(
+        default="en",
+        description="Language for the starter questions (ISO 639-1 code, e.g. 'en', 'sl').",
+    ),
+):
     """Get 4 simple starter nutrition questions cached for 30 minutes."""
     try:
-        return qa_service.get_simple_nutri_questions()
+        return qa_service.get_simple_nutri_questions(language=language)
     except Exception as e:
         logger.error("Error getting starter nutrition questions: %s", e, exc_info=True)
         raise InternalError(

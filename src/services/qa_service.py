@@ -41,6 +41,7 @@ from backend.prompts import (
     QA_TIPS_FROM_GUIDELINES,
     QA_TIPS_FROM_ARTICLES,
     QA_TIP_REWRITE,
+    QA_CONVERSATION_SUMMARY,
 )
 
 
@@ -68,6 +69,7 @@ logger = logging.getLogger(__name__)
 TTL_QA_RESPONSE = 86400  # 1 day
 TTL_QA_FEEDBACK = 2592000  # 30 days
 TTL_QA_CLARIFICATION_THREAD = 1800  # 30 minutes
+TTL_QA_CONVERSATION = 3600  # 1 hour — running follow-up thread summary
 TTL_SIMPLE_NUTRI_QUESTIONS = 1800  # 30 minutes
 TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
 TIP_GROUNDING_TOP_K = 3
@@ -193,6 +195,7 @@ class QAService:
         self.cache_manager = CacheManager(enabled=cache_enabled)
         self._embedder = None
         self._simple_question_llm = None
+        self._conversation_summary_llm = None
         self._simple_question_redis = None
         self._qa_threads: Dict[str, Dict[str, Any]] = {}
         self._retriever_adapters = QARetrieverAdapters(
@@ -234,6 +237,18 @@ class QAService:
         return self._simple_question_llm
 
     @property
+    def conversation_summary_llm(self):
+        """Lazy-load a small Groq client for running conversation summaries."""
+        if self._conversation_summary_llm is None:
+            self._conversation_summary_llm = GROQ_CHAT.get_client(
+                model=SIMPLE_NUTRI_QUESTION_MODEL,
+                temperature=0.2,
+                max_tokens=512,
+                reasoning_effort="low",
+            )
+        return self._conversation_summary_llm
+
+    @property
     def simple_question_redis(self):
         """Strict Redis client for starter question caching."""
         if self._simple_question_redis is None:
@@ -244,14 +259,18 @@ class QAService:
             self._simple_question_redis = client
         return self._simple_question_redis
 
-    def get_simple_nutri_questions(self) -> SimpleNutriQuestionsResponse:
+    def get_simple_nutri_questions(
+        self, language: str = "en"
+    ) -> SimpleNutriQuestionsResponse:
         """Return 4 starter nutrition questions with strict Redis caching."""
+        language = (language or "en").strip().lower() or "en"
         cache_key = self.cache_manager.generate_cache_key(
             prefix="qa",
             data={
                 "type": "simple_nutri_questions",
-                "version": 2,
+                "version": 3,
                 "count": 4,
+                "language": language,
             },
         )
 
@@ -281,7 +300,9 @@ class QAService:
                 "Redis is required for starter question caching but is unavailable."
             ) from e
 
-        generated_questions = self._generate_simple_nutri_questions(count=4)
+        generated_questions = self._generate_simple_nutri_questions(
+            count=4, language=language
+        )
         response = SimpleNutriQuestionsResponse(
             questions=generated_questions,
             generated_at=datetime.now().isoformat(),
@@ -531,6 +552,10 @@ class QAService:
         user_context = self._resolve_user_context(request)
         thread_context = self._load_qa_thread(request.qa_thread_id)
         user_context = self._merge_thread_user_context(user_context, thread_context)
+        # Running conversation summary for free-form follow-ups. Present only when
+        # the client is continuing a thread (it echoes back qa_thread_id); the
+        # answer is generated stateless otherwise. Facts only — mode-agnostic.
+        conversation_summary = self._load_conversation_summary(request.qa_thread_id)
 
         if thread_context and request.clarification_response is None:
             clarification = ClarificationRequest(**thread_context["clarification"])
@@ -701,6 +726,7 @@ class QAService:
                 language=request.language,
                 retriever=effective_retriever,
                 user_context=context_payload,
+                prior_conversation=conversation_summary,
             )
         else:
             primary_answer, follow_ups = primary_agent.generate_answer_without_rag(
@@ -708,6 +734,7 @@ class QAService:
                 expertise_level=request.expertise_level,
                 language=request.language,
                 user_context=context_payload,
+                prior_conversation=conversation_summary,
             )
 
         # Dual-answer logic (simple mode only)
@@ -728,6 +755,12 @@ class QAService:
                 )
             )
 
+        # Return a thread id the UI can echo back to continue this conversation.
+        # Reuse an existing one (clarification/continuation) or mint a fresh one so
+        # a first answer is already threadable. Whether context is actually carried
+        # stays the UI's choice: it must send this id back for the next follow-up.
+        conversation_thread_id = request.qa_thread_id or str(uuid.uuid4())
+
         response = QAResponse(
             question=effective_question,
             mode=request.mode,
@@ -739,7 +772,7 @@ class QAService:
             generated_at=datetime.now().isoformat(),
             cache_hit=False,
             request_id=request_id,
-            qa_thread_id=request.qa_thread_id,
+            qa_thread_id=conversation_thread_id,
             needs_clarification=False,
             clarification=None,
             user_context=user_context,
@@ -750,6 +783,17 @@ class QAService:
             self.cache_manager.set(
                 cache_key, response.model_dump(), ttl=TTL_QA_RESPONSE
             )
+
+        # Update the running thread summary for the next free-form follow-up.
+        # Best-effort and mode-agnostic (facts only); never blocks the answer.
+        self._update_conversation_summary(
+            thread_id=conversation_thread_id,
+            previous_summary=conversation_summary,
+            question=effective_question,
+            answer_text=getattr(primary_answer, "answer", "") or "",
+            language=request.language,
+            trace_context=_request_trace_context(request),
+        )
 
         # Persist to PostgreSQL
         persist_request = request.model_copy(
@@ -1158,6 +1202,77 @@ class QAService:
     def _clear_qa_thread(self, thread_id: str) -> None:
         self._qa_threads.pop(thread_id, None)
         self.cache_manager.delete(f"qa_thread:{thread_id}")
+
+    def _conversation_cache_key(self, thread_id: str) -> str:
+        return f"qa_conversation:{thread_id}"
+
+    def _load_conversation_summary(self, thread_id: Optional[str]) -> Optional[str]:
+        """Load the running summary for a conversation thread, if any.
+
+        Stateless by default: only returns context when the client opts into a
+        thread by echoing back a ``qa_thread_id`` from a prior answer. The UI
+        decides when a thread continues.
+        """
+        if not thread_id:
+            return None
+        cached = self.cache_manager.get(self._conversation_cache_key(thread_id))
+        if isinstance(cached, dict):
+            summary = cached.get("summary")
+            return summary if isinstance(summary, str) and summary.strip() else None
+        return None
+
+    def _update_conversation_summary(
+        self,
+        *,
+        thread_id: Optional[str],
+        previous_summary: Optional[str],
+        question: str,
+        answer_text: str,
+        language: str,
+        trace_context: Dict[str, Optional[str]],
+    ) -> None:
+        """Regenerate and persist the running thread summary after an answer.
+
+        Best-effort: a summarization failure must never fail the answer that was
+        already produced — it only means the next follow-up loses this turn's
+        context. Only runs when the client is threading (``thread_id`` present).
+        """
+        if not thread_id:
+            return
+        try:
+            prompt = QA_CONVERSATION_SUMMARY.compile(
+                previous_summary=(previous_summary or "").strip() or "(none)",
+                question=question,
+                answer=answer_text,
+                language=language or "en",
+            )
+            response = self.conversation_summary_llm.invoke(
+                prompt,
+                config=build_trace_config(
+                    run_name="qa-conversation-summary",
+                    session_id=thread_id,
+                    user_id=trace_context.get("user_id"),
+                    tags=["qa", "conversation", "summary"],
+                ),
+            )
+            summary = (getattr(response, "content", "") or "").strip()
+            if not summary:
+                return
+            self.cache_manager.set(
+                self._conversation_cache_key(thread_id),
+                {
+                    "thread_id": thread_id,
+                    "summary": summary,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ttl=TTL_QA_CONVERSATION,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Conversation summary update skipped for thread %s: %s",
+                thread_id,
+                exc,
+            )
 
     @staticmethod
     def _merge_thread_user_context(
@@ -1605,11 +1720,15 @@ class QAService:
 
         return guidelines, retrieved_models
 
-    def _generate_simple_nutri_questions(self, count: int = 4) -> List[str]:
+    def _generate_simple_nutri_questions(
+        self, count: int = 4, language: str = "en"
+    ) -> List[str]:
         """Generate assistant-directed nutrition questions with validation."""
         for attempt in range(1, MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS + 1):
             try:
-                questions = self._generate_simple_questions_once(count=count)
+                questions = self._generate_simple_questions_once(
+                    count=count, language=language
+                )
                 questions = self._normalize_simple_questions(questions, count=count)
                 if len(questions) == count:
                     return questions
@@ -1634,9 +1753,11 @@ class QAService:
         )
         return self._generate_fallback_questions(count=count)
 
-    def _generate_simple_questions_once(self, count: int) -> List[str]:
+    def _generate_simple_questions_once(
+        self, count: int, language: str = "en"
+    ) -> List[str]:
         """Single pass generation for starter nutrition questions."""
-        prompt = QA_STARTER_QUESTIONS.compile(count=count)
+        prompt = QA_STARTER_QUESTIONS.compile(count=count, language=language)
         response = self.simple_question_llm.invoke(
             prompt,
             config=build_trace_config(
@@ -3144,27 +3265,30 @@ class QAService:
         return text[start:]
 
     def _generate_fallback_questions(self, count: int) -> List[str]:
-        """Emergency fallback without a fixed question pool."""
+        """Emergency fallback without a fixed question pool.
+
+        Everyday, household-friendly phrasing (RCSI/Claire feedback: the starter
+        questions must read like a regular shopper or home cook would ask, not a
+        nutrition textbook).
+        """
         pool = [
-            "How does dietary fiber support gut health?",
-            "What is the difference between soluble and insoluble fiber?",
-            "How do whole grains differ nutritionally from refined grains?",
-            "What factors affect how quickly blood sugar rises after meals?",
-            "How does protein intake influence satiety?",
-            "What nutrients are commonly low in highly processed diets?",
-            "How does sodium intake relate to long-term cardiovascular health?",
-            "What is the role of omega-3 fats in nutrition science?",
-            "How does fermentation change the nutritional profile of foods?",
-            "What does current evidence say about ultra-processed foods?",
+            "Are frozen vegetables as healthy as fresh ones?",
+            "Is brown bread really better than white bread?",
+            "What foods are high in fibre?",
+            "Does drinking coffee count toward my daily water?",
+            "Are eggs good or bad for you?",
+            "Is it better to eat fruit or drink fruit juice?",
+            "What are some good sources of protein?",
+            "How much salt is too much in a day?",
+            "Are all fats bad for you?",
+            "Is honey healthier than sugar?",
         ]
         random.shuffle(pool)
         selected = self._normalize_simple_questions(pool, count=count)
 
         while len(selected) < count:
             idx = len(selected) + 1
-            selected.append(
-                f"What does current evidence show about nutrient bioavailability in foods? ({idx})"
-            )
+            selected.append(f"What are some everyday healthy snacks? ({idx})")
 
         return selected[:count]
 

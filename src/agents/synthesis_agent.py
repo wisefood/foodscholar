@@ -14,6 +14,7 @@ from models.search import (
     ArticleMetadata,
 )
 from utilities.citation_validator import create_citation_from_article
+from agents.qa_agent import COMPLEXITY_INSTRUCTIONS
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -119,17 +120,13 @@ class SynthesisAgent:
     ) -> Dict[str, Any]:
         """Generate synthesis using LLM."""
 
-        complexity_instructions = {
-            "beginner": "Use simple, accessible language. Explain technical terms. Use analogies where helpful.",
-            "intermediate": "Use clear scientific language. Define complex terms when first introduced.",
-            "expert": "Use precise scientific terminology. Focus on methodology and statistical significance.",
-        }
-
         prompt_template = ChatPromptTemplate.from_messages([
             ("system", f"""You are a scientific literature synthesis expert. Your task is to read multiple scientific articles and write a clear, natural summary that addresses the user's query — as if explaining the research landscape to a knowledgeable colleague.
 
 EXPERTISE LEVEL: {expertise_level}
-{complexity_instructions.get(expertise_level, complexity_instructions['intermediate'])}
+{COMPLEXITY_INSTRUCTIONS.get(expertise_level, COMPLEXITY_INSTRUCTIONS['intermediate'])}
+
+LANGUAGE: Write every natural-language string in the JSON — the "summary" and every "finding" — in {language}. Only proper nouns (author names, place names, organizations) and established scientific Latin terms may remain in their original form; translate everything else, do not leave English words in a non-English answer.
 
 CRITICAL RULES:
 1. Never make claims without grounding them in the provided articles.

@@ -18,11 +18,55 @@ from models.qa import QAAnswer, QACitation, DEFAULT_GROQ_MODEL
 
 logger = logging.getLogger(__name__)
 
+# Register specifications per expertise level. These are deliberately DIVERGENT
+# (not one "technicality dial") so beginner and expert answers read as written for
+# genuinely different audiences — different vocabulary, framing, structure, and what
+# is included vs omitted. See Claire/RCSI feedback: the two modes must be clearly
+# differentiated, not the same answer with more/fewer words.
 COMPLEXITY_INSTRUCTIONS = {
-    "beginner": "Use simple, accessible language. Explain technical terms. Use analogies where helpful.",
-    "intermediate": "Use clear scientific language. Define complex terms when first introduced.",
-    "expert": "Use precise scientific terminology. Focus on methodology and statistical significance.",
+    "beginner": (
+        "Write for a curious non-specialist with no science background.\n"
+        "- Vocabulary: everyday words. If a technical term is unavoidable, define it in plain language the first time, in parentheses.\n"
+        "- Framing: start from what the reader already experiences (food, meals, the body) and connect the science to that.\n"
+        "- Use a concrete analogy or everyday example to make each key idea land.\n"
+        "- Structure: short sentences, one idea at a time; lead with the practical takeaway, then the 'why'.\n"
+        "- Omit: study designs, effect sizes, statistics, mechanism-level detail, and citations-as-argument. Reassure rather than caveat-heavily.\n"
+        "- Tone: warm, encouraging, and confident without oversimplifying to the point of being wrong."
+    ),
+    "intermediate": (
+        "Write for an informed general reader comfortable with basic science.\n"
+        "- Use clear scientific language; define complex terms when first introduced.\n"
+        "- Balance the practical takeaway with a brief, honest sense of the evidence behind it.\n"
+        "- Structure: readable prose with the conclusion first, then supporting reasoning."
+    ),
+    "expert": (
+        "Write for a nutrition/food-science professional or researcher.\n"
+        "- Vocabulary: precise scientific and clinical terminology; do NOT define common domain terms or use analogies — assume fluency.\n"
+        "- Framing: foreground mechanism, methodology, and the strength and shape of the evidence.\n"
+        "- Where the sources support it, be specific about study designs (RCT, cohort, meta-analysis), effect sizes/direction, and statistical or clinical significance.\n"
+        "- Structure: dense, information-first prose; no hand-holding, no motivational framing, no restating the question.\n"
+        "- Surface limitations, heterogeneity, and open questions the way you would for a knowledgeable colleague."
+    ),
 }
+
+
+def _format_prior_conversation(prior_conversation: Optional[str]) -> str:
+    """Render the running thread summary as a prompt block, or empty when absent.
+
+    Mode-agnostic on purpose: this carries the FACTS of the conversation so a
+    free-form follow-up ("what about for kids?") resolves, while expertise level
+    and wording register stay decided per answer. Returns "" when there is no
+    prior context so the ``{{prior_conversation}}`` slot collapses to nothing.
+    """
+    summary = (prior_conversation or "").strip()
+    if not summary:
+        return ""
+    return (
+        "\nPRIOR CONVERSATION (running summary of earlier turns in this thread; "
+        "use it to interpret follow-up questions, and avoid needlessly repeating "
+        "facts already given):\n"
+        f"{summary}\n"
+    )
 
 
 class QAAgent:
@@ -50,6 +94,7 @@ class QAAgent:
         language: str = "en",
         retriever: str = "rag",
         user_context: Optional[Dict[str, Any]] = None,
+        prior_conversation: Optional[str] = None,
     ) -> Tuple[QAAnswer, List[str]]:
         """
         Generate an answer using retrieved articles as context (RAG mode).
@@ -91,6 +136,7 @@ class QAAgent:
                 "complexity": complexity,
                 "language": language,
                 "answer_context": answer_context,
+                "prior_conversation": _format_prior_conversation(prior_conversation),
                 "question": question,
                 "source_context": source_context,
             },
@@ -109,6 +155,7 @@ class QAAgent:
         expertise_level: str = "intermediate",
         language: str = "en",
         user_context: Optional[Dict[str, Any]] = None,
+        prior_conversation: Optional[str] = None,
     ) -> Tuple[QAAnswer, List[str]]:
         """
         Generate an answer using only LLM parametric knowledge (no retrieval).
@@ -147,6 +194,7 @@ class QAAgent:
                 "complexity": complexity,
                 "language": language,
                 "answer_context": answer_context,
+                "prior_conversation": _format_prior_conversation(prior_conversation),
                 "question": question,
             },
             run_name="qa-answer-norag",

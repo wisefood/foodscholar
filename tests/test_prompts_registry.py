@@ -78,7 +78,8 @@ class TestPromptRegistry(unittest.TestCase):
         from langchain.prompts import ChatPromptTemplate
         from backend.prompts import QA_ANSWER_RAG_SYSTEM, QA_ANSWER_RAG_USER
         v = dict(expertise_level="expert", complexity="CX", language="en",
-                 answer_context="ACTX", question="Q?", source_context="SRC")
+                 answer_context="ACTX", prior_conversation="", question="Q?",
+                 source_context="SRC")
         tmpl = ChatPromptTemplate.from_messages([
             ("system", QA_ANSWER_RAG_SYSTEM.langchain()),
             ("human", QA_ANSWER_RAG_USER.langchain()),
@@ -90,7 +91,7 @@ class TestPromptRegistry(unittest.TestCase):
 EXPERTISE LEVEL: {v['expertise_level']}
 {v['complexity']}
 
-LANGUAGE: Respond in {v['language']}.
+LANGUAGE: Write EVERY natural-language string you output in {v['language']} — this includes the "answer" prose AND every entry in "follow_ups". Do not switch to English for the follow-up questions or for any technical term that has a normal {v['language']} equivalent. Only the following may stay in their original form: proper nouns (author names, place names, organizations), source URNs, and established scientific Latin terms with no common {v['language']} word. Never leave stray English words in an otherwise {v['language']} answer.
 
 ANSWER FORMULATION CONTEXT:
 {v['answer_context']}
@@ -142,7 +143,7 @@ IMPORTANT: Return ONLY the JSON object."""
         ])
         msgs = tmpl.format_messages(
             expertise_level="beginner", complexity="C", language="el",
-            answer_context="AC", question="WHATQ")
+            answer_context="AC", prior_conversation="", question="WHATQ")
         self.assertIn("beginner", msgs[0].content)
         self.assertIn('"overall_confidence": "high or medium or low"',
                       msgs[0].content)
@@ -155,25 +156,21 @@ IMPORTANT: Return ONLY the JSON object."""
         self.assertIn("Clarifier and Safety planner", out)
         self.assertIn('"risk_level": "low | medium | high"', out)
 
-    def test_qa_starter_matches_legacy(self):
+    def test_qa_starter_renders_and_constrains_register(self):
         from backend.prompts import QA_STARTER_QUESTIONS
-        count = 4
-        legacy = f"""You are creating starter questions that a user can ask an AI nutrition assistant.
-
-Generate exactly {count} short nutrition-science questions that can be submitted by an average user, not expert.
-
-Rules:
-- Questions must be directed to the ΑΙ, so the user can submit them. Dont us first-person wording.
-- Do NOT ask about the user's habits, preferences, or choices.
-- Do NOT use wording like "do you", "your", "what's your", or "go-to".
-- Do NOT generate meal-planning or food-suggestion content (no lunch/dinner/snack/recipe/menu/prep ideas).
-- Focus on general nutrition science, food composition, and evidence-based concepts.
-- Keep each question <= 16 words.
-- Avoid diagnosis, treatments, and supplement dosage advice.
-- Return ONLY valid JSON in this format:
-{{"questions": ["q1", "q2", "q3", "q4"]}}
-"""
-        self.assertEqual(QA_STARTER_QUESTIONS.compile(count=count), legacy)
+        out = QA_STARTER_QUESTIONS.compile(count=4, language="sl")
+        # Variables substituted, no leftover mustache.
+        self.assertNotIn("{{", out)
+        self.assertIn("exactly 4", out)
+        self.assertIn("Write every question in sl", out)
+        # Register: aimed at everyday household users, not academic phrasing.
+        self.assertIn("household", out.lower())
+        self.assertIn("everyday", out.lower())
+        # Guards the exact over-academic phrasings Claire (RCSI) flagged.
+        self.assertIn("microbiota", out)
+        self.assertIn("Explain how", out)
+        # JSON output contract preserved.
+        self.assertIn('{"questions": ["q1", "q2", "q3", "q4"]}', out)
 
     def test_qa_tips_from_guidelines_matches_legacy(self):
         from backend.prompts import QA_TIPS_FROM_GUIDELINES

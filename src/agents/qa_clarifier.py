@@ -16,6 +16,7 @@ except Exception as exc:  # pragma: no cover
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
 from backend.prompts import QA_CLARIFIER_SYSTEM
+from agents.clarifier_fallback_i18n import localize as _clarify_i18n
 from models.qa import (
     ClarificationOption,
     ClarificationRequest,
@@ -160,6 +161,32 @@ def _merge_with_fallback(
     return plan
 
 
+def _localized_clarification(
+    clarification_id: str,
+    option_values: list[str],
+    language: Optional[str],
+) -> ClarificationRequest:
+    """Build a single-choice fallback clarification with localized user-facing text.
+
+    ``clarification_id`` and ``option_values`` are canonical (English/stable) and
+    drive matching/retrieval; only the question, option labels, and reason are
+    localized via the i18n table (English fallback when the language is unknown).
+    """
+    strings = _clarify_i18n(clarification_id, language)
+    labels = strings.get("labels", {}) if isinstance(strings, dict) else {}
+    return ClarificationRequest(
+        id=clarification_id,
+        question=str(strings.get("question", "")),
+        input_type="single_choice",
+        options=[
+            ClarificationOption(label=labels.get(value, value), value=value)
+            for value in option_values
+        ],
+        allow_free_text=True,
+        reason=strings.get("reason"),
+    )
+
+
 def _fallback_clarification(
     *,
     question_lower: str,
@@ -167,23 +194,17 @@ def _fallback_clarification(
     user_context: QAUserContext,
     answered_ids: Set[str],
 ) -> Optional[ClarificationRequest]:
+    language = request.language
+
     if (
         "target_age_group" not in answered_ids
         and _mentions_minor_without_age(question_lower)
         and not user_context.member_age_group
     ):
-        return ClarificationRequest(
-            id="target_age_group",
-            question="Who is the nutrition guidance for?",
-            input_type="single_choice",
-            options=[
-                ClarificationOption(label="Infant", value="infant"),
-                ClarificationOption(label="Child", value="child"),
-                ClarificationOption(label="Teen", value="teen"),
-                ClarificationOption(label="Adult", value="adult"),
-            ],
-            allow_free_text=True,
-            reason="Age materially changes safe nutrition advice.",
+        return _localized_clarification(
+            "target_age_group",
+            ["infant", "child", "teen", "adult"],
+            language,
         )
 
     if (
@@ -192,46 +213,25 @@ def _fallback_clarification(
         and not user_context.country
         and not request.member_id
     ):
-        return ClarificationRequest(
-            id="country_or_region",
-            question="Which country or guideline region should the answer use?",
-            input_type="single_choice",
-            options=[
-                ClarificationOption(label="United States", value="US"),
-                ClarificationOption(label="European Union", value="EU"),
-                ClarificationOption(label="United Kingdom", value="UK"),
-                ClarificationOption(label="Greece", value="GR"),
-                ClarificationOption(label="No preference", value="general"),
-            ],
-            allow_free_text=True,
-            reason="Food-based recommendations can differ by country or guideline region.",
+        return _localized_clarification(
+            "country_or_region",
+            ["US", "EU", "UK", "GR", "general"],
+            language,
         )
 
     if (
         "safety_context" not in answered_ids
         and _looks_like_supplement_safety_question(question_lower)
     ):
-        return ClarificationRequest(
-            id="safety_context",
-            question="Is there any relevant safety context?",
-            input_type="single_choice",
-            options=[
-                ClarificationOption(label="None", value="none"),
-                ClarificationOption(
-                    label="Pregnant or breastfeeding",
-                    value="pregnancy_or_breastfeeding",
-                ),
-                ClarificationOption(
-                    label="Chronic condition",
-                    value="chronic_condition",
-                ),
-                ClarificationOption(
-                    label="Medication or supplement use",
-                    value="medication_or_supplement",
-                ),
+        return _localized_clarification(
+            "safety_context",
+            [
+                "none",
+                "pregnancy_or_breastfeeding",
+                "chronic_condition",
+                "medication_or_supplement",
             ],
-            allow_free_text=True,
-            reason="Conditions and medications can change supplement safety advice.",
+            language,
         )
 
     return None
