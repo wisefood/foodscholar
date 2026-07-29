@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from backend.elastic import ELASTIC_CLIENT
 from models.qa import QAClarifierSafetyPlan, QAUserContext, RetrievedSource
+from services.article_policy import article_filter_query
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class RetrieverAdapter(Protocol):
         plan: QAClarifierSafetyPlan,
         top_k: int,
         user_context: Optional[QAUserContext],
+        expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
         ...
 
@@ -52,6 +54,7 @@ class NoRagRetrieverAdapter:
         plan: QAClarifierSafetyPlan,
         top_k: int,
         user_context: Optional[QAUserContext],
+        expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
         return RetrievalResult(
             status={
@@ -75,7 +78,10 @@ class LinearragRetrieverAdapter:
         plan: QAClarifierSafetyPlan,
         top_k: int,
         user_context: Optional[QAUserContext],
+        expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
+        # LinearRAG has no queryable policy fields, so reader visibility and
+        # tiers are enforced downstream by article_policy.filter_and_rank.
         try:
             from services.linearrag_service import retrieve as linearrag_retrieve
 
@@ -187,6 +193,7 @@ class ElasticRagRetrieverAdapter:
         plan: QAClarifierSafetyPlan,
         top_k: int,
         user_context: Optional[QAUserContext],
+        expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
         article_query = contextualize_query(
             plan.article_query or plan.canonical_question or question,
@@ -199,6 +206,7 @@ class ElasticRagRetrieverAdapter:
         article_payloads, article_sources, article_status = self._retrieve_articles(
             article_query,
             top_k,
+            expertise_level=expertise_level,
         )
         guideline_top_k = min(max(top_k, 1), QA_GUIDELINE_RAG_TOP_K_MAX)
         guideline_payloads, guideline_sources, guideline_status = (
@@ -227,6 +235,8 @@ class ElasticRagRetrieverAdapter:
         self,
         query: str,
         top_k: int,
+        *,
+        expertise_level: Optional[str] = None,
     ) -> tuple[List[Dict[str, Any]], List[RetrievedSource], Dict[str, Any]]:
         try:
             query_vector = self.embed_query(query)
@@ -236,9 +246,9 @@ class ElasticRagRetrieverAdapter:
                 k=top_k,
                 num_candidates=max(top_k * 20, 100),
                 field="embedding",
-                filter_query={
-                    "bool": {"must_not": {"term": {"status": "deleted"}}}
-                },
+                # Editorially restricted articles are excluded in the query
+                # rather than afterwards, so they never consume a top_k slot.
+                filter_query=article_filter_query(expertise_level),
                 source_excludes=["embedding"],
             )
         except Exception as exc:

@@ -56,6 +56,11 @@ def _request_trace_context(request: "QARequest") -> Dict[str, Optional[str]]:
         "session_id": request.qa_thread_id,
         "user_id": request.user_id or request.member_id,
     }
+from services.article_policy import (
+    article_filter_query,
+    filter_and_rank,
+    is_expert_audience,
+)
 from services.qa_retrievers import (
     QARetrieverAdapters,
     RetrievalResult,
@@ -650,6 +655,7 @@ class QAService:
             top_k=request.top_k,
             retriever=effective_retriever,
             user_context=user_context,
+            expertise_level=request.expertise_level,
         )
         if effective_rag:
             source_payloads = retrieval_result.source_payloads
@@ -859,20 +865,46 @@ class QAService:
         top_k: int,
         retriever: str,
         user_context: Optional[QAUserContext],
+        expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
-        """Retrieve evidence through the selected adapter."""
+        """
+        Retrieve evidence through the selected adapter, then apply editorial policy.
+
+        Articles the catalog marks as restricted for this audience are dropped and
+        the rest are re-ranked by indexing tier. The Elastic retriever already
+        excludes them in the query; this second pass covers retrievers that cannot
+        (LinearRAG) and applies the tier boost uniformly.
+        """
         self._retriever_adapters = QARetrieverAdapters(
             embed_query=self._embed_query,
             articles_index=self.INDEX_NAME,
             guidelines_index=self.GUIDELINES_INDEX_NAME,
         )
         adapter = self._retriever_adapters.get(retriever)
+
         result = adapter.retrieve(
             question=question,
             plan=plan,
             top_k=top_k,
             user_context=user_context,
+            expertise_level=expertise_level,
         )
+
+        before = len(result.source_payloads)
+        result.source_payloads, result.retrieved_sources = filter_and_rank(
+            result.source_payloads,
+            result.retrieved_sources,
+            expertise_level=expertise_level,
+            limit=top_k,
+        )
+        if len(result.source_payloads) != before:
+            result.status["editorial_policy"] = {
+                "expertise_level": expertise_level,
+                "expert_audience": is_expert_audience(expertise_level),
+                "payloads_before": before,
+                "payloads_after": len(result.source_payloads),
+            }
+
         logger.info("QA retrieval status: %s", result.status)
         return result
 
@@ -1563,6 +1595,7 @@ class QAService:
         top_k: int,
         retriever: str = "rag",
         user_context: Optional[QAUserContext] = None,
+        expertise_level: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
         plan = QAClarifierSafetyPlan(
             original_question=question,
@@ -1570,12 +1603,16 @@ class QAService:
             article_query=question,
             guideline_query=f"{question} dietary guideline recommendation",
         )
+        # Tips and secondary lookups go to every reader, so they default to the
+        # non-expert audience: expert-only articles stay out unless a caller
+        # says otherwise.
         result = self._retrieve_sources(
             question=question,
             plan=plan,
             top_k=top_k,
             retriever=retriever,
             user_context=user_context,
+            expertise_level=expertise_level,
         )
         return result.source_payloads, result.retrieved_sources
 
@@ -1584,6 +1621,7 @@ class QAService:
         question: str,
         top_k: int,
         user_context: Optional[QAUserContext] = None,
+        expertise_level: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
         """Retrieve article sources for default Elasticsearch RAG."""
         try:
@@ -1594,9 +1632,7 @@ class QAService:
                 k=top_k,
                 num_candidates=max(top_k * 20, 100),
                 field="embedding",
-                filter_query={
-                    "bool": {"must_not": {"term": {"status": "deleted"}}}
-                },
+                filter_query=article_filter_query(expertise_level),
                 source_excludes=["embedding"],
             )
         except Exception as e:

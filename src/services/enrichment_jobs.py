@@ -20,6 +20,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
+from services.article_policy import normalize_tier
+
 logger = logging.getLogger(__name__)
 
 
@@ -152,6 +154,13 @@ def extract_enrichment_fields(enriched_data: Dict[str, Any]) -> tuple:
     verdict = _clean_str_list(evaluation.get("verdict"), default=[])
     if verdict:
         enhance_fields["ai_key_takeaways"] = verdict[:3]
+
+    # The agent's tier is a proposal, written to the AI-owned field. An editor's
+    # `indexing_tier` (set from the console) overrides it at retrieval time and
+    # is never touched here, so re-enrichment cannot undo an editorial decision.
+    proposed_tier = normalize_tier(evaluation.get("indexing_tier"))
+    if proposed_tier is not None:
+        enhance_fields["ai_indexing_tier"] = proposed_tier
 
     # Standard article fields should be updated via PATCH /articles/{urn} (save),
     # not via /enhance.
