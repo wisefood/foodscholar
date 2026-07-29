@@ -5,14 +5,14 @@ Runs keyword extraction, homogenization, and full article enrichment.
 
 import json
 import logging
+import re
 import unicodedata
 import copy
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from collections import Counter, defaultdict
 
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
 from backend.prompts import (
@@ -55,6 +55,86 @@ _DEFAULT_ANNOTATION_OUTPUT: Dict[str, Any] = {
 }
 
 
+# gpt-oss-20b is a reasoning model: without an explicit token budget and
+# minimal reasoning it spends the whole completion on hidden reasoning and
+# returns empty (or truncated) content, which then fails JSON parsing. The
+# annotation payload is the largest in the codebase (glossary + 3x3 Q&A), so
+# it needs a correspondingly generous budget.
+_ANNOTATION_MAX_TOKENS = 8192
+_KEYWORD_MAX_TOKENS = 1024
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` block in ``text``, if any."""
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _parse_json_object(content: str) -> Dict[str, Any]:
+    """
+    Parse a JSON object out of raw model output.
+
+    Tolerates the usual small-model deviations: Markdown fences, prose or
+    reasoning around the payload, trailing commas and control characters.
+
+    Raises:
+        ValueError: if no JSON object can be recovered from ``content``.
+    """
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("model returned empty content")
+
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    candidates = [text]
+    extracted = _extract_first_json_object(text)
+    if extracted and extracted != text:
+        candidates.append(extracted)
+
+    last_error: Optional[Exception] = None
+    for candidate in candidates:
+        for variant in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+            try:
+                parsed = json.loads(variant)
+            except Exception as e:  # noqa: BLE001 - any decode failure is a retry
+                last_error = e
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            last_error = ValueError(f"expected a JSON object, got {type(parsed).__name__}")
+
+    raise ValueError(f"unparseable model output: {last_error}")
+
+
 class EnrichmentAgent:
     """
     Agent for enriching scientific articles with annotations and metadata.
@@ -87,10 +167,16 @@ class EnrichmentAgent:
             temperature: LLM temperature for deterministic output (default: 0.0)
         """
         self.keyword_llm = GROQ_CHAT.get_client(
-            model=keyword_model, temperature=temperature
+            model=keyword_model,
+            temperature=temperature,
+            max_tokens=_KEYWORD_MAX_TOKENS,
+            reasoning_effort="low",
         )
         self.annotation_llm = GROQ_CHAT.get_client(
-            model=annotation_model, temperature=temperature
+            model=annotation_model,
+            temperature=temperature,
+            max_tokens=_ANNOTATION_MAX_TOKENS,
+            reasoning_effort="low",
         )
 
     @staticmethod
@@ -152,11 +238,22 @@ class EnrichmentAgent:
             ),
         )
 
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        text = content.strip()
+        if "```json" in text:
+            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+        elif "```" in text:
+            text = text.split("```", 1)[1].split("```", 1)[0].strip()
+        # The model sometimes prefixes the array with a sentence of reasoning.
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            text = match.group(0)
+
         try:
-            data = json.loads(response.content)
+            data = json.loads(text)
             return [k for k in data if isinstance(k, str)][:10]
         except Exception:
-            logger.error(f"Keyword JSON invalid: {response.content}")
+            logger.error("Keyword JSON invalid: %.500r", content)
             return []
 
     def extract_keywords(self, abstract: str) -> List[str]:
@@ -337,6 +434,53 @@ class EnrichmentAgent:
 
         return enriched
 
+    def _invoke_annotation(self, chain, article, attempts: int = 2) -> Dict[str, Any]:
+        """
+        Run the annotation chain and parse its JSON payload.
+
+        Reasoning models occasionally return an empty completion (the whole
+        token budget went to hidden reasoning) or wrap the JSON in prose. Both
+        are transient, so retry once before giving up.
+
+        Raises:
+            ValueError: if no attempt produced a parseable JSON object.
+        """
+        payload = {
+            "title": article.title,
+            "abstract": article.abstract,
+            "authors": article.authors,
+        }
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            response = chain.invoke(
+                payload,
+                config=build_trace_config(
+                    run_name="enrichment-annotation",
+                    tags=["enrichment", "annotation"],
+                ),
+            )
+            content = getattr(response, "content", response)
+            if not isinstance(content, str):
+                content = str(content)
+
+            try:
+                return _parse_json_object(content)
+            except ValueError as e:
+                last_error = e
+                logger.warning(
+                    "Annotation JSON unusable for %s (attempt %d/%d): %s | raw=%.500r",
+                    getattr(article, "urn", "<unknown>"),
+                    attempt,
+                    attempts,
+                    e,
+                    content,
+                )
+
+        raise ValueError(
+            f"Annotation model returned no usable JSON after {attempts} attempts: {last_error}"
+        )
+
     def enrich_article(self, article) -> Dict[str, Any]:
         """
         Enrich a scientific article with annotations, keywords, and Q&A.
@@ -358,28 +502,20 @@ class EnrichmentAgent:
         # Extract and normalize keywords from abstract
         keywords = self.extract_keywords(article.abstract)
 
-        # Build the annotation chain for full article enrichment
+        # Build the annotation chain for full article enrichment. The JSON is
+        # parsed by hand rather than with JsonOutputParser so that empty or
+        # noisy completions can be salvaged and retried instead of blowing up
+        # the whole job.
         enrichment_chain = (
             PromptTemplate(
                 input_variables=["title", "abstract", "authors"],
                 template=ENRICHMENT_ANNOTATION.langchain(),
             )
             | self.annotation_llm
-            | JsonOutputParser()
         )
 
         # Generate enrichment annotations
-        enriched = enrichment_chain.invoke(
-            {
-                "title": article.title,
-                "abstract": article.abstract,
-                "authors": article.authors,
-            },
-            config=build_trace_config(
-                run_name="enrichment-annotation",
-                tags=["enrichment", "annotation"],
-            ),
-        )
+        enriched = self._invoke_annotation(enrichment_chain, article)
 
         enriched = self._normalize_enriched(enriched, article.abstract)
 
