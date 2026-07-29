@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 class ArticleInput(BaseModel):
     """Input model for article enrichment."""
@@ -36,3 +36,83 @@ class EnrichmentResponse(BaseModel):
     annotations: Dict[str, Any] = Field(
         description="Simplified abstract, glossary, and Q&A sections"
     )
+
+
+class EnrichmentJobRequest(BaseModel):
+    """Options for queuing a selective enrichment job."""
+
+    force: bool = Field(
+        default=False,
+        description=(
+            "Re-enrich even if the article was already processed. Clears the "
+            "sweeper's processed/failed bookkeeping first."
+        ),
+    )
+    requested_by: Optional[str] = Field(
+        default=None, description="Identifier of the operator who requested the run"
+    )
+
+
+class EnrichmentBatchRequest(EnrichmentJobRequest):
+    """Options for queuing selective enrichment for several articles."""
+
+    urns: List[str] = Field(
+        min_length=1,
+        max_length=200,
+        description="Article URNs to enrich",
+    )
+
+
+class EnrichmentJobStatus(BaseModel):
+    """Combined on-demand job state and sweeper bookkeeping for one article."""
+
+    urn: str = Field(description="Article URN")
+    status: str = Field(
+        description="queued | running | succeeded | failed | not_found"
+    )
+    job_id: Optional[str] = Field(default=None, description="Latest job identifier")
+    enqueued_at: Optional[str] = Field(default=None, description="When the job was queued")
+    started_at: Optional[str] = Field(default=None, description="When processing began")
+    completed_at: Optional[str] = Field(default=None, description="When processing ended")
+    error: Optional[str] = Field(default=None, description="Failure reason, if any")
+    result: Optional[Dict[str, Any]] = Field(
+        default=None, description="Summary of what the last successful run wrote"
+    )
+    processed: bool = Field(
+        default=False, description="Article is in the sweeper's processed set"
+    )
+    permanently_failed: bool = Field(
+        default=False, description="Article exceeded sweeper retries"
+    )
+
+
+class EnrichmentBatchResponse(BaseModel):
+    """Result of a batch enqueue."""
+
+    total: int = Field(description="Number of distinct URNs queued or already in flight")
+    jobs: List[EnrichmentJobStatus] = Field(description="Per-article job state")
+
+
+class EnrichmentResetResponse(BaseModel):
+    """Result of clearing sweeper bookkeeping for an article."""
+
+    urn: str = Field(description="Article URN")
+    cleared_processed: bool = Field(description="Removed from the processed set")
+    cleared_failed: bool = Field(description="Removed from the permanently-failed set")
+
+
+class EnrichmentWorkerStatus(BaseModel):
+    """Combined status of both enrichment workers."""
+
+    sweeper: Dict[str, Any] = Field(
+        description="Catalog sweeper state (enabled, running, paused, stats, cursor)"
+    )
+    jobs: Dict[str, Any] = Field(
+        description="On-demand job worker state (running, pending_jobs, stats)"
+    )
+
+
+class SweeperPauseRequest(BaseModel):
+    """Pause or resume the catalog sweeper at runtime."""
+
+    paused: bool = Field(description="True to pause the sweeper, False to resume it")

@@ -54,6 +54,16 @@ class Config:
         self.settings["WORKER_POLL_INTERVAL"] = int(
             os.getenv("WORKER_POLL_INTERVAL", "10")
         )
+
+        # Selective (on-demand) enrichment worker. Deliberately independent of
+        # ENABLE_BACKGROUND_WORKER: the console must be able to enrich a single
+        # article while the catalog sweeper is stopped or paused.
+        self.settings["ENABLE_ENRICHMENT_JOB_WORKER"] = (
+            os.getenv("ENABLE_ENRICHMENT_JOB_WORKER", "true").lower() == "true"
+        )
+        self.settings["ENRICHMENT_JOB_POLL_INTERVAL"] = int(
+            os.getenv("ENRICHMENT_JOB_POLL_INTERVAL", "5")
+        )
         self.settings["POSTGRES_HOST"] = os.getenv("POSTGRES_HOST", "localhost")
         self.settings["POSTGRES_PORT"] = int(os.getenv("POSTGRES_PORT", 5432))
         self.settings["POSTGRES_USER"] = os.getenv("POSTGRES_USER", "postgres")

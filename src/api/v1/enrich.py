@@ -1,20 +1,54 @@
 """Article enrichment API endpoints."""
 import logging
-from fastapi import APIRouter, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+
+from config import config
+from models.enrich import (
+    ArticleInput,
+    EnrichmentBatchRequest,
+    EnrichmentBatchResponse,
+    EnrichmentJobRequest,
+    EnrichmentJobStatus,
+    EnrichmentResetResponse,
+    EnrichmentResponse,
+    EnrichmentWorkerStatus,
+    SweeperPauseRequest,
+)
 from services.article_enricher import ArticleEnricher
-from models.enrich import ArticleInput, EnrichmentResponse
+from services.enrichment_jobs import (
+    ArticleNotFound,
+    EnrichmentJobService,
+    RedisUnavailable,
+)
+from workers.enrichment_job_worker import get_enrichment_job_worker
+from workers.enrichment_worker import get_worker
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/enrich", tags=["Enrichment"])
 
 article_enricher = ArticleEnricher()
+job_service = EnrichmentJobService()
+
+
+def _queue_unavailable(exc: Exception) -> HTTPException:
+    logger.error("Redis unavailable for enrichment jobs: %s", exc)
+    return HTTPException(
+        status_code=503,
+        detail="Enrichment job queue is unavailable",
+    )
 
 
 @router.post("/article", response_model=EnrichmentResponse)
 async def enrich_article(request: ArticleInput):
     """
     Enrich a scientific article with annotations, keywords, and Q&A.
+
+    Stateless: this accepts article metadata inline and returns the enrichment
+    without touching the catalog. To enrich and persist a catalog article, use
+    `POST /enrich/articles/{urn}`.
 
     This endpoint accepts article metadata and:
     1. Extracts and normalizes keywords from the abstract
@@ -53,3 +87,170 @@ async def enrich_article(request: ArticleInput):
             status_code=500,
             detail=f"Error enriching article: {str(e)}",
         )
+
+
+@router.post(
+    "/articles",
+    response_model=EnrichmentBatchResponse,
+    status_code=202,
+)
+async def enqueue_article_enrichment_batch(request: EnrichmentBatchRequest):
+    """
+    Queue selective enrichment for several catalog articles at once.
+
+    Duplicates within the batch are collapsed, and articles already queued or
+    running keep their existing job.
+    """
+    try:
+        job_service.enqueue_many(
+            request.urns,
+            force=request.force,
+            requested_by=request.requested_by,
+        )
+        statuses = job_service.get_statuses(request.urns)
+        return EnrichmentBatchResponse(total=len(statuses), jobs=statuses)
+    except ArticleNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.post(
+    "/articles/{urn:path}",
+    response_model=EnrichmentJobStatus,
+    status_code=202,
+)
+async def enqueue_article_enrichment(
+    urn: str,
+    request: Optional[EnrichmentJobRequest] = None,
+):
+    """
+    Queue selective enrichment for one catalog article.
+
+    The job is drained by the on-demand enrichment worker, which runs
+    independently of the catalog sweeper — selective enrichment keeps working
+    while the sweeper is paused or disabled.
+
+    If a job for this article is already queued or running, the existing job is
+    returned and no duplicate is enqueued. Pass `force=true` to re-enrich an
+    article that was already processed.
+    """
+    try:
+        job_service.enqueue(
+            urn,
+            force=(request.force if request else False),
+            requested_by=(request.requested_by if request else None),
+        )
+        return job_service.get_status(urn)
+    except ArticleNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.get("/jobs", response_model=EnrichmentBatchResponse)
+async def get_enrichment_statuses(
+    urns: list[str] = Query(
+        default=[],
+        description="Article URNs to look up (repeat the parameter per URN)",
+    ),
+):
+    """
+    Enrichment status for a set of articles.
+
+    Used by the console article list to badge each row without fetching a job
+    per article.
+    """
+    if not urns:
+        return EnrichmentBatchResponse(total=0, jobs=[])
+
+    try:
+        statuses = job_service.get_statuses(urns)
+        return EnrichmentBatchResponse(total=len(statuses), jobs=statuses)
+    except ArticleNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.get("/articles/{urn:path}", response_model=EnrichmentJobStatus)
+async def get_article_enrichment_status(urn: str):
+    """
+    Enrichment status for one article.
+
+    Merges the on-demand job record with the sweeper's processed/failed
+    bookkeeping, so an article enriched by either path reports as `succeeded`.
+    """
+    try:
+        return job_service.get_status(urn)
+    except ArticleNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.delete("/articles/{urn:path}", response_model=EnrichmentResetResponse)
+async def reset_article_enrichment(urn: str):
+    """
+    Clear sweeper bookkeeping for an article so it becomes eligible again.
+
+    Removes it from the processed and permanently-failed sets and clears its
+    retry counter. Does not delete enrichment already written to the catalog.
+    """
+    try:
+        return job_service.reset_article(urn)
+    except ArticleNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.get("/worker", response_model=EnrichmentWorkerStatus)
+async def get_enrichment_worker_status():
+    """
+    Status of both enrichment workers.
+
+    `sweeper` is the catalog-scanning worker (start/stop via
+    `ENABLE_BACKGROUND_WORKER`, pause/resume at runtime). `jobs` is the
+    on-demand worker that serves selective enrichment.
+    """
+    sweeper_enabled = bool(config.settings["ENABLE_BACKGROUND_WORKER"])
+    sweeper: dict = {"enabled": sweeper_enabled}
+    if sweeper_enabled:
+        sweeper.update(get_worker().get_stats())
+    else:
+        # Still report the pause flag so the console shows a consistent switch.
+        try:
+            sweeper["paused"] = job_service.is_sweeper_paused()
+        except RedisUnavailable:
+            sweeper["paused"] = None
+        sweeper["running"] = False
+
+    jobs_enabled = bool(config.settings["ENABLE_ENRICHMENT_JOB_WORKER"])
+    jobs: dict = {"enabled": jobs_enabled}
+    if jobs_enabled:
+        jobs.update(get_enrichment_job_worker().get_stats())
+    else:
+        jobs["running"] = False
+        jobs["pending_jobs"] = job_service.pending_jobs()
+
+    return EnrichmentWorkerStatus(sweeper=sweeper, jobs=jobs)
+
+
+@router.post("/worker/pause", response_model=EnrichmentWorkerStatus)
+async def set_sweeper_paused(request: SweeperPauseRequest):
+    """
+    Pause or resume the catalog sweeper at runtime.
+
+    The switch lives in Redis, so it applies to every API replica and survives
+    restarts. Selective enrichment jobs continue to be served while paused.
+    """
+    try:
+        job_service.set_sweeper_paused(request.paused)
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+    logger.info(
+        "Enrichment sweeper %s via API", "paused" if request.paused else "resumed"
+    )
+    return await get_enrichment_worker_status()

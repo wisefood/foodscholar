@@ -4,6 +4,11 @@ Simplified background enrichment worker running as a thread in the FastAPI app.
 This worker runs continuously in the background, scanning the data catalog
 and enriching articles. Uses Redis to prevent duplicate processing across
 multiple API replicas.
+
+Selective, per-article enrichment lives in ``workers.enrichment_job_worker``.
+Both share the persistence logic in ``services.enrichment_jobs`` so a manually
+enriched article is written exactly like a swept one, and both read the same
+Redis pause switch.
 """
 
 import logging
@@ -13,15 +18,25 @@ import time
 from typing import Optional, Dict, Any
 from datetime import datetime
 
+from services.enrichment_jobs import (
+    CatalogUnavailable,
+    EnrichmentJobService,
+    RedisUnavailable,
+    extract_enrichment_fields,
+    is_catalog_unavailable_error,
+    persist_enrichment,
+)
+
 logger = logging.getLogger(__name__)
 
-
-class RedisUnavailable(RuntimeError):
-    """Raised when Redis is required but unreachable."""
-
-
-class CatalogUnavailable(RuntimeError):
-    """Raised when the data-catalog API is unreachable."""
+__all__ = [
+    "BackgroundEnrichmentWorker",
+    "CatalogUnavailable",
+    "RedisUnavailable",
+    "get_worker",
+    "start_background_worker",
+    "stop_background_worker",
+]
 
 
 class BackgroundEnrichmentWorker:
@@ -44,6 +59,7 @@ class BackgroundEnrichmentWorker:
         *,
         redis_client: Optional[Any] = None,
         enrichment_agent: Optional[Any] = None,
+        job_service: Optional[EnrichmentJobService] = None,
     ):
         """
         Initialize the background worker.
@@ -74,6 +90,12 @@ class BackgroundEnrichmentWorker:
         else:
             self.enrichment_agent = enrichment_agent
 
+        # Shared with the on-demand worker: pause switch and Redis bookkeeping.
+        self.job_service = job_service or EnrichmentJobService(
+            redis_client=self.redis,
+            enrichment_agent=self.enrichment_agent,
+        )
+
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._shutdown_event = threading.Event()
@@ -91,24 +113,14 @@ class BackgroundEnrichmentWorker:
         self._catalog_down = False
         self._catalog_last_error_log_at = 0.0  # monotonic seconds
 
+        # Pause-state tracking (avoid log spam while parked)
+        self._paused = False
+
         logger.info("Background enrichment worker initialized")
 
     @staticmethod
     def _is_catalog_unavailable_error(exc: Exception) -> bool:
-        msg = str(exc).lower()
-        return any(
-            s in msg
-            for s in (
-                "connection refused",
-                "failed to establish a new connection",
-                "max retries exceeded",
-                "httpconnectionpool",
-                "newconnectionerror",
-                "read timed out",
-                "connect timeout",
-                "temporarily unavailable",
-            )
-        )
+        return is_catalog_unavailable_error(exc)
 
     def _redis_available(self) -> bool:
         """Best-effort check that Redis is reachable."""
@@ -270,106 +282,7 @@ class BackgroundEnrichmentWorker:
         Returns:
             Tuple of (enhance_fields, article_fields, extras_fields)
         """
-        # NOTE: The data-catalog `/enhance` endpoint currently validates `fields` keys
-        # and only accepts: ai_tags, ai_category, ai_key_takeaways.
-        enhance_fields: Dict[str, Any] = {}
-        article_fields: Dict[str, Any] = {}
-
-        def _clean_str_list(value: Any, *, default: Optional[list[str]] = None) -> list[str]:
-            if isinstance(value, str) and value.strip():
-                value = [value.strip()]
-            if not isinstance(value, list):
-                return default or []
-            cleaned: list[str] = []
-            for item in value:
-                if not isinstance(item, str):
-                    continue
-                s = item.strip()
-                if not s or s in cleaned:
-                    continue
-                cleaned.append(s)
-            return cleaned if cleaned or default is None else default
-
-        def _clean_optional_str(value: Any) -> Optional[str]:
-            if not isinstance(value, str):
-                return None
-            s = value.strip()
-            return s if s else None
-
-        combined_tags: list[str] = []
-        for src in (enriched_data.get("keywords"), enriched_data.get("tags")):
-            if isinstance(src, str) and src.strip():
-                src = [src.strip()]
-            if not isinstance(src, list):
-                continue
-            for t in src:
-                if not isinstance(t, str):
-                    continue
-                tt = t.strip()
-                if not tt or tt in combined_tags:
-                    continue
-                combined_tags.append(tt)
-        if combined_tags:
-            enhance_fields["ai_tags"] = combined_tags
-
-        keywords = _clean_str_list(enriched_data.get("keywords"), default=[])
-        tags = _clean_str_list(enriched_data.get("tags"), default=["Other"])
-        topics = _clean_str_list(enriched_data.get("topics"), default=["Other"])[:3]
-        hard_exclusion_flags = _clean_str_list(
-            enriched_data.get("hard_exclusion_flags"), default=["None"]
-        )
-
-        reader_group = _clean_optional_str(enriched_data.get("reader_group"))
-        age_group = _clean_optional_str(enriched_data.get("age_group"))
-        population_group = _clean_optional_str(enriched_data.get("population_group"))
-        geographic_context = enriched_data.get("geographic_context")
-        biological_model = _clean_optional_str(enriched_data.get("biological_model"))
-
-        study_type = _clean_optional_str(enriched_data.get("study_type"))
-        if study_type is not None:
-            enhance_fields["ai_category"] = study_type
-
-        try:
-            conf_val = enriched_data.get("annotation_confidence")
-            conf = float(conf_val) if conf_val is not None else None
-        except Exception:
-            conf = None
-        annotation_confidence = max(0.0, min(1.0, conf)) if conf is not None else None
-
-        evaluation = enriched_data.get("evaluation") if isinstance(enriched_data.get("evaluation"), dict) else {}
-        verdict = _clean_str_list(evaluation.get("verdict"), default=[])
-        if verdict:
-            enhance_fields["ai_key_takeaways"] = verdict[:3]
-
-        # Standard article fields should be updated via PATCH /articles/{urn} (save),
-        # not via /enhance.
-        article_fields["keywords"] = keywords
-        article_fields["tags"] = tags
-        article_fields["topics"] = topics
-        article_fields["hard_exclusion_flags"] = hard_exclusion_flags
-        if reader_group is not None:
-            article_fields["reader_group"] = reader_group
-        if age_group is not None:
-            article_fields["age_group"] = age_group
-        if population_group is not None:
-            article_fields["population_group"] = population_group
-        if isinstance(geographic_context, dict) and geographic_context:
-            article_fields["geographic_context"] = geographic_context
-        if biological_model is not None:
-            article_fields["biological_model"] = biological_model
-        if study_type is not None:
-            article_fields["study_type"] = study_type
-        if annotation_confidence is not None:
-            article_fields["annotation_confidence"] = annotation_confidence
-
-        # Everything else goes to extras
-        extras_fields = {
-            "annotations": enriched_data.get("annotations", {}),
-            "evaluation": evaluation,
-            "enriched_at": datetime.now().isoformat(),
-        }
-
-        return enhance_fields, article_fields, extras_fields
+        return extract_enrichment_fields(enriched_data)
 
     def _process_article(self, article) -> bool:
         """
@@ -421,43 +334,8 @@ class BackgroundEnrichmentWorker:
             # Enrich the article
             enriched_data = self.enrichment_agent.enrich_article(article)
 
-            # Extract fields
-            enhance_fields, article_fields, extras_fields = self._extract_enrichment_fields(
-                enriched_data
-            )
-
-            # Persist enrichment output first using the entity instance we already
-            # have (in-place), then attempt the optional /enhance call.
-            #
-            # Rationale: if /enhance fails it may leave the upstream client entity
-            # in a "dirty" state that causes subsequent save() to include ai_* keys,
-            # which the base PATCH schema rejects.
-            if enhance_fields:
-                extras_fields["enhance_agent"] = "foodscholar-v1"
-                extras_fields["enhance_fields"] = enhance_fields
-
-            original_sync = getattr(article, "sync", True)
-            try:
-                article.sync = False
-                for field_name, field_value in article_fields.items():
-                    setattr(article, field_name, field_value)
-                article.extras = extras_fields
-                try:
-                    article.save(only_dirty=True)
-                except Exception as save_err:
-                    if self._is_catalog_unavailable_error(save_err):
-                        raise CatalogUnavailable(str(save_err)) from save_err
-                    raise
-            finally:
-                article.sync = original_sync
-
-            if enhance_fields:
-                try:
-                    article.enhance_self(agent="foodscholar-v1", fields=enhance_fields)
-                except Exception as enhance_err:
-                    logger.warning(
-                        f"Enhance endpoint failed for article {article_id}; skipping /enhance. Error: {enhance_err}"
-                    )
+            # Shared with the on-demand worker so both paths write identically.
+            persist_enrichment(article, enriched_data)
 
             logger.info(f"Successfully enriched article {article_id}")
 
@@ -551,6 +429,22 @@ class BackgroundEnrichmentWorker:
                     logger.info("Redis connection restored. Resuming enrichment worker.")
                     self._redis_down = False
 
+                # Runtime pause switch (set from the console). Honored by every
+                # replica; selective enrichment jobs keep running while parked.
+                if self.job_service.is_sweeper_paused():
+                    if not self._paused:
+                        logger.info(
+                            "Enrichment sweeper paused via runtime switch. "
+                            "Selective enrichment jobs are unaffected."
+                        )
+                        self._paused = True
+                    self._shutdown_event.wait(timeout=self.poll_interval)
+                    continue
+
+                if self._paused:
+                    logger.info("Enrichment sweeper resumed via runtime switch.")
+                    self._paused = False
+
                 # Get current cursor position
                 cursor = self._get_cursor()
 
@@ -635,9 +529,14 @@ class BackgroundEnrichmentWorker:
             cursor = self._get_cursor()
         except RedisUnavailable:
             cursor = None
+        try:
+            paused = self.job_service.is_sweeper_paused()
+        except RedisUnavailable:
+            paused = None
         return {
             **self.stats,
             "running": self._running,
+            "paused": paused,
             "cursor": cursor,
             "uptime_seconds": (
                 (

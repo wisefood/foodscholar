@@ -1,11 +1,20 @@
-# Background Enrichment Worker
+# Background Enrichment Workers
 
-A simplified background worker that runs as a thread within your FastAPI application, continuously enriching articles from the data catalog.
+FoodScholar runs **two** enrichment workers as daemon threads inside the FastAPI app:
+
+| Worker | Module | What it does | Toggle |
+| --- | --- | --- | --- |
+| **Sweeper** | `workers/enrichment_worker.py` | Walks the whole catalog in cursor order and enriches everything it has not seen | `ENABLE_BACKGROUND_WORKER` (default `false`) + runtime pause |
+| **Job worker** | `workers/enrichment_job_worker.py` | Drains a Redis queue of selective, per-article enrichment requests from the console | `ENABLE_ENRICHMENT_JOB_WORKER` (default `true`) |
+
+They are deliberately independent: **you can stop or pause the sweeper entirely and still enrich individual articles on demand.** Both share the persistence logic in `services/enrichment_jobs.py`, so a manually enriched article is written exactly like a swept one.
 
 ## Features
 
-- **Runs in Background**: Operates as a daemon thread in your FastAPI app
+- **Runs in Background**: Operates as daemon threads in your FastAPI app
 - **Multi-Replica Safe**: Uses Redis locks to prevent duplicate processing across replicas
+- **Runtime Pause**: Stop the sweeper without a redeploy; the switch lives in Redis and applies to every replica
+- **Selective Enrichment**: Queue one article (or a batch) from the WiseFood console
 - **Graceful Shutdown**: Stops cleanly when the app shuts down
 - **Automatic Retry**: Retries failed articles up to 3 times
 - **Simple Configuration**: Just set environment variables
@@ -48,15 +57,58 @@ curl http://localhost:8000/api/v1/worker/status
 Configure via environment variables:
 
 ```bash
-# Enable/disable the worker
+# Catalog sweeper
 ENABLE_BACKGROUND_WORKER=true
+WORKER_BATCH_SIZE=50        # Articles fetched per batch
+WORKER_POLL_INTERVAL=10     # Seconds between polling cycles
 
-# Number of articles to fetch per batch
-WORKER_BATCH_SIZE=50
-
-# Seconds to wait between polling cycles
-WORKER_POLL_INTERVAL=10
+# Selective (on-demand) enrichment worker
+ENABLE_ENRICHMENT_JOB_WORKER=true
+ENRICHMENT_JOB_POLL_INTERVAL=5
 ```
+
+## Selective Enrichment API
+
+All under `/api/v1/enrich`. The WiseFood console drives these through
+`/api/v1/foodscholar/enrich/*` on wisefood-api (admin/expert only).
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/enrich/articles/{urn}` | Queue one article. Body `{"force": true}` re-enriches an already-processed one. |
+| `POST` | `/enrich/articles` | Queue a batch: `{"urns": [...], "force": false}` |
+| `GET` | `/enrich/articles/{urn}` | Job status for one article |
+| `GET` | `/enrich/jobs?urns=a&urns=b` | Status for many articles (one call per page of the article list) |
+| `DELETE` | `/enrich/articles/{urn}` | Clear sweeper bookkeeping so the article is eligible again |
+| `GET` | `/enrich/worker` | Status of both workers |
+| `POST` | `/enrich/worker/pause` | `{"paused": true\|false}` — pause/resume the sweeper |
+
+Job statuses are `queued`, `running`, `succeeded`, `failed`, or `not_found`. An
+article the sweeper already handled reports `succeeded` even without an
+on-demand job record.
+
+### Stop automatic enrichment, enrich one article by hand
+
+```bash
+# Park the sweeper (every replica honors this immediately)
+curl -X POST localhost:8000/api/v1/enrich/worker/pause \
+  -H 'Content-Type: application/json' -d '{"paused": true}'
+
+# Enrich a single article — the job worker still serves this
+curl -X POST localhost:8000/api/v1/enrich/articles/urn:article:12345 \
+  -H 'Content-Type: application/json' -d '{"force": true}'
+
+# Watch it land
+curl localhost:8000/api/v1/enrich/articles/urn:article:12345
+
+# Resume the sweep when you are done
+curl -X POST localhost:8000/api/v1/enrich/worker/pause \
+  -H 'Content-Type: application/json' -d '{"paused": false}'
+```
+
+The same controls are available in the console at
+**Console → Asset Manager → Scientific Articles**: a worker card with a
+pause/resume switch, an enrichment badge and *Enrich* action per row, multi-select
+bulk enrichment, and a per-article panel on the article workspace page.
 
 ## How It Works
 
@@ -156,13 +208,23 @@ docker logs -f foodscholar-api
 
 ## Redis Data
 
-The worker uses these Redis keys:
+Shared bookkeeping:
 
 - `enrichment:processed` (SET) - IDs of successfully processed articles
+- `enrichment:failed` (SET) - IDs of permanently failed articles (exceeded retries)
+- `enrichment:retry:{article_id}` (STRING, 24h TTL) - Retry counts
+
+Sweeper only:
+
 - `enrichment:cursor` (STRING) - 0-based offset into the catalog (persists pagination across restarts)
 - `enrichment:lock:{article_id}` (STRING, 300s TTL) - Processing locks
-- `enrichment:retry:{article_id}` (STRING, 24h TTL) - Retry counts
-- `enrichment:failed` (SET) - IDs of permanently failed articles (exceeded retries)
+- `enrichment:sweeper:paused` (STRING) - `"1"` while the sweeper is paused; absent otherwise
+
+On-demand job worker:
+
+- `enrichment:jobs:queue` (LIST) - Queued selective enrichment requests
+- `enrichment:job:{urn}` (STRING, 7d TTL) - Job status and last-run summary
+- `enrichment:job:lock:{urn}` (STRING, 900s TTL) - Per-article processing locks
 
 ### Clear Processed Set
 
@@ -317,13 +379,22 @@ More replicas = faster processing (up to a point):
 
 ## Disable the Worker
 
-To disable temporarily without changing code:
+Prefer the runtime pause — it needs no redeploy, applies to every replica, and
+leaves selective enrichment working:
+
+```bash
+curl -X POST localhost:8000/api/v1/enrich/worker/pause \
+  -H 'Content-Type: application/json' -d '{"paused": true}'
+```
+
+To disable the sweeper thread outright:
 
 ```bash
 export ENABLE_BACKGROUND_WORKER=false
 ```
 
-Or remove the environment variable entirely (defaults to false).
+Or remove the environment variable entirely (defaults to false). The on-demand
+job worker is unaffected and keeps serving console requests.
 
 ## FAQ
 
@@ -334,10 +405,13 @@ A: No, Redis is required for distributed locking across replicas.
 A: The worker thread stops, but locks will expire after 5 minutes (300s). Articles can be reprocessed on next startup.
 
 **Q: Can I process only specific articles?**
-A: Currently, the worker processes all articles from the catalog. To customize, modify the `_run()` method in `background_enrichment.py` to add filters.
+A: Yes — `POST /api/v1/enrich/articles/{urn}`, or select rows in the console article list and use *Enrich selected*. This works while the sweeper is paused or disabled.
 
 **Q: How do I force reprocessing?**
-A: Clear the processed set: `redis-cli DEL enrichment:processed`
+A: Per article, `POST /api/v1/enrich/articles/{urn}` with `{"force": true}`. For the whole catalog, clear the processed set: `redis-cli DEL enrichment:processed`
+
+**Q: Does pausing the sweeper stop selective enrichment too?**
+A: No. The pause flag is only read by the sweeper loop. The on-demand job worker keeps draining its queue.
 
 **Q: Does this work with auto-scaling?**
 A: Yes! You can scale replicas up/down dynamically. Each replica's worker coordinates via Redis.

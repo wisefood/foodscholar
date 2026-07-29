@@ -19,6 +19,11 @@ from workers.enrichment_worker import (
     stop_background_worker,
     get_worker,
 )
+from workers.enrichment_job_worker import (
+    start_enrichment_job_worker,
+    stop_enrichment_job_worker,
+    get_enrichment_job_worker,
+)
 from workers.guideline_extraction_worker import (
     start_guideline_worker,
     stop_guideline_worker,
@@ -48,6 +53,9 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Starting background enrichment worker...")
         start_background_worker()
+    if config.settings["ENABLE_ENRICHMENT_JOB_WORKER"]:
+        logger.info("Starting selective enrichment job worker...")
+        start_enrichment_job_worker()
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         logger.info("Starting guideline extraction worker...")
         start_guideline_worker()
@@ -74,6 +82,9 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         logger.info("Stopping background enrichment worker...")
         stop_background_worker()
+    if config.settings["ENABLE_ENRICHMENT_JOB_WORKER"]:
+        logger.info("Stopping selective enrichment job worker...")
+        stop_enrichment_job_worker()
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         logger.info("Stopping guideline extraction worker...")
         stop_guideline_worker()
@@ -154,6 +165,11 @@ async def root():
         "endpoints": {
             "search_summaries": "/api/v1/search/summarize",
             "enrich_article": "/api/v1/enrich/article",
+            "enrich_catalog_article": "/api/v1/enrich/articles/{urn}",
+            "enrich_catalog_articles_batch": "/api/v1/enrich/articles",
+            "enrich_job_statuses": "/api/v1/enrich/jobs",
+            "enrich_worker_status": "/api/v1/enrich/worker",
+            "enrich_worker_pause": "/api/v1/enrich/worker/pause",
             "qa_ask": "/api/v1/qa/ask",
             "qa_feedback": "/api/v1/qa/feedback",
             "qa_models": "/api/v1/qa/models",
@@ -187,6 +203,8 @@ async def health_check():
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
         worker = get_worker()
         health_data["background_worker"] = worker.get_stats()
+    if config.settings["ENABLE_ENRICHMENT_JOB_WORKER"]:
+        health_data["enrichment_job_worker"] = get_enrichment_job_worker().get_stats()
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         guideline_worker = get_guideline_worker()
         health_data["guideline_worker"] = guideline_worker.get_stats()
