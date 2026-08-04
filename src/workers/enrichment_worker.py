@@ -161,6 +161,62 @@ class BackgroundEnrichmentWorker:
 
         logger.info("Background enrichment worker started")
 
+    def is_alive(self) -> bool:
+        """Whether the worker thread is actually running right now."""
+        return bool(self._thread and self._thread.is_alive())
+
+    def restart(self, *, resume: bool = True) -> dict:
+        """
+        Force the sweeper back into a running state.
+
+        Two things can leave it stopped in a way that ``start()`` alone will not
+        fix. The pause switch is a Redis key with no expiry, so a pause set
+        weeks ago silently survives every deploy. And if the worker thread died,
+        ``_running`` stays True, which makes ``start()`` decide it is already
+        running and return without doing anything.
+
+        This clears both: it drops the stale flag, joins any dead thread, and
+        starts a fresh one. ``resume`` additionally lifts the pause switch,
+        which is what an operator almost always means by "restart it".
+        """
+        was_alive = self.is_alive()
+        was_paused = None
+
+        if resume:
+            try:
+                was_paused = self.job_service.is_sweeper_paused()
+                if was_paused:
+                    self.job_service.set_sweeper_paused(False)
+            except Exception:
+                logger.warning(
+                    "Could not clear the sweeper pause switch during restart",
+                    exc_info=True,
+                )
+
+        # Tear down whatever is left, ignoring the _running bookkeeping that may
+        # be lying to us.
+        self._running = False
+        self._shutdown_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=30)
+        self._thread = None
+        self._paused = False
+
+        self.start()
+
+        logger.info(
+            "Enrichment sweeper restarted (thread was %s, pause switch was %s)",
+            "alive" if was_alive else "dead",
+            was_paused,
+        )
+        return {
+            "restarted": True,
+            "thread_was_alive": was_alive,
+            "pause_switch_was_set": was_paused,
+            "resumed": bool(resume and was_paused),
+            "running": self.is_alive(),
+        }
+
     def stop(self):
         """Stop the background worker thread gracefully."""
         if not self._running:
@@ -536,6 +592,11 @@ class BackgroundEnrichmentWorker:
         return {
             **self.stats,
             "running": self._running,
+            # `running` is bookkeeping and can outlive the thread; `alive` is
+            # the truth. A worker that is running-but-not-alive has died and
+            # needs a restart, not a resume.
+            "alive": self.is_alive(),
+            "stalled": bool(self._running and not self.is_alive()),
             "paused": paused,
             "cursor": cursor,
             "uptime_seconds": (

@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
+from agents.json_output import extract_first_json_object, parse_json_object
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
 from backend.prompts import (
@@ -64,75 +65,11 @@ _ANNOTATION_MAX_TOKENS = 8192
 _KEYWORD_MAX_TOKENS = 1024
 
 
-def _extract_first_json_object(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` block in ``text``, if any."""
-    start = text.find("{")
-    if start < 0:
-        return None
-
-    depth = 0
-    in_string = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
-
-
-def _parse_json_object(content: str) -> Dict[str, Any]:
-    """
-    Parse a JSON object out of raw model output.
-
-    Tolerates the usual small-model deviations: Markdown fences, prose or
-    reasoning around the payload, trailing commas and control characters.
-
-    Raises:
-        ValueError: if no JSON object can be recovered from ``content``.
-    """
-    text = (content or "").strip()
-    if not text:
-        raise ValueError("model returned empty content")
-
-    if "```json" in text:
-        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in text:
-        text = text.split("```", 1)[1].split("```", 1)[0].strip()
-
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-
-    candidates = [text]
-    extracted = _extract_first_json_object(text)
-    if extracted and extracted != text:
-        candidates.append(extracted)
-
-    last_error: Optional[Exception] = None
-    for candidate in candidates:
-        for variant in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
-            try:
-                parsed = json.loads(variant)
-            except Exception as e:  # noqa: BLE001 - any decode failure is a retry
-                last_error = e
-                continue
-            if isinstance(parsed, dict):
-                return parsed
-            last_error = ValueError(f"expected a JSON object, got {type(parsed).__name__}")
-
-    raise ValueError(f"unparseable model output: {last_error}")
+# Kept as module-level aliases: these names are referenced across this module
+# and by its tests, while the implementations are shared with the guideline
+# enrichment agent.
+_extract_first_json_object = extract_first_json_object
+_parse_json_object = parse_json_object
 
 
 class EnrichmentAgent:

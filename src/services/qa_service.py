@@ -64,7 +64,10 @@ from services.article_policy import (
 from services.qa_retrievers import (
     QARetrieverAdapters,
     RetrievalResult,
+    GUIDELINE_SOURCE_EXCLUDES,
+    guideline_base_query,
     guideline_context_should_clauses,
+    guideline_tip_pool_query,
 )
 from utilities.cache import CacheManager
 from exceptions import InvalidError
@@ -1674,29 +1677,8 @@ class QAService:
         context_should = self._guideline_context_should_clauses(user_context)
         body = {
             "size": top_k,
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "multi_match": {
-                                "query": question,
-                                "fields": [
-                                    "rule_text^4",
-                                    "title^2",
-                                    "notes",
-                                    "food_groups^2",
-                                    "target_populations",
-                                    "guide_region",
-                                    "country",
-                                    "population",
-                                ],
-                                "type": "best_fields",
-                            }
-                        }
-                    ],
-                    "must_not": [{"term": {"status": "deleted"}}],
-                }
-            },
+            "query": guideline_base_query(question),
+            "_source": {"excludes": GUIDELINE_SOURCE_EXCLUDES},
         }
         if context_should:
             body["query"]["bool"]["should"] = context_should
@@ -2094,6 +2076,12 @@ class QAService:
                         and publication_year.strip()
                         else None
                     ),
+                    # Link hints, so the citation resolves even if the rule
+                    # itself is no longer publicly readable.
+                    "source_type": item.get("source_type") or None,
+                    "guide_urn": item.get("guide_urn") or None,
+                    "page_no": item.get("page_no") or None,
+                    "region": item.get("region") or None,
                 },
             }
 
@@ -2138,12 +2126,8 @@ class QAService:
                     index_name=self.GUIDELINES_INDEX_NAME,
                     size=size,
                     seed=seed,
-                    filter_query={
-                        "bool": {
-                            "must": [{"exists": {"field": "rule_text"}}],
-                            "must_not": [{"term": {"status": "deleted"}}],
-                        }
-                    },
+                    filter_query=guideline_tip_pool_query(),
+                    source_excludes=GUIDELINE_SOURCE_EXCLUDES,
                 )
             except Exception:
                 logger.exception("Random guideline fetch failed for tips.")
@@ -2175,47 +2159,38 @@ class QAService:
         query: Optional[str],
     ) -> List[Dict[str, Any]]:
         """Search a topical-but-randomized guideline pool for daily tips."""
-        if not query:
-            return ELASTIC_CLIENT.random_search(
-                index_name=self.GUIDELINES_INDEX_NAME,
-                size=size,
-                seed=seed,
-                filter_query={
-                    "bool": {
-                        "must": [{"exists": {"field": "rule_text"}}],
-                        "must_not": [{"term": {"status": "deleted"}}],
-                    }
-                },
-            )
-
-        body = {
-            "bool": {
-                "must": [
-                    {"exists": {"field": "rule_text"}},
-                    {
-                        "multi_match": {
-                            "query": query,
-                            "fields": [
-                                "rule_text^4",
-                                "title^2",
-                                "notes",
-                                "food_groups^2",
-                                "target_populations",
-                                "guide_region",
-                            ],
-                            "type": "best_fields",
-                        }
-                    },
-                ],
-                "must_not": [{"term": {"status": "deleted"}}],
-            }
-        }
         return ELASTIC_CLIENT.random_search(
             index_name=self.GUIDELINES_INDEX_NAME,
             size=size,
             seed=seed,
-            filter_query=body,
+            filter_query=guideline_tip_pool_query(query),
+            source_excludes=GUIDELINE_SOURCE_EXCLUDES,
         )
+
+
+    @staticmethod
+    def _guideline_link_hints(guideline: dict) -> dict:
+        """
+        Where a tip's rule lives, carried alongside its id.
+
+        The id alone is only resolvable while the rule is publicly readable. A
+        rule that is later archived — or that was never activated — makes the
+        citation a dead end, because the client cannot look up which guide or
+        page it belonged to. Carrying the guide and page means the link still
+        lands somewhere useful.
+        """
+        pages = [
+            ref.get("page_start")
+            for ref in (guideline.get("source_refs") or [])
+            if isinstance(ref, dict) and ref.get("page_start")
+        ]
+        page_no = guideline.get("page_no") or (pages[0] if pages else None)
+        return {
+            "source_type": "guideline",
+            "guide_urn": guideline.get("guide_urn") or None,
+            "page_no": int(page_no) if isinstance(page_no, int) else None,
+            "region": guideline.get("guide_region") or None,
+        }
 
     def _generate_tip_candidates_from_guidelines(
         self, *, guidelines: List[Dict[str, Any]], candidate_count: int
@@ -2289,6 +2264,7 @@ class QAService:
                     "passage": self._extract_guideline_passage(guideline),
                     "title": guideline.get("title", None),
                     "publication_year": self._guideline_publication_year(guideline),
+                    **self._guideline_link_hints(guideline),
                 }
             )
 
@@ -2359,6 +2335,7 @@ class QAService:
                 "passage": self._extract_guideline_passage(guideline),
                 "title": guideline.get("title", None),
                 "publication_year": self._guideline_publication_year(guideline),
+                **self._guideline_link_hints(guideline),
             }
             for kind, text in (
                 ("tip", self._guideline_rule_to_tip(rule_text)),

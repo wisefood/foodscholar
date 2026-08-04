@@ -104,6 +104,51 @@ class Config:
             os.getenv("GUIDELINE_JOB_LOCK_TIMEOUT", "7200")
         )
 
+        # Guideline facet enrichment (post-extraction). Bumping the version
+        # re-enriches the whole corpus on the next run; records at or above the
+        # current version are skipped, so runs are resumable and repeatable.
+        self.settings["GUIDELINE_ENRICHMENT_VERSION"] = int(
+            os.getenv("GUIDELINE_ENRICHMENT_VERSION", "1")
+        )
+        self.settings["ENABLE_GUIDELINE_ENRICHMENT_WORKER"] = (
+            os.getenv("ENABLE_GUIDELINE_ENRICHMENT_WORKER", "true").lower() == "true"
+        )
+        self.settings["GUIDELINE_ENRICHMENT_WORKER_POLL_INTERVAL"] = int(
+            os.getenv("GUIDELINE_ENRICHMENT_WORKER_POLL_INTERVAL", "5")
+        )
+        self.settings["GUIDELINE_ENRICHMENT_QUEUE_KEY"] = os.getenv(
+            "GUIDELINE_ENRICHMENT_QUEUE_KEY", "guideline_enrichment:queue"
+        )
+        self.settings["GUIDELINE_ENRICHMENT_LOCK_PREFIX"] = os.getenv(
+            "GUIDELINE_ENRICHMENT_LOCK_PREFIX", "guideline_enrichment:lock"
+        )
+        self.settings["GUIDELINE_ENRICHMENT_LOCK_TIMEOUT"] = int(
+            os.getenv("GUIDELINE_ENRICHMENT_LOCK_TIMEOUT", "7200")
+        )
+
+        # Guideline retrieval mode: "bm25" (default) or "hybrid" (BM25 + kNN).
+        # Hybrid only helps once the guideline embedding backfill has run; until
+        # then the vector leg would favour the embedded minority.
+        self.settings["QA_GUIDELINE_RETRIEVAL_MODE"] = os.getenv(
+            "QA_GUIDELINE_RETRIEVAL_MODE", "bm25"
+        )
+        self.settings["QA_GUIDELINE_KNN_BOOST"] = float(
+            os.getenv("QA_GUIDELINE_KNN_BOOST", "1.0")
+        )
+
+        # How many rules one guide enriches at a time. The provider's rate
+        # limit is shared with extraction and every other replica, so this is
+        # deliberately modest rather than "as many as possible".
+        self.settings["GUIDELINE_ENRICHMENT_CONCURRENCY"] = int(
+            os.getenv("GUIDELINE_ENRICHMENT_CONCURRENCY", "8")
+        )
+        # A whole-job extraction failure is usually transient (a rate limit that
+        # outlasted the per-call backoff, a flaky download), so it is retried a
+        # bounded number of times before being recorded as failed.
+        self.settings["GUIDELINE_EXTRACTION_MAX_ATTEMPTS"] = int(
+            os.getenv("GUIDELINE_EXTRACTION_MAX_ATTEMPTS", "3")
+        )
+
         # Langfuse observability (opt-in). Tracing activates only when both
         # the public and secret keys are provided. The Langfuse SDK reads
         # these from the environment directly; they are registered here for

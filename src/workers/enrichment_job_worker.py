@@ -61,6 +61,38 @@ class EnrichmentJobWorker:
         self._thread.start()
         logger.info("Enrichment job worker started")
 
+    def is_alive(self) -> bool:
+        """Whether the worker thread is actually running right now."""
+        return bool(self._thread and self._thread.is_alive())
+
+    def restart(self) -> dict:
+        """
+        Force the job worker back into a running state.
+
+        ``start()`` short-circuits on ``_running``, which stays True if the
+        thread died, so a crashed worker can never be revived by start alone.
+        This tears the bookkeeping down first.
+        """
+        was_alive = self.is_alive()
+
+        self._running = False
+        self._shutdown_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=30)
+        self._thread = None
+
+        self.start()
+
+        logger.info(
+            "Enrichment job worker restarted (thread was %s)",
+            "alive" if was_alive else "dead",
+        )
+        return {
+            "restarted": True,
+            "thread_was_alive": was_alive,
+            "running": self.is_alive(),
+        }
+
     def stop(self) -> None:
         """Stop the worker thread gracefully."""
         if not self._running:
@@ -152,6 +184,8 @@ class EnrichmentJobWorker:
         return {
             **self.stats,
             "running": self._running,
+            "alive": self.is_alive(),
+            "stalled": bool(self._running and not self.is_alive()),
             "queue_key": self.job_service.QUEUE_KEY,
             "pending_jobs": self.job_service.pending_jobs(),
             "uptime_seconds": (

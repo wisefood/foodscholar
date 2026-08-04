@@ -13,6 +13,8 @@ from models.enrich import (
     EnrichmentJobStatus,
     EnrichmentResetResponse,
     EnrichmentResponse,
+    EnrichmentWorkerRestartRequest,
+    EnrichmentWorkerRestartResponse,
     EnrichmentWorkerStatus,
     SweeperPauseRequest,
 )
@@ -254,3 +256,61 @@ async def set_sweeper_paused(request: SweeperPauseRequest):
         "Enrichment sweeper %s via API", "paused" if request.paused else "resumed"
     )
     return await get_enrichment_worker_status()
+
+
+@router.post("/worker/restart", response_model=EnrichmentWorkerRestartResponse)
+async def restart_enrichment_workers(request: EnrichmentWorkerRestartRequest):
+    """
+    Force the enrichment workers back into a running state.
+
+    Resume is not always enough. Two states leave a worker stopped in a way the
+    pause switch cannot describe:
+
+    - The pause key in Redis has no expiry, so a pause set weeks ago survives
+      every deploy. The console shows "paused" and resuming works, but nobody
+      remembers who set it.
+    - A worker thread that died leaves `running: true` behind, and `start()`
+      reads that and decides there is nothing to do. The console shows
+      "running" while nothing is being processed.
+
+    This clears the pause switch and rebuilds the thread, so a worker that is
+    stale-paused, dead, or both comes back in one action.
+    """
+    result: dict = {"sweeper": None, "jobs": None}
+
+    if request.sweeper:
+        if config.settings["ENABLE_BACKGROUND_WORKER"]:
+            result["sweeper"] = get_worker().restart(resume=request.resume)
+        else:
+            # The thread is disabled by configuration, so there is nothing to
+            # revive — but the pause switch is still worth clearing, otherwise
+            # enabling the worker later starts it straight into a stale pause.
+            cleared = None
+            if request.resume:
+                try:
+                    cleared = job_service.is_sweeper_paused()
+                    if cleared:
+                        job_service.set_sweeper_paused(False)
+                except RedisUnavailable as exc:
+                    raise _queue_unavailable(exc) from exc
+            result["sweeper"] = {
+                "restarted": False,
+                "reason": "ENABLE_BACKGROUND_WORKER is off in this replica",
+                "pause_switch_was_set": cleared,
+                "resumed": bool(cleared),
+            }
+
+    if request.jobs:
+        if config.settings["ENABLE_ENRICHMENT_JOB_WORKER"]:
+            result["jobs"] = get_enrichment_job_worker().restart()
+        else:
+            result["jobs"] = {
+                "restarted": False,
+                "reason": "ENABLE_ENRICHMENT_JOB_WORKER is off in this replica",
+            }
+
+    logger.info("Enrichment workers restarted via API: %s", result)
+    status = await get_enrichment_worker_status()
+    return EnrichmentWorkerRestartResponse(
+        sweeper=result["sweeper"], jobs=result["jobs"], status=status
+    )

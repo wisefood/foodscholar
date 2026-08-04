@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from config import config
+from services.guideline_extractor import DEFAULT_PROFILE_PAGE_COUNT
 from services.guideline_jobs import (
     GuidelineJobQueueUnavailable,
     GuidelineJobService,
@@ -35,7 +36,7 @@ class BackgroundGuidelineExtractionWorker:
         self._shutdown_event = threading.Event()
         self._redis_down = False
 
-        self.stats = {"processed": 0, "failed": 0, "started_at": None}
+        self.stats = {"processed": 0, "failed": 0, "retried": 0, "started_at": None}
 
         logger.info("Background guideline extraction worker initialized")
 
@@ -106,6 +107,15 @@ class BackgroundGuidelineExtractionWorker:
         try:
             self.job_service.mark_running(job)
             storage = self.job_service.download_artifact_pdf(artifact_uuid)
+            guide_context = self.job_service.resolve_guide_context(job.get("guide_id"))
+            profile_document = job.get("profile_document", True)
+            if guide_context.is_empty() and not profile_document:
+                logger.warning(
+                    "Extracting %s with neither guide metadata nor document "
+                    "profiling; rules will carry no population unless the page "
+                    "states it.",
+                    artifact_uuid,
+                )
             output = self.job_service.extractor.process_pdf(
                 pdf_path=storage.pdf_path,
                 model=job.get("model"),
@@ -113,6 +123,10 @@ class BackgroundGuidelineExtractionWorker:
                 progress_callback=lambda current_page, total_pages: self._on_progress(
                     artifact_uuid, current_page, total_pages
                 ),
+                guide_context=guide_context,
+                profile_document=profile_document,
+                profile_page_count=job.get("profile_page_count")
+                or DEFAULT_PROFILE_PAGE_COUNT,
             )
             result = self.job_service.build_result(
                 artifact_uuid=artifact_uuid,
@@ -124,8 +138,13 @@ class BackgroundGuidelineExtractionWorker:
             self.stats["processed"] += 1
             logger.info("Completed guideline extraction for %s", artifact_uuid)
         except Exception as exc:
-            self.job_service.mark_failed(artifact_uuid, str(exc))
-            self.stats["failed"] += 1
+            # Transient failures are re-queued up to the attempt cap; only the
+            # final attempt records the job as failed.
+            outcome = self.job_service.retry_or_fail(artifact_uuid, job, str(exc))
+            if outcome.get("status") == "queued":
+                self.stats["retried"] += 1
+            else:
+                self.stats["failed"] += 1
             logger.error(
                 "Failed guideline extraction for %s: %s",
                 artifact_uuid,

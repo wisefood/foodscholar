@@ -5,8 +5,14 @@ from unittest.mock import patch
 class _FakeGuidelineSearchClient:
     def search(self, index, body):
         assert index == "guidelines"
-        assert "knn" not in str(body).lower()
-        assert "embedding" not in str(body).lower()
+        # Default retrieval is keyword-only: no vector leg unless hybrid mode
+        # is switched on. Checked structurally rather than by searching the
+        # serialized body for "embedding", because the query legitimately names
+        # that field in `_source.excludes`.
+        assert "knn" not in body
+        # The vector is never returned; once the corpus is embedded it would
+        # otherwise be the bulk of every hit.
+        assert body["_source"]["excludes"] == ["embedding"]
         fields = body["query"]["bool"]["must"][0]["multi_match"]["fields"]
         assert "rule_text^4" in fields
         return {

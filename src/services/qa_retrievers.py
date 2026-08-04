@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from backend.elastic import ELASTIC_CLIENT
+from config import config
 from models.qa import QAClarifierSafetyPlan, QAUserContext, RetrievedSource
 from services.article_policy import article_filter_query
 
@@ -311,33 +312,35 @@ class ElasticRagRetrieverAdapter:
 
         body = {
             "size": top_k,
-            "query": {
-                "bool": {
-                    "must": [
-                        {
-                            "multi_match": {
-                                "query": query,
-                                "fields": [
-                                    "rule_text^4",
-                                    "title^2",
-                                    "notes",
-                                    "food_groups^2",
-                                    "target_populations",
-                                    "guide_region",
-                                    "country",
-                                    "population",
-                                ],
-                                "type": "best_fields",
-                            }
-                        }
-                    ],
-                    "must_not": [{"term": {"status": "deleted"}}],
-                }
-            },
+            "query": guideline_base_query(query),
+            "_source": {"excludes": GUIDELINE_SOURCE_EXCLUDES},
         }
         context_should = guideline_context_should_clauses(user_context)
         if context_should:
             body["query"]["bool"]["should"] = context_should
+
+        mode = "keyword"
+        if guideline_hybrid_enabled():
+            # Rule sentences are short and paraphrase heavily, which is exactly
+            # where BM25 alone misses; the vector leg catches semantic matches
+            # the wording does not share. The gate applies to both legs.
+            try:
+                body["knn"] = {
+                    "field": "embedding",
+                    "query_vector": self.embed_query(query),
+                    "k": top_k,
+                    "num_candidates": max(top_k * 20, 100),
+                    "filter": guideline_retrieval_filter(),
+                    "boost": guideline_hybrid_knn_boost(),
+                }
+                mode = "hybrid"
+            except Exception as exc:
+                # A failed embedding call degrades to keyword search rather than
+                # failing the answer outright.
+                logger.warning(
+                    "Guideline hybrid retrieval unavailable, using keyword only: %s",
+                    exc,
+                )
 
         try:
             response = ELASTIC_CLIENT.client.search(
@@ -350,7 +353,7 @@ class ElasticRagRetrieverAdapter:
                 "ok": False,
                 "error": repr(exc),
                 "used_query": query,
-                "mode": "keyword",
+                "mode": mode,
             }
 
         payloads: List[Dict[str, Any]] = []
@@ -407,7 +410,7 @@ class ElasticRagRetrieverAdapter:
                 "ok": True,
                 "hit_count": len(payloads),
                 "used_query": query,
-                "mode": "keyword",
+                "mode": mode,
             },
         )
 
@@ -500,9 +503,119 @@ def score_value(value: Any) -> float:
         return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Guideline retrieval: the single source of truth
+#
+# Every path that surfaces a guideline to a user — QA answers, daily tips —
+# must build its query from the helpers below. Duplicating a query body is how
+# the editorial gate came to be enforced in one place and not the others.
+# ---------------------------------------------------------------------------
+
+# Only active guidelines are retrievable. Draft, archived, deprecated and
+# deleted rules stay in the catalog for editors but are never cited to a user
+# and never quoted in an answer. Activating a reviewed guide's rules is a
+# deliberate editorial act (POST /guidelines/editorial-policy in the catalog).
+GUIDELINE_ACTIVE_STATUS = "active"
+
+# Fields a guideline query searches. The facet fields carry real values only
+# once enrichment has run; before that they simply never match, which costs
+# nothing. Fields absent from the mapping are excluded on purpose — they match
+# nothing and quietly mislead anyone reading the query.
+# Never returned to a caller. Once guidelines carry vectors this is the bulk of
+# every hit's payload — 384 floats per result, parsed and discarded.
+GUIDELINE_SOURCE_EXCLUDES = ["embedding"]
+
+GUIDELINE_SEARCH_FIELDS = [
+    "rule_text^4",
+    "title^2",
+    "notes",
+    "topic^3",
+    "food_groups^2",
+    "nutrients^2",
+    "health_conditions^2",
+    "target_populations",
+    "life_stage^2",
+    "setting",
+    "guide_region",
+    "applicable_regions",
+]
+
+
+def guideline_retrieval_filter() -> List[Dict[str, Any]]:
+    """The editorial gate on every user-facing guideline query."""
+    return [{"term": {"status": GUIDELINE_ACTIVE_STATUS}}]
+
+
+def guideline_hybrid_enabled() -> bool:
+    """
+    Whether guideline retrieval combines BM25 with vector search.
+
+    Off by default: the vector leg is only useful once guidelines have been
+    embedded, and enabling it before the backfill completes would rank the
+    embedded minority above everything else.
+    """
+    return str(
+        config.settings.get("QA_GUIDELINE_RETRIEVAL_MODE", "bm25")
+    ).strip().lower() == "hybrid"
+
+
+def guideline_hybrid_knn_boost() -> float:
+    """Relative weight of the vector leg against BM25 in hybrid mode."""
+    try:
+        return float(config.settings.get("QA_GUIDELINE_KNN_BOOST", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def guideline_base_query(query: str) -> Dict[str, Any]:
+    """A gated BM25 query over the guideline index."""
+    return {
+        "bool": {
+            "must": [
+                {
+                    "multi_match": {
+                        "query": query,
+                        "fields": GUIDELINE_SEARCH_FIELDS,
+                        "type": "best_fields",
+                    }
+                }
+            ],
+            "filter": guideline_retrieval_filter(),
+        }
+    }
+
+
+def guideline_tip_pool_query(query: Optional[str] = None) -> Dict[str, Any]:
+    """
+    A gated query for the daily-tip guideline pool.
+
+    Tips are shown unprompted to every reader, so they run through the same
+    editorial gate as cited answers — arguably a stronger requirement, since
+    nobody asked for them.
+    """
+    must: List[Dict[str, Any]] = [{"exists": {"field": "rule_text"}}]
+    if query:
+        must.append(
+            {
+                "multi_match": {
+                    "query": query,
+                    "fields": GUIDELINE_SEARCH_FIELDS,
+                    "type": "best_fields",
+                }
+            }
+        )
+    return {"bool": {"must": must, "filter": guideline_retrieval_filter()}}
+
+
 def guideline_context_should_clauses(
     user_context: Optional[QAUserContext],
 ) -> List[Dict[str, Any]]:
+    """
+    Soft preferences for guidelines matching the asker's country and age group.
+
+    These only reorder results; nothing here excludes a guideline, so a user
+    with no context set still gets the full corpus ranked by relevance.
+    """
     if not user_context:
         return []
 
@@ -519,8 +632,7 @@ def guideline_context_should_clauses(
                     "query": term,
                     "fields": [
                         "guide_region^5",
-                        "country^5",
-                        "source^2",
+                        "applicable_regions^5",
                         "title",
                     ],
                     "type": "best_fields",
@@ -543,8 +655,9 @@ def guideline_context_should_clauses(
                     "query": term,
                     "fields": [
                         "target_populations^3",
-                        "population^3",
-                        "reader_group^2",
+                        "life_stage^3",
+                        "audience^2",
+                        "setting",
                         "notes",
                     ],
                     "type": "best_fields",

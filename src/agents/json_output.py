@@ -1,0 +1,147 @@
+"""
+Recovering JSON objects from raw LLM output.
+
+Shared by the article and guideline enrichment agents. The small models these
+agents run on deviate from strict JSON in predictable ways — Markdown fences,
+a sentence of reasoning before the payload, trailing commas, stray control
+characters — and every one of those is recoverable rather than a reason to
+discard the response.
+"""
+
+import json
+import re
+from typing import Any, Dict, Optional
+
+
+def extract_first_json_object(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` block in ``text``, if any."""
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def parse_json_object(content: str) -> Dict[str, Any]:
+    """
+    Parse a JSON object out of raw model output.
+
+    Raises:
+        ValueError: if no JSON object can be recovered from ``content``.
+    """
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("model returned empty content")
+
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+    candidates = [text]
+    extracted = extract_first_json_object(text)
+    if extracted and extracted != text:
+        candidates.append(extracted)
+
+    last_error: Optional[Exception] = None
+    for candidate in candidates:
+        for variant in (candidate, re.sub(r",\s*([}\]])", r"\1", candidate)):
+            try:
+                parsed = json.loads(variant)
+            except Exception as e:  # noqa: BLE001 - any decode failure is a retry
+                last_error = e
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            last_error = ValueError(
+                f"expected a JSON object, got {type(parsed).__name__}"
+            )
+
+    raise ValueError(f"unparseable model output: {last_error}")
+
+
+def clean_str(value: Any) -> Optional[str]:
+    """Return a stripped string, or None for anything empty or non-textual."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    # Models trained to always fill a field say "Not stated" instead of leaving
+    # it out; that is an absent value, not a value.
+    if cleaned.lower() in {"not stated", "unknown", "n/a", "none", "null"}:
+        return None
+    return cleaned
+
+
+def clean_str_list(
+    value: Any,
+    *,
+    allowed: Optional[list] = None,
+    lowercase: bool = True,
+    limit: Optional[int] = None,
+) -> list:
+    """
+    Normalize a list of strings, dropping empties and out-of-vocabulary values.
+
+    ``allowed`` enforces a closed vocabulary: anything the model invents is
+    discarded rather than written to the catalog.
+    """
+    if not isinstance(value, list):
+        return []
+
+    cleaned: list = []
+    for item in value:
+        text = clean_str(item)
+        if text is None:
+            continue
+        if lowercase:
+            text = text.lower().replace(" ", "_")
+        if allowed is not None and text not in allowed:
+            continue
+        if text not in cleaned:
+            cleaned.append(text)
+        if limit is not None and len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def clean_int(value: Any, *, minimum: Optional[int] = None) -> Optional[int]:
+    """Return an int, treating negatives (the "not stated" sentinel) as absent."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    if value < 0:
+        return None
+    if minimum is not None and value < minimum:
+        return None
+    return value
+
+
+def clean_confidence(value: Any) -> Optional[float]:
+    """Clamp a model-reported confidence into [0, 1], or None if unusable."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return max(0.0, min(1.0, float(value)))

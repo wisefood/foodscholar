@@ -116,3 +116,33 @@ class SweeperPauseRequest(BaseModel):
     """Pause or resume the catalog sweeper at runtime."""
 
     paused: bool = Field(description="True to pause the sweeper, False to resume it")
+
+
+class EnrichmentWorkerRestartRequest(BaseModel):
+    """Force the enrichment workers back into a running state."""
+
+    sweeper: bool = Field(default=True, description="Restart the catalog sweeper")
+    jobs: bool = Field(default=True, description="Restart the on-demand job worker")
+    resume: bool = Field(
+        default=True,
+        description=(
+            "Also clear the sweeper pause switch. This is what an operator "
+            "usually means by restart: a pause set long ago has no expiry and "
+            "survives every deploy, so restarting without clearing it would "
+            "start a fresh thread that immediately parks itself again."
+        ),
+    )
+
+
+class EnrichmentWorkerRestartResponse(BaseModel):
+    """What the restart actually did, plus the resulting worker status."""
+
+    sweeper: Optional[dict] = Field(
+        default=None, description="Sweeper restart outcome, or null if not requested"
+    )
+    jobs: Optional[dict] = Field(
+        default=None, description="Job worker restart outcome, or null if not requested"
+    )
+    status: "EnrichmentWorkerStatus" = Field(
+        description="Worker status after the restart"
+    )

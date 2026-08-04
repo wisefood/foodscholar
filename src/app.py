@@ -29,6 +29,10 @@ from workers.guideline_extraction_worker import (
     stop_guideline_worker,
     get_guideline_worker,
 )
+from workers.guideline_enrichment_worker import (
+    start_guideline_enrichment_worker,
+    stop_guideline_enrichment_worker,
+)
 from config import config
 
 # Initialize logger
@@ -59,6 +63,9 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         logger.info("Starting guideline extraction worker...")
         start_guideline_worker()
+    if config.settings.get("ENABLE_GUIDELINE_ENRICHMENT_WORKER", True):
+        logger.info("Starting guideline enrichment worker...")
+        start_guideline_enrichment_worker()
 
     # Idempotently sync prompts to Langfuse in the background. Non-blocking:
     # app startup never waits on (or fails due to) Langfuse availability.
@@ -88,6 +95,9 @@ async def lifespan(app: FastAPI):
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         logger.info("Stopping guideline extraction worker...")
         stop_guideline_worker()
+    if config.settings.get("ENABLE_GUIDELINE_ENRICHMENT_WORKER", True):
+        logger.info("Stopping guideline enrichment worker...")
+        stop_guideline_enrichment_worker()
 
     logger.info("App shutdown: closing DB connections")
     from backend.postgres import PostgresConnectionSingleton

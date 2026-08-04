@@ -475,6 +475,22 @@ class TipEvidence(BaseModel):
         default=None,
         description="Source date/year metadata (optional)",
     )
+    source_type: Optional[str] = Field(
+        default=None, description="'guideline' or 'article'"
+    )
+    guide_urn: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent guide of a guideline source. Lets a client deep-link even "
+            "when the rule itself is no longer publicly readable."
+        ),
+    )
+    page_no: Optional[int] = Field(
+        default=None, description="Page the rule came from, when known"
+    )
+    region: Optional[str] = Field(
+        default=None, description="Guide region, used to build the guide path"
+    )
 
 
 class TipWithEvidence(BaseModel):

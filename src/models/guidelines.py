@@ -4,7 +4,11 @@ from typing import List, Literal, Optional, cast
 
 from pydantic import BaseModel, Field, field_validator
 
-from services.guideline_extractor import get_default_dpi, get_default_model
+from services.guideline_extractor import (
+    DEFAULT_PROFILE_PAGE_COUNT,
+    get_default_dpi,
+    get_default_model,
+)
 
 GuidelineActionType = Literal[
     "eat",
@@ -65,6 +69,37 @@ class GuidelineExtractionRunRequest(BaseModel):
         le=300,
         description="Render DPI used when converting PDF pages to images",
     )
+    guide_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Guide identifier or URN whose metadata (title, region, audience, year) "
+            "is injected into the extraction prompts so rules extracted from a page "
+            "carry the guide's population context. Strongly recommended."
+        ),
+    )
+    profile_document: bool = Field(
+        default=True,
+        description=(
+            "Read the guide's opening pages to establish its title, region, and "
+            "above all the population it addresses, filling whatever the catalog "
+            "record leaves blank. Disable only to save the extra model call when "
+            "the catalog metadata is known to be complete."
+        ),
+    )
+    profile_page_count: int = Field(
+        default=DEFAULT_PROFILE_PAGE_COUNT,
+        ge=1,
+        le=20,
+        description="How many leading pages the document profile pass reads",
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Re-queue even when a job is already registered for this artifact. "
+            "The per-artifact lock still prevents two workers extracting the "
+            "same PDF, so this is safe; use it to recover a stalled job."
+        ),
+    )
 
 
 class GuidelineProcessedPage(BaseModel):
@@ -73,6 +108,10 @@ class GuidelineProcessedPage(BaseModel):
     page: int = Field(description="1-based page number")
     page_summary: str = Field(description="Short summary of the page content")
     guideline_count: int = Field(description="Number of guidelines extracted from the page")
+    continues_from_previous: bool = Field(
+        default=False,
+        description="Whether this page continued a table, list, or sentence from the previous page",
+    )
 
 
 class GuidelineSkippedPage(BaseModel):
@@ -81,13 +120,91 @@ class GuidelineSkippedPage(BaseModel):
     page: int = Field(description="1-based page number")
     decision: str = Field(description="Triage decision for the page")
     reason: str = Field(description="Why the page was skipped")
+    continues_from_previous: bool = Field(
+        default=False,
+        description="Whether this page continued a structure from the previous page",
+    )
+
+
+class GuidelineGuideContext(BaseModel):
+    """
+    Guide context injected into the extraction prompts.
+
+    Assembled from the catalog record plus, where that was silent, the guide
+    document itself. ``derived_fields`` names the values that came from the
+    document so a reviewer can see what was inferred rather than curated.
+    """
+
+    guide_urn: Optional[str] = None
+    title: Optional[str] = None
+    region: Optional[str] = None
+    audience: Optional[str] = None
+    target_audiences: List[str] = Field(default_factory=list)
+    language: Optional[str] = None
+    publication_year: Optional[int] = None
+    issuing_authority: Optional[str] = None
+    population_note: Optional[str] = Field(
+        default=None, description="Who the guidance is for, in the document's own terms"
+    )
+    age_min_months: Optional[int] = None
+    age_max_months: Optional[int] = None
+    scope_note: Optional[str] = None
+    evidence: List[str] = Field(
+        default_factory=list,
+        description="Verbatim quotes the document-derived values were based on",
+    )
+    derived_fields: List[str] = Field(
+        default_factory=list,
+        description="Context fields read from the document rather than the catalog record",
+    )
+
+
+class GuidelineDocumentProfile(BaseModel):
+    """Raw result of the profile pass over the guide's opening pages."""
+
+    title: Optional[str] = None
+    issuing_authority: Optional[str] = None
+    region: Optional[str] = None
+    language: Optional[str] = None
+    publication_year: Optional[int] = None
+    audience: Optional[str] = None
+    population_note: Optional[str] = None
+    age_min_months: Optional[int] = None
+    age_max_months: Optional[int] = None
+    scope_note: Optional[str] = None
+    evidence: List[str] = Field(default_factory=list)
+    pages_read: List[int] = Field(default_factory=list)
 
 
 class ExtractedGuidelineItem(BaseModel):
-    """A single extracted guideline sentence."""
+    """
+    A single extracted guideline sentence plus the facet hints the page supported.
+
+    Every field except ``page`` and ``text`` was added with extraction schema v2;
+    results persisted under v1 validate with all of them absent.
+    """
 
     page: int = Field(description="1-based source page number")
     text: str = Field(description="Extracted guideline text")
+    section_label: Optional[str] = Field(
+        default=None, description="Heading or table caption the rule sits under"
+    )
+    source_snippet: Optional[str] = Field(
+        default=None, description="Verbatim span from the page the rule is based on"
+    )
+    target_population_hint: Optional[str] = Field(
+        default=None, description="Free-text description of who the rule is for"
+    )
+    age_min_months: Optional[int] = Field(default=None)
+    age_max_months: Optional[int] = Field(default=None)
+    life_stage: List[str] = Field(default_factory=list)
+    setting: List[str] = Field(default_factory=list)
+    health_conditions: List[str] = Field(default_factory=list)
+    nutrients: List[str] = Field(default_factory=list)
+    guideline_type: Optional[str] = Field(default=None)
+    topic: List[str] = Field(default_factory=list)
+    action_type_hint: Optional[str] = Field(default=None)
+    confidence: Optional[float] = Field(default=None)
 
 
 class GuidelineArtifactStorageResponse(BaseModel):
@@ -128,14 +245,41 @@ class GuidelineExtractionResponse(BaseModel):
     unique_guidelines: List[str] = Field(
         description="Deduplicated guideline strings across the full document"
     )
+    schema_version: int = Field(
+        default=1,
+        description=(
+            "Extraction result schema version. 1 = per-rule {page, text} only; "
+            "2 = per-rule facet hints, provenance, and guide context. Results "
+            "stored before v2 keep their version and are imported accordingly."
+        ),
+    )
+    guide_context: Optional[GuidelineGuideContext] = Field(
+        default=None,
+        description="Guide context used during extraction (catalog record merged with the document profile)",
+    )
+    document_profile: Optional[GuidelineDocumentProfile] = Field(
+        default=None,
+        description="What the guide's opening pages said about the document, when profiling ran",
+    )
+    continuation_pages: List[int] = Field(
+        default_factory=list,
+        description="Pages that continued a structure from the preceding page",
+    )
 
 
 class GuidelineExtractionJobResponse(BaseModel):
     """Current queued/running/completed status for a guideline extraction job."""
 
     artifact_uuid: str = Field(description="Artifact UUID")
-    status: Literal["not_found", "queued", "running", "succeeded", "failed"] = Field(
-        description="Current job state"
+    status: Literal[
+        "not_found", "queued", "running", "succeeded", "failed", "stalled"
+    ] = Field(description="Current job state")
+    stalled: bool = Field(
+        default=False,
+        description=(
+            "The job claims to be running but no worker holds its lock — the "
+            "process handling it died. Re-queueing is safe and will pick it up."
+        ),
     )
     job_id: Optional[str] = Field(default=None, description="Latest job identifier for this artifact")
     model: Optional[str] = Field(default=None, description="Model requested for the latest job")
@@ -172,15 +316,28 @@ class GuidelineImportRequest(BaseModel):
     action_type: GuidelineActionType = Field(
         default=DEFAULT_GUIDELINE_ACTION_TYPE,
         description=(
-            "Action type to use for all newly created guidelines. "
-            "Legacy 'encourage' inputs are normalized to 'choose'."
+            "Fallback action type for guidelines whose extraction produced no "
+            "per-rule action hint. Legacy 'encourage' inputs normalize to 'choose'."
         ),
     )
-    existing_scan_limit: int = Field(
-        default=500,
+    existing_scan_limit: Optional[int] = Field(
+        default=None,
         ge=1,
-        le=5000,
-        description="Maximum number of existing guide guidelines to scan when deduping and calculating sequence numbers",
+        le=100000,
+        description=(
+            "Maximum number of existing guide guidelines to scan when deduping and "
+            "calculating sequence numbers. Omit to scan every existing guideline, "
+            "which is what correctness requires — a bounded scan silently misses "
+            "duplicates and can reuse sequence numbers on large guides."
+        ),
+    )
+    import_facets: bool = Field(
+        default=True,
+        description=(
+            "Carry per-rule facet hints (life stage, setting, nutrients, ...) and "
+            "source references from a v2 extraction result onto the created "
+            "guidelines. No effect on v1 results, which carry no hints."
+        ),
     )
 
     @field_validator("action_type", mode="before")
@@ -188,6 +345,50 @@ class GuidelineImportRequest(BaseModel):
     def validate_action_type(cls, value: str) -> GuidelineActionType:
         """Normalize backwards-compatible action type aliases before validation."""
         return normalize_guideline_action_type(value)
+
+
+class GuidelineEnrichmentEnqueueRequest(BaseModel):
+    """Request body for queueing guideline facet enrichment."""
+
+    guide_urns: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Guides to enrich. Omit to enrich every guide that has guidelines — "
+            "the backfill form."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Re-enrich guidelines that already reached the current enrichment "
+            "version. The catalog still refuses to overwrite human-edited values."
+        ),
+    )
+    allow_pdf_profile: bool = Field(
+        default=True,
+        description=(
+            "When a guide's catalog metadata does not establish who its rules are "
+            "for, read the guide's PDF to recover it. This is what gives the "
+            "already-extracted corpus its population context; disabling it makes "
+            "enrichment markedly weaker on thinly-catalogued guides."
+        ),
+    )
+
+
+class GuidelineEnrichmentPreviewRequest(BaseModel):
+    """Request body for previewing enrichment proposals for one guide."""
+
+    guide_urn: str = Field(description="Guide whose rules should be sampled")
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="How many of the guide's rules to run the agent over",
+    )
+    allow_pdf_profile: bool = Field(
+        default=True,
+        description="Read the guide's PDF when its metadata leaves the population unestablished",
+    )
 
 
 class GuidelineImportItemResponse(BaseModel):
@@ -204,6 +405,10 @@ class GuidelineImportItemResponse(BaseModel):
     )
     reason: Optional[str] = Field(default=None, description="Why the guideline was skipped, if applicable")
     created_id: Optional[str] = Field(default=None, description="Created guideline identifier")
+    facets: dict = Field(
+        default_factory=dict,
+        description="Facet fields and source references carried from the extraction result",
+    )
 
 
 class GuidelineImportResponse(BaseModel):
@@ -226,6 +431,17 @@ class GuidelineImportResponse(BaseModel):
     total_skipped: int = Field(description="Number of guidelines skipped because they already existed")
     next_sequence_no_start: int = Field(
         description="First proposed or assigned sequence number for this import batch"
+    )
+    schema_version: int = Field(
+        default=1,
+        description="Schema version of the extraction result that was imported",
+    )
+    existing_scan_complete: bool = Field(
+        default=True,
+        description=(
+            "False when a scan limit truncated the existing-guideline scan, meaning "
+            "dedupe and sequence numbering saw only part of the guide"
+        ),
     )
     items: List[GuidelineImportItemResponse] = Field(
         description="Per-guideline import outcomes in the order they were evaluated"

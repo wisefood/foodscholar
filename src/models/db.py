@@ -156,3 +156,40 @@ class GuidelineExtractionRecord(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class GuidelineEnrichmentRecord(Base):
+    """
+    Progress of the facet-enrichment pass over one guide's guidelines.
+
+    Keyed by guide rather than by rule: enrichment is driven per guide because
+    the guide's context is what every rule under it inherits, and that context
+    is resolved once per guide.
+    """
+
+    __tablename__ = "guideline_enrichments"
+    __table_args__ = {"schema": SCHEMA}
+
+    guide_urn = Column(String(512), primary_key=True)
+    status = Column(String(16), nullable=False, default="queued")
+    version = Column(Integer, nullable=False, default=1)
+    total = Column(Integer, nullable=False, default=0)
+    enriched = Column(Integer, nullable=False, default=0)
+    skipped_version = Column(Integer, nullable=False, default=0)
+    skipped_no_facets = Column(Integer, nullable=False, default=0)
+    failed = Column(Integer, nullable=False, default=0)
+    context_sources = Column(JSONB, nullable=True)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
