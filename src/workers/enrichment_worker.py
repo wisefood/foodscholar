@@ -50,6 +50,8 @@ class BackgroundEnrichmentWorker:
     - Automatic retry on failures
     """
 
+    JOIN_TIMEOUT_SECONDS = 30
+
     def __init__(
         self,
         batch_size: int = 50,
@@ -198,7 +200,33 @@ class BackgroundEnrichmentWorker:
         self._running = False
         self._shutdown_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=30)
+            self._thread.join(timeout=self.JOIN_TIMEOUT_SECONDS)
+
+        # A thread that would not join is still running the sweep loop. Starting
+        # a second one here would set `_running` back to True, which the old
+        # thread also reads — so both would process the queue, and every further
+        # restart would add another. Refuse instead and say why: the operator
+        # needs to know a restart did not happen, not be told it succeeded.
+        if self._thread and self._thread.is_alive():
+            logger.error(
+                "Enrichment sweeper thread did not stop within %ss; refusing to "
+                "start a second one",
+                self.JOIN_TIMEOUT_SECONDS,
+            )
+            return {
+                "restarted": False,
+                "reason": (
+                    f"The worker thread did not stop within "
+                    f"{self.JOIN_TIMEOUT_SECONDS}s. It is most likely blocked on "
+                    f"a model call. Retry shortly; the pause switch was still "
+                    f"cleared."
+                ),
+                "thread_was_alive": was_alive,
+                "pause_switch_was_set": was_paused,
+                "resumed": bool(resume and was_paused),
+                "running": True,
+            }
+
         self._thread = None
         self._paused = False
 

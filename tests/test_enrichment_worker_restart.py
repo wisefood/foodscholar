@@ -213,3 +213,64 @@ class TestRestartIsRepeatable:
 
         assert stats["running"] is True
         assert stats["stalled"] is True
+
+
+class TestUnstoppableThread:
+    """
+    A worker blocked mid-batch (typically inside a model call) will not honour
+    the shutdown event within the join window. Starting a fresh thread anyway
+    would leave two workers draining the same queue — and `start()` sets
+    `_running` back to True, which the stuck thread also reads, so it resumes
+    rather than winding down. Every retry would add another.
+    """
+
+    def test_sweeper_refuses_to_start_a_second_thread(self, sweeper):
+        sweeper.JOIN_TIMEOUT_SECONDS = 0.05
+        # A thread that ignores the shutdown event, like one blocked on a call.
+        release = threading.Event()
+        sweeper._run = lambda: release.wait()
+        sweeper.start()
+        assert _wait_until_alive(sweeper)
+        before = threading.active_count()
+
+        try:
+            result = sweeper.restart()
+
+            assert result["restarted"] is False
+            assert "did not stop" in result["reason"]
+            assert threading.active_count() == before
+        finally:
+            release.set()
+
+    def test_job_worker_refuses_to_start_a_second_thread(self, job_worker):
+        job_worker.JOIN_TIMEOUT_SECONDS = 0.05
+        release = threading.Event()
+        job_worker._run = lambda: release.wait()
+        job_worker.start()
+        assert _wait_until_alive(job_worker)
+        before = threading.active_count()
+
+        try:
+            result = job_worker.restart()
+
+            assert result["restarted"] is False
+            assert threading.active_count() == before
+        finally:
+            release.set()
+
+    def test_pause_is_still_cleared_when_the_thread_will_not_stop(self):
+        """The half that can succeed must still succeed."""
+        worker = build_sweeper(paused=True)
+        worker.JOIN_TIMEOUT_SECONDS = 0.05
+        release = threading.Event()
+        worker._run = lambda: release.wait()
+        worker.start()
+        assert _wait_until_alive(worker)
+
+        try:
+            result = worker.restart(resume=True)
+
+            assert result["restarted"] is False
+            assert worker.job_service.is_sweeper_paused() is False
+        finally:
+            release.set()

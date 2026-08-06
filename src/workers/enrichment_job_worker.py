@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 class EnrichmentJobWorker:
     """Background thread that drains queued per-article enrichment jobs."""
 
+    JOIN_TIMEOUT_SECONDS = 30
+
     def __init__(
         self,
         poll_interval: int = 5,
@@ -78,7 +80,27 @@ class EnrichmentJobWorker:
         self._running = False
         self._shutdown_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=30)
+            self._thread.join(timeout=self.JOIN_TIMEOUT_SECONDS)
+
+        # Starting a second thread while the first refuses to stop would leave
+        # two workers draining the same queue, and one more on every retry.
+        if self._thread and self._thread.is_alive():
+            logger.error(
+                "Enrichment job worker thread did not stop within %ss; refusing "
+                "to start a second one",
+                self.JOIN_TIMEOUT_SECONDS,
+            )
+            return {
+                "restarted": False,
+                "reason": (
+                    f"The worker thread did not stop within "
+                    f"{self.JOIN_TIMEOUT_SECONDS}s. It is most likely blocked on "
+                    f"a model call. Retry shortly."
+                ),
+                "thread_was_alive": was_alive,
+                "running": True,
+            }
+
         self._thread = None
 
         self.start()
