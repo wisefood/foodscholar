@@ -85,6 +85,24 @@ class MemoryPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.decide("member-1", "like", "  ", "accept")
 
+    def test_suggestions_carry_the_question_as_provenance(self):
+        """R1-D3/A2: the panel must be able to say why a goal was inferred."""
+        with patch.object(
+            self.service, "_extract",
+            return_value=[{"kind": "goal", "value": "reduce_fat", "confidence": "high"}],
+        ), patch.object(self.service, "_fetch_profile", return_value=PROFILE):
+            out = self.service.suggest(
+                "member-1",
+                "We're worried about our family's heart health — is red meat harmful?",
+            )
+        self.assertEqual(len(out), 1)
+        self.assertIn("heart health", out[0]["source_text"])
+
+    def test_accepted_source_text_reaches_the_write(self):
+        with patch.object(self.service, "_apply", return_value=True) as apply_mock:
+            self.service.decide("m", "goal", "reduce_fat", "accept", "because I asked")
+        apply_mock.assert_called_once_with("m", "goal", "reduce_fat", "because I asked")
+
     # --- goal kind -------------------------------------------------------- #
 
     def test_high_confidence_goal_nudges(self):

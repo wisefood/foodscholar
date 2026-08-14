@@ -377,6 +377,13 @@ class MemorySuggestion(BaseModel):
     ] = Field(description="What profile field an acceptance writes to")
     value: str = Field(description="Canonical lowercase item / goal slug / pattern")
     statement: str = Field(description="The nudge question shown to the user")
+    source_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "The question this was inferred from, echoed back on accept and "
+            "stored with the memory as its provenance"
+        ),
+    )
 
 
 class MemoryDecisionRequest(BaseModel):

@@ -117,6 +117,7 @@ async def decide_memory(request: MemoryDecisionRequest):
             request.suggestion.kind,
             request.suggestion.value,
             request.decision,
+            request.suggestion.source_text or "",
         )
         return MemoryDecisionResponse(applied=applied, decision=request.decision)
     except ValueError as e:

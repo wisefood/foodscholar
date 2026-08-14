@@ -73,7 +73,14 @@ class MemoryService:
             if not candidates:
                 return []
             profile = self._fetch_profile(member_id)
-            return self._apply_policy(candidates, profile)
+            suggestions = self._apply_policy(candidates, profile)
+            # The question is the provenance: a goal inferred here was inferred
+            # because the member asked this. Echoed back on accept and stored
+            # with the memory so the panel can answer "why am I seeing this?".
+            source_text = " ".join(str(question or "").split())[:240]
+            for suggestion in suggestions:
+                suggestion["source_text"] = source_text
+            return suggestions
         except Exception as e:
             logger.warning("Memory suggestion failed for %s: %s", member_id, e)
             return []
@@ -165,7 +172,8 @@ class MemoryService:
     # ------------------------------------------------------------------ #
 
     def decide(
-        self, member_id: str, kind: str, value: str, decision: str
+        self, member_id: str, kind: str, value: str, decision: str,
+        source_text: str = "",
     ) -> bool:
         """Apply an accepted suggestion or record a declined one.
 
@@ -178,10 +186,12 @@ class MemoryService:
             raise ValueError("Invalid memory suggestion payload")
 
         if decision == "accept":
-            return self._apply(member_id, kind, value_norm)
+            return self._apply(member_id, kind, value_norm, source_text)
         return self._record_optout(member_id, value_norm) and False
 
-    def _apply(self, member_id: str, kind: str, value: str) -> bool:
+    def _apply(
+        self, member_id: str, kind: str, value: str, source_text: str = ""
+    ) -> bool:
         from backend.platform import WISEFOOD_PLATFORM
 
         client = WISEFOOD_PLATFORM.get_client()
@@ -233,11 +243,16 @@ class MemoryService:
                 profile.dietary_groups = groups
 
             log = list(props.get("memory_log") or [])
-            log.append({
+            entry = {
                 "kind": kind, "value": value,
                 "source": "foodscholar",
                 "recorded_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            # Omitted rather than stored empty, so entries written before this
+            # and after it read the same way in the memory panel.
+            if source_text:
+                entry["source_text"] = source_text
+            log.append(entry)
             props["memory_log"] = log
             profile.properties = props
             logger.info(
