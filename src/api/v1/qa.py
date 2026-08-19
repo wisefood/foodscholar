@@ -62,7 +62,7 @@ async def ask_question(request: QARequest):
     {
         "question": "What are the health benefits of fermented foods?",
         "mode": "advanced",
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-20b",
         "rag_enabled": false,
         "expertise_level": "expert"
     }

@@ -25,6 +25,7 @@ from agents.json_output import (
 )
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from config import config
 from backend.prompts import GUIDELINE_ENRICHMENT
 
 logger = logging.getLogger(__name__)
@@ -101,9 +102,10 @@ class GuidelineEnrichmentAgent:
 
     def __init__(
         self,
-        model: str = "openai/gpt-oss-20b",
+        model: Optional[str] = None,
         temperature: float = 0.0,
     ):
+        model = model or config.settings["GUIDELINE_ENRICHMENT_MODEL"]
         self.model = model
         self.llm = GROQ_CHAT.get_client(
             model=model,
@@ -278,11 +280,7 @@ class GuidelineEnrichmentAgent:
             ),
         )
 
-        content = (
-            response.content
-            if isinstance(response.content, str)
-            else str(response.content)
-        )
+        content = response.content
 
         try:
             data = parse_json_object(content)

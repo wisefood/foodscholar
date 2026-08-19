@@ -2,15 +2,16 @@
 from pydantic import BaseModel, Field, model_validator
 from typing import Any, Dict, List, Optional, Literal
 
+from config import config
 
-AVAILABLE_GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-]
 
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+# Both are deployment configuration (QA_AVAILABLE_MODELS / QA_DEFAULT_MODEL).
+# The list is simultaneously the advanced-mode request validator and the
+# contract /qa/models advertises to the UI, so retiring a model id is an env
+# change: no rebuild, and the picker cannot drift from what the server accepts.
+AVAILABLE_GROQ_MODELS = config.settings["QA_AVAILABLE_MODELS"]
+
+DEFAULT_GROQ_MODEL = config.settings["QA_DEFAULT_MODEL"]
 
 
 class ClarificationOption(BaseModel):
@@ -305,10 +306,10 @@ class DualAnswerFeedback(BaseModel):
 
     request_id: str = Field(description="Unique request identifier for tracking")
     answer_a_label: str = Field(
-        description="Label describing approach A (e.g., 'model:llama-3.3-70b, temp:0.3')"
+        description="Label describing approach A (e.g., 'model:openai/gpt-oss-120b, temp:0.3')"
     )
     answer_b_label: str = Field(
-        description="Label describing approach B (e.g., 'model:llama-3.1-8b, temp:0.3')"
+        description="Label describing approach B (e.g., 'model:openai/gpt-oss-20b, temp:0.3')"
     )
 
 

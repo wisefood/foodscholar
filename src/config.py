@@ -1,5 +1,16 @@
 """Application configuration."""
 import os
+from typing import List
+
+
+def _csv_list(raw: str) -> List[str]:
+    """Parse a comma-separated env value, dropping blanks and duplicates."""
+    seen = []
+    for item in (raw or "").split(","):
+        value = item.strip()
+        if value and value not in seen:
+            seen.append(value)
+    return seen
 
 
 class Config:
@@ -149,6 +160,70 @@ class Config:
             os.getenv("GUIDELINE_EXTRACTION_MAX_ATTEMPTS", "3")
         )
 
+        # ------------------------------------------------------------------
+        # Models
+        #
+        # Every model the app talks to is named here and nowhere else, so a
+        # provider retiring an id (or a deployment wanting a cheaper one) is an
+        # env change rather than a code change. The roles are separate on
+        # purpose: they are not interchangeable. The utility/enrichment roles
+        # run high-volume, low-stakes calls where a small model is the right
+        # answer, the QA role is user-facing, and the extraction role needs
+        # vision over rendered PDF pages through a different provider entirely.
+        #
+        # Family-specific quirks (reasoning budgets, which knobs a family
+        # rejects) are handled once in backend.model_profiles, so any id from a
+        # registered family can be dropped into any Groq-backed role here.
+        # ------------------------------------------------------------------
+
+        # User-facing Q&A. QA_AVAILABLE_MODELS is also the API contract: it is
+        # what /qa/models advertises and what an advanced-mode request is
+        # validated against, so the UI picker follows this list without a
+        # redeploy.
+        self.settings["QA_DEFAULT_MODEL"] = os.getenv(
+            "QA_DEFAULT_MODEL", "openai/gpt-oss-120b"
+        )
+        self.settings["QA_AVAILABLE_MODELS"] = _csv_list(
+            os.getenv(
+                "QA_AVAILABLE_MODELS",
+                "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.6-27b",
+            )
+        )
+        # Cheap leg for classification and A/B comparison. Groq retired both
+        # Llama ids on 2026-08-16, so there is no non-reasoning option left:
+        # this is now the small reasoning model, and every call through it
+        # depends on the reasoning handling in backend.model_profiles.
+        self.settings["QA_FAST_MODEL"] = os.getenv(
+            "QA_FAST_MODEL", "openai/gpt-oss-20b"
+        )
+        # Starter questions, tips, conversation summaries.
+        self.settings["QA_UTILITY_MODEL"] = os.getenv(
+            "QA_UTILITY_MODEL", "openai/gpt-oss-20b"
+        )
+        self.settings["SESSION_TITLE_MODEL"] = os.getenv(
+            "SESSION_TITLE_MODEL", "openai/gpt-oss-20b"
+        )
+        self.settings["SESSION_CHAT_MODEL"] = os.getenv(
+            "SESSION_CHAT_MODEL", "openai/gpt-oss-120b"
+        )
+        self.settings["SYNTHESIS_MODEL"] = os.getenv(
+            "SYNTHESIS_MODEL", "openai/gpt-oss-120b"
+        )
+        self.settings["MEMORY_EXTRACTOR_MODEL"] = os.getenv(
+            "MEMORY_EXTRACTOR_MODEL", "openai/gpt-oss-20b"
+        )
+        self.settings["ENRICHMENT_KEYWORD_MODEL"] = os.getenv(
+            "ENRICHMENT_KEYWORD_MODEL", "openai/gpt-oss-20b"
+        )
+        self.settings["ENRICHMENT_ANNOTATION_MODEL"] = os.getenv(
+            "ENRICHMENT_ANNOTATION_MODEL", "openai/gpt-oss-20b"
+        )
+        self.settings["GUIDELINE_ENRICHMENT_MODEL"] = os.getenv(
+            "GUIDELINE_ENRICHMENT_MODEL", "openai/gpt-oss-20b"
+        )
+
+        self._validate_models()
+
         # Langfuse observability (opt-in). Tracing activates only when both
         # the public and secret keys are provided. The Langfuse SDK reads
         # these from the environment directly; they are registered here for
@@ -158,6 +233,30 @@ class Config:
         self.settings["LANGFUSE_BASE_URL"] = os.getenv(
             "LANGFUSE_BASE_URL", "https://cloud.langfuse.com"
         )
+
+
+    def _validate_models(self):
+        """Fail fast on a model configuration that cannot serve a request.
+
+        A misconfigured model list is not a degradation to absorb: an empty
+        picker or a default the validator rejects turns every advanced-mode
+        request into a 400 at runtime. Better to refuse to start.
+        """
+        available = self.settings["QA_AVAILABLE_MODELS"]
+        default = self.settings["QA_DEFAULT_MODEL"]
+
+        if not available:
+            raise ValueError(
+                "QA_AVAILABLE_MODELS is empty; it must list at least one model id"
+            )
+        if not default:
+            raise ValueError("QA_DEFAULT_MODEL must be set to a model id")
+        if default not in available:
+            raise ValueError(
+                f"QA_DEFAULT_MODEL '{default}' is not in QA_AVAILABLE_MODELS "
+                f"{available}; a default the request validator rejects would "
+                "fail every advanced-mode request"
+            )
 
 
 # Configure application settings

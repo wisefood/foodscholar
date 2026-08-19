@@ -31,7 +31,9 @@ from typing import Any, Dict, List, Optional
 
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
 from backend.prompts import QA_MEMORY_EXTRACTOR
+from config import config
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,7 @@ VALID_KINDS = {
     "like", "dislike", "cuisine", "allergy_hint", "goal", "dietary_pattern"
 }
 MAX_SUGGESTIONS_PER_TURN = 2
-EXTRACTOR_MODEL = "llama-3.3-70b-versatile"
+EXTRACTOR_MODEL = config.settings["MEMORY_EXTRACTOR_MODEL"]
 
 
 class MemoryService:
@@ -94,7 +96,7 @@ class MemoryService:
                 tags=["qa", "memory"],
             ),
         )
-        text = str(getattr(response, "content", "") or "")
+        text = normalize_model_text(getattr(response, "content", ""))
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
             return []

@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = config.settings["GUIDELINE_EXTRACTION_MODEL"]
 DEFAULT_DPI = 144
 TRIAGE_TEXT_LIMIT = 3500
 DEFAULT_PDF_WORKSPACE = "/tmp/foodscholar/guideline_artifacts"

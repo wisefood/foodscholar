@@ -630,6 +630,78 @@ All configuration is environment-driven and read once in `src/config.py` into `c
 | `GROQ_API_KEY` | *(required)* | Groq API key for chat and annotation inference |
 | `OPENAI_API_KEY` | *(required for extraction)* | OpenAI key for vision-based PDF extraction |
 
+### Models
+
+Every model the application talks to is named by one of these variables and nowhere else, so a
+provider retiring a model id is a config change and a restart. The roles are deliberately separate:
+they are *not* interchangeable. The utility and enrichment roles run high-volume, low-stakes calls
+where a small model is the right answer; the QA roles are user-facing; extraction is a vision call
+through a different provider entirely.
+
+| Variable | Default | Role |
+|---|---|---|
+| `QA_DEFAULT_MODEL` | `openai/gpt-oss-120b` | Answer model for simple mode and unspecified advanced requests |
+| `QA_AVAILABLE_MODELS` | `openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.6-27b` | Comma-separated. Advertised by `GET /qa/models` and enforced on advanced-mode requests |
+| `QA_FAST_MODEL` | `openai/gpt-oss-20b` | Cheap leg for A/B comparison strategies |
+| `QA_UTILITY_MODEL` | `openai/gpt-oss-20b` | Starter questions, tips, conversation summaries |
+| `SESSION_TITLE_MODEL` | `openai/gpt-oss-20b` | Chat session titles |
+| `SESSION_CHAT_MODEL` | `openai/gpt-oss-120b` | Structured chat responses |
+| `SYNTHESIS_MODEL` | `openai/gpt-oss-120b` | Search-result synthesis |
+| `MEMORY_EXTRACTOR_MODEL` | `openai/gpt-oss-20b` | Consented-memory suggestion extraction |
+| `ENRICHMENT_KEYWORD_MODEL` | `openai/gpt-oss-20b` | Article keyword extraction |
+| `ENRICHMENT_ANNOTATION_MODEL` | `openai/gpt-oss-20b` | Article annotation |
+| `GUIDELINE_ENRICHMENT_MODEL` | `openai/gpt-oss-20b` | Guideline facet enrichment |
+| `GUIDELINE_EXTRACTION_MODEL` | `gpt-5.4` | Vision model for PDF page extraction (OpenAI, not Groq) |
+
+`QA_DEFAULT_MODEL` must appear in `QA_AVAILABLE_MODELS` and the list must be non-empty — otherwise
+`Config._validate_models` raises at startup rather than letting every advanced-mode request 400.
+
+**Groq retirements (2026-08-16).** `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` were shut
+down; announced 2026-06-17, effective 2026-08-16. Neither appears in any default here. The
+replacements Groq named are `openai/gpt-oss-20b` and `openai/gpt-oss-120b` / `qwen/qwen3.6-27b`
+respectively. Two consequences worth knowing:
+
+- **There is no non-reasoning model left in the deployment.** Every Groq-backed role now runs on a
+  reasoning family, so the roles that used a small chat model for a trivial job (session titles,
+  classification, the A/B comparison leg) depend on the reasoning handling in
+  `backend/model_profiles.py` rather than on the model being simple. Cost per call for those roles is
+  higher than it was, bounded by `reasoning_effort=low` and the `max_tokens` floor.
+- **`qwen/qwen3.6-27b` is in the picker deliberately** — one vendor's deprecation notice should not
+  leave the service with no answer model, so a second family stays configured and reachable.
+
+Retired ids are listed in `RETIRED` in `backend/model_profiles.py`, which warns at client
+construction with the shutdown date and the replacement. A retired id still matches its family row,
+so without that list nothing would flag it — the call would just fail at the provider.
+
+Cluster deployment supplies these as a normal env map; the defaults above are what the application
+runs with when it does not.
+
+### Model portability
+
+Swapping a model must not require an agent-by-agent audit, so the family-specific behaviour lives in
+two places instead of at each call site:
+
+- **`backend/model_profiles.py`** — a capability table keyed by model-id substring, applied by the
+  Groq pool to every client it builds. It injects `reasoning_format=hidden`, a `reasoning_effort` and
+  a `max_tokens` floor for reasoning families, raises a caller budget that is too low for one, and
+  **drops parameters a family would reject** (`reasoning_*` on Llama, `temperature` on the OpenAI
+  reasoning models). An unregistered id is used as-is and logs a warning.
+- **`backend/model_output.py`** — `normalize_model_text` runs over every response before anything
+  reads it: it flattens content blocks, strips `<think>`/`<reasoning>` blocks and OpenAI harmony
+  channel residue (`analysis … assistantfinal`), and discards a fragment left by a completion cut off
+  mid-reasoning. This is the second line of defence for families the profile table does not know.
+
+All JSON recovery goes through `agents/json_output.py` (`parse_json_object` / `parse_json_array`).
+When each call site had its own parser the weakest one decided which models the app could run, so
+adding a new parser is a regression, not a local choice.
+
+**Introducing a new model:** add a row to `_FAMILIES` in `backend/model_profiles.py` if it is a new
+family, then point a role at it. An id from an unregistered family still runs, with caller defaults
+only and a warning naming itself.
+
+**Retiring one:** add it to `RETIRED` with the shutdown date and replacement, then move every role
+off it. `tests/test_model_config.py` asserts no configured default references a retired id.
+
 ### Workers
 
 | Variable | Default | Description |
@@ -790,6 +862,7 @@ mistakes are expensive and hard to spot in review:
 | Guideline retrieval gate | `tests/test_guideline_retrieval_gate.py` |
 | Consented memory | `tests/test_memory_service.py` |
 | Model retry/backoff | `tests/test_model_backoff.py` |
+| Model config, capability profiles, output normalization | `tests/test_model_config.py` |
 | Prompt registry and Langfuse fallbacks | `tests/test_prompts_registry.py` |
 | QA clarification flow and guideline RAG | `tests/test_qa_clarification.py`, `tests/test_qa_guideline_rag.py` |
 | Tips generation and LLM token budgets | `tests/test_tips_generation.py` |
@@ -801,9 +874,15 @@ mistakes are expensive and hard to spot in review:
 ### Reasoning models need an explicit token budget
 
 `openai/gpt-oss-*` models are reasoning models. Called without `max_tokens` and a `reasoning_effort`
-cap they can spend the entire completion on hidden reasoning and return **empty content**, which
-surfaces as an opaque JSON parse failure. Every structured-output call in this repository sets both,
-and parses defensively via `src/agents/json_output.py`. Preserve that pattern when adding calls.
+cap they can spend the entire completion on hidden reasoning and return **empty content** or a
+payload truncated mid-object, which surfaces as an opaque JSON parse failure; left at the provider
+default they can also return that reasoning *inside* `content`, where it is rendered as the answer.
+
+This is no longer each call site's problem: `backend/model_profiles.py` applies the budget and
+`reasoning_format=hidden` in the Groq pool, and `backend/model_output.py` strips leaked reasoning
+before parsing. See [Model portability](#model-portability). A call site may still pass an explicit
+`max_tokens` or `reasoning_effort` — an explicit value wins, except a budget below the family floor,
+which is raised.
 
 ### Connection pooling
 

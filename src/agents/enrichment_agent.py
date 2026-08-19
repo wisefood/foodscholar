@@ -3,9 +3,7 @@ Enrichment agent for scientific articles.
 Runs keyword extraction, homogenization, and full article enrichment.
 """
 
-import json
 import logging
-import re
 import unicodedata
 import copy
 from typing import List, Dict, Any, Optional
@@ -13,9 +11,15 @@ from collections import Counter, defaultdict
 
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
-from agents.json_output import extract_first_json_object, parse_json_object
+from agents.json_output import (
+    extract_first_json_object,
+    parse_json_array,
+    parse_json_object,
+)
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
+from config import config
 from backend.prompts import (
     ENRICHMENT_ANNOTATION,
     ENRICHMENT_KEYWORDS_SYSTEM,
@@ -91,18 +95,24 @@ class EnrichmentAgent:
 
     def __init__(
         self,
-        keyword_model: str = "openai/gpt-oss-20b",
-        annotation_model: str = "openai/gpt-oss-20b",
+        keyword_model: Optional[str] = None,
+        annotation_model: Optional[str] = None,
         temperature: float = 0.0,
     ):
         """
         Initialize the enrichment agent with LLM clients.
 
         Args:
-            keyword_model: Model ID for keyword extraction (default: gpt-oss-20b)
-            annotation_model: Model ID for full annotation (default: gpt-oss-20b)
+            keyword_model: Model ID for keyword extraction
+                (default: ENRICHMENT_KEYWORD_MODEL)
+            annotation_model: Model ID for full annotation
+                (default: ENRICHMENT_ANNOTATION_MODEL)
             temperature: LLM temperature for deterministic output (default: 0.0)
         """
+        keyword_model = keyword_model or config.settings["ENRICHMENT_KEYWORD_MODEL"]
+        annotation_model = (
+            annotation_model or config.settings["ENRICHMENT_ANNOTATION_MODEL"]
+        )
         self.keyword_llm = GROQ_CHAT.get_client(
             model=keyword_model,
             temperature=temperature,
@@ -175,23 +185,19 @@ class EnrichmentAgent:
             ),
         )
 
-        content = response.content if isinstance(response.content, str) else str(response.content)
-        text = content.strip()
-        if "```json" in text:
-            text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in text:
-            text = text.split("```", 1)[1].split("```", 1)[0].strip()
-        # The model sometimes prefixes the array with a sentence of reasoning.
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
-            text = match.group(0)
-
+        # The model sometimes prefixes the array with a sentence of reasoning;
+        # the shared parser recovers the array from around it.
         try:
-            data = json.loads(text)
-            return [k for k in data if isinstance(k, str)][:10]
-        except Exception:
-            logger.error("Keyword JSON invalid: %.500r", content)
+            data = parse_json_array(response.content)
+        except ValueError as e:
+            logger.error(
+                "Keyword JSON invalid: %s | raw=%.500r",
+                e,
+                normalize_model_text(response.content),
+            )
             return []
+
+        return [k for k in data if isinstance(k, str)][:10]
 
     def extract_keywords(self, abstract: str) -> List[str]:
         """
@@ -397,9 +403,7 @@ class EnrichmentAgent:
                     tags=["enrichment", "annotation"],
                 ),
             )
-            content = getattr(response, "content", response)
-            if not isinstance(content, str):
-                content = str(content)
+            content = normalize_model_text(getattr(response, "content", response))
 
             try:
                 return _parse_json_object(content)

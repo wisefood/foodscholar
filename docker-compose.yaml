@@ -10,6 +10,10 @@ services:
       - GROQ_API_KEY=_your_api_key_here_
       - OPENAI_API_KEY=_your_openai_api_key_here_
       - PORT=8080
+      # Model roles all have defaults (see README > Configuration > Models),
+      # so nothing needs setting here. Override a role to pin it, e.g.:
+      # - QA_DEFAULT_MODEL=openai/gpt-oss-20b
+      # - QA_AVAILABLE_MODELS=openai/gpt-oss-20b,qwen/qwen3.6-27b
     volumes:
       - ./app.py:/app/app.py
     restart: unless-stopped

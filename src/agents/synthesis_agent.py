@@ -1,12 +1,15 @@
 """Synthesis agent for multi-document search summarization."""
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain.prompts import ChatPromptTemplate
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools import tool
 from langchain import hub
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
+from agents.json_output import parse_json_array, parse_json_object
+from config import config
 from models.search import (
     Citation,
     SynthesizedFinding,
@@ -25,16 +28,17 @@ class SynthesisAgent:
 
     def __init__(
         self,
-        model: str = "llama-3.3-70b-versatile",
+        model: Optional[str] = None,
         temperature: float = 0.3,
     ):
         """
         Initialize synthesis agent.
 
         Args:
-            model: Groq model to use
+            model: Groq model to use (default: SYNTHESIS_MODEL)
             temperature: Model temperature (lower = more focused)
         """
+        model = model or config.settings["SYNTHESIS_MODEL"]
         self.llm = GROQ_CHAT.get_client(model=model, temperature=temperature)
         self._agent_executor = None
         self._tools = None
@@ -178,43 +182,16 @@ Generate a synthesis that answers the query comprehensively.""")
                 ),
             )
 
-            # Parse the JSON response
-            import json
-            import re
-            content = response.content.strip()
+            return parse_json_object(response.content)
 
-            # Try to extract JSON from code blocks if present
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            # Clean up control characters that break JSON parsing
-            # Remove or escape control characters except for allowed ones
-            content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
-
-            # Log the cleaned content for debugging
-            logger.debug(f"Cleaned LLM response (first 500 chars): {content[:500]}")
-
-            result = json.loads(content)
-            return result
-
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             logger.error(f"JSON parsing error: {e}")
-            logger.error(f"Problematic content (first 1000 chars): {content[:1000] if 'content' in locals() else 'N/A'}")
-
-            # Try to use JSON repair or extract what we can
-            try:
-                # Attempt to fix common JSON issues
-                result = json.loads(content)
-                logger.info("Successfully parsed with json5")
-                return result
-            except Exception as json5_error:
-                logger.error(f"json5 parsing also failed: {json5_error}")
-
-            # Final fallback
+            logger.error(
+                "Problematic content (first 1000 chars): %s",
+                normalize_model_text(getattr(response, "content", ""))[:1000],
+            )
             return {
-                "summary": f"Unable to parse LLM response. Please try again or check the logs.",
+                "summary": "Unable to parse LLM response. Please try again or check the logs.",
                 "findings": []
             }
         except Exception as e:
@@ -302,16 +279,7 @@ Return ONLY a JSON array of 3 strings, each a specific question. Example:
                     tags=["search", "followups"],
                 ),
             )
-            content = response.content.strip()
-
-            # Extract JSON array
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            import json
-            suggestions = json.loads(content)
+            suggestions = parse_json_array(response.content)
 
             return suggestions[:3]  # Ensure max 3
 

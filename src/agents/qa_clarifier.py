@@ -15,6 +15,7 @@ except Exception as exc:  # pragma: no cover
 
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from agents.json_output import parse_json_object
 from backend.prompts import QA_CLARIFIER_SYSTEM
 from agents.clarifier_fallback_i18n import localize as _clarify_i18n
 from models.qa import (
@@ -135,13 +136,9 @@ def build_fallback_plan(
     )
 
 
-def _parse_json_object(content: str) -> Dict[str, Any]:
-    content = content.strip()
-    if "```json" in content:
-        content = content.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in content:
-        content = content.split("```", 1)[1].split("```", 1)[0].strip()
-    return json.loads(content)
+def _parse_json_object(content: Any) -> Dict[str, Any]:
+    """Parse the plan JSON, tolerating fences, prose and leaked reasoning."""
+    return parse_json_object(content)
 
 
 def _merge_with_fallback(

@@ -1,21 +1,40 @@
 """
 Recovering JSON objects from raw LLM output.
 
-Shared by the article and guideline enrichment agents. The small models these
-agents run on deviate from strict JSON in predictable ways — Markdown fences,
-a sentence of reasoning before the payload, trailing commas, stray control
-characters — and every one of those is recoverable rather than a reason to
-discard the response.
+Shared by every agent that asks a model for JSON. Models deviate from strict
+JSON in predictable ways — Markdown fences, a sentence of reasoning before the
+payload, trailing commas, stray control characters, leaked reasoning blocks —
+and every one of those is recoverable rather than a reason to discard the
+response.
+
+This is the only JSON entry point the agents should use. When each call site
+had its own parser, the weakest one decided which models the app could run: a
+family whose output the robust parser recovered still broke the paths that only
+split on code fences.
 """
 
 import json
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+from backend.model_output import normalize_model_text
 
 
-def extract_first_json_object(text: str) -> Optional[str]:
-    """Return the first balanced ``{...}`` block in ``text``, if any."""
-    start = text.find("{")
+def _prepare(content: Any) -> str:
+    """Reduce raw model output to the text a JSON parser should see."""
+    text = normalize_model_text(content)
+
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1].split("```", 1)[0].strip()
+
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
+
+
+def _extract_balanced(text: str, opener: str, closer: str) -> Optional[str]:
+    """Return the first balanced ``opener...closer`` block in ``text``."""
+    start = text.find(opener)
     if start < 0:
         return None
 
@@ -34,35 +53,52 @@ def extract_first_json_object(text: str) -> Optional[str]:
             continue
         if ch == '"':
             in_string = True
-        elif ch == "{":
+        elif ch == opener:
             depth += 1
-        elif ch == "}":
+        elif ch == closer:
             depth -= 1
             if depth == 0:
                 return text[start:i + 1]
     return None
 
 
-def parse_json_object(content: str) -> Dict[str, Any]:
+def extract_first_json_object(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` block in ``text``, if any."""
+    return _extract_balanced(text, "{", "}")
+
+
+def extract_first_json_array(text: str) -> Optional[str]:
+    """Return the first balanced ``[...]`` block in ``text``, if any."""
+    return _extract_balanced(text, "[", "]")
+
+
+def parse_json_object(content: Any) -> Dict[str, Any]:
     """
     Parse a JSON object out of raw model output.
 
     Raises:
         ValueError: if no JSON object can be recovered from ``content``.
     """
-    text = (content or "").strip()
+    return _parse(content, dict, extract_first_json_object)
+
+
+def parse_json_array(content: Any) -> List[Any]:
+    """
+    Parse a JSON array out of raw model output.
+
+    Raises:
+        ValueError: if no JSON array can be recovered from ``content``.
+    """
+    return _parse(content, list, extract_first_json_array)
+
+
+def _parse(content: Any, expected: type, extractor) -> Any:
+    text = _prepare(content)
     if not text:
         raise ValueError("model returned empty content")
 
-    if "```json" in text:
-        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in text:
-        text = text.split("```", 1)[1].split("```", 1)[0].strip()
-
-    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-
     candidates = [text]
-    extracted = extract_first_json_object(text)
+    extracted = extractor(text)
     if extracted and extracted != text:
         candidates.append(extracted)
 
@@ -74,10 +110,10 @@ def parse_json_object(content: str) -> Dict[str, Any]:
             except Exception as e:  # noqa: BLE001 - any decode failure is a retry
                 last_error = e
                 continue
-            if isinstance(parsed, dict):
+            if isinstance(parsed, expected):
                 return parsed
             last_error = ValueError(
-                f"expected a JSON object, got {type(parsed).__name__}"
+                f"expected a JSON {expected.__name__}, got {type(parsed).__name__}"
             )
 
     raise ValueError(f"unparseable model output: {last_error}")

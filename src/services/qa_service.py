@@ -36,6 +36,8 @@ from models.qa import (
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
+from config import config
 from backend.prompts import (
     QA_STARTER_QUESTIONS,
     QA_TIPS_FROM_GUIDELINES,
@@ -110,7 +112,7 @@ REGION_LABELS = {
 }
 TIPS_OF_THE_DAY_TIPS_COUNT = 2
 TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT = 2
-SIMPLE_NUTRI_QUESTION_MODEL = "openai/gpt-oss-20b"
+SIMPLE_NUTRI_QUESTION_MODEL = config.settings["QA_UTILITY_MODEL"]
 SIMPLE_QUESTION_BLOCKED_TERMS = [
     "do you",
     "what's your",
@@ -187,7 +189,7 @@ AMBIGUITY_KEYWORDS = [
 ]
 
 DUAL_ANSWER_STRATEGIES = [
-    ("model_comparison", {}, {"model": "llama-3.1-8b-instant"}),
+    ("model_comparison", {}, {"model": config.settings["QA_FAST_MODEL"]}),
     ("temperature_variation", {"temperature": 0.3}, {"temperature": 0.7}),
     ("top_k_variation", {"top_k": 5}, {"top_k": 10}),
 ]
@@ -2793,7 +2795,9 @@ class QAService:
                     tags=["qa", "generated-content", "tips"],
                 ),
             )
-            output = response.content.strip()
+            # Free text straight to the user: reasoning that leaked into
+            # content would be rendered as the tip itself.
+            output = normalize_model_text(response.content)
             if "insufficient_evidence" in output.lower():
                 return None
 
@@ -3186,9 +3190,9 @@ class QAService:
 
         return did_you_know, tips
 
-    def _parse_questions_json(self, content: str) -> Dict[str, Any]:
+    def _parse_questions_json(self, content: Any) -> Dict[str, Any]:
         """Parse JSON question payload from model output."""
-        text = content.strip()
+        text = normalize_model_text(content)
 
         if "```json" in text:
             text = text.split("```json", 1)[1].split("```", 1)[0].strip()
@@ -3207,9 +3211,9 @@ class QAService:
                 raise
             return json5.loads(text)
 
-    def _parse_tip_candidates_json(self, content: str) -> Dict[str, Any]:
+    def _parse_tip_candidates_json(self, content: Any) -> Dict[str, Any]:
         """Parse JSON tip candidate payload from model output."""
-        text = content.strip()
+        text = normalize_model_text(content)
         if not text:
             return {"items": []}
 

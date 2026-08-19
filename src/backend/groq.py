@@ -4,6 +4,9 @@ import logging
 from typing import Optional, Dict, Any, TYPE_CHECKING
 from threading import Lock
 
+from backend.model_profiles import apply_profile
+from config import config
+
 if TYPE_CHECKING:  # pragma: no cover
     from langchain_groq import ChatGroq as ChatGroqType
 else:  # pragma: no cover
@@ -64,7 +67,7 @@ class GroqConnectionPool:
 
     def get_client(
         self,
-        model: str = "llama-3.3-70b-versatile",
+        model: Optional[str] = None,
         temperature: float = 0.7,
         api_key: Optional[str] = None,
         **kwargs
@@ -73,7 +76,7 @@ class GroqConnectionPool:
         Get or create a ChatGroq client from the pool.
 
         Args:
-            model: Groq model name (default: llama-3.3-70b-versatile)
+            model: Groq model id; defaults to QA_DEFAULT_MODEL
             temperature: Model temperature (default: 0.7)
             api_key: Optional API key override
             **kwargs: Additional ChatGroq configuration parameters
@@ -90,7 +93,21 @@ class GroqConnectionPool:
         # Use provided API key or fall back to environment variable
         used_api_key = api_key or self._api_key
 
-        # Generate pool key (excluding api_key from key for security)
+        model = model or config.settings["QA_DEFAULT_MODEL"]
+
+        # Reconcile the request with what this model family actually accepts.
+        # Doing it here rather than at the call sites is what makes the roles in
+        # config.py swappable: an agent asks for a model and a temperature, and
+        # the reasoning budget / reasoning knobs / unsupported-parameter pruning
+        # that a particular family needs are applied in one place.
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        kwargs = apply_profile(model, kwargs)
+        temperature = kwargs.pop("temperature", None)
+
+        # Generate pool key (excluding api_key from key for security). The
+        # profile-resolved kwargs are part of it, so two callers that differ
+        # only in a dropped parameter share one client instead of building two.
         pool_key = self._get_pool_key(model, temperature, **kwargs)
 
         # Attach the Langfuse callback handler when observability is enabled.
@@ -109,9 +126,10 @@ class GroqConnectionPool:
             if pool_key not in self._pool:
                 logger.info(f"Creating new ChatGroq instance: {pool_key}")
 
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
                 self._pool[pool_key] = ChatGroq(
                     model=model,
-                    temperature=temperature,
                     api_key=used_api_key,
                     **kwargs
                 )

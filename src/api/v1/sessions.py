@@ -18,6 +18,8 @@ import json
 
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
+from config import config
 from models.session import (
     SessionStartRequest,
     SessionStartResponse,
@@ -86,7 +88,9 @@ def generate_session_title(
 ) -> str:
     """Generate a short title for the session based on the first user message."""
     try:
-        llm = GROQ_CHAT.get_client(model="llama-3.3-70b-versatile", temperature=0.3)
+        llm = GROQ_CHAT.get_client(
+            model=config.settings["SESSION_TITLE_MODEL"], temperature=0.3
+        )
 
         context_info = f"\nUser context: {user_context}" if user_context else ""
 
@@ -111,7 +115,7 @@ Title:"""
                 tags=["session-chat", "title"],
             ),
         )
-        title = response.content.strip().strip('"').strip("'")
+        title = normalize_model_text(response.content).strip('"').strip("'")
 
         if len(title) > 50:
             title = title[:47] + "..."
@@ -124,7 +128,9 @@ Title:"""
 
 def create_structured_chain(session_data: dict, max_history: int = 20):
     """Create a chain that returns structured output."""
-    llm = GROQ_CHAT.get_client(model="llama-3.3-70b-versatile", temperature=0.7)
+    llm = GROQ_CHAT.get_client(
+        model=config.settings["SESSION_CHAT_MODEL"], temperature=0.7
+    )
 
     structured_llm = llm.with_structured_output(FoodFactsResponse)
     memory = _build_memory(session_data.get("messages", []), max_history)

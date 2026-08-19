@@ -1,5 +1,4 @@
 """Question Answering agent for non-contextual Q&A with optional RAG."""
-import json
 import re
 import logging
 from typing import List, Dict, Any, Optional, Tuple
@@ -8,6 +7,8 @@ from langchain.prompts import ChatPromptTemplate
 
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
+from backend.model_output import normalize_model_text
+from agents.json_output import parse_json_object
 from backend.prompts import (
     QA_ANSWER_RAG_SYSTEM,
     QA_ANSWER_RAG_USER,
@@ -382,23 +383,23 @@ class QAAgent:
                 "follow_ups": [],
             }
 
-    def _parse_llm_response(self, content: str) -> Dict[str, Any]:
-        """Parse JSON from LLM response, handling code blocks and control chars."""
-        content = content.strip()
+    def _parse_llm_response(self, content: Any) -> Dict[str, Any]:
+        """Parse the answer JSON out of raw model output.
 
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-
-        # Clean control characters
-        content = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content)
-
+        Delegates to the shared recovery parser so this path tolerates exactly
+        what the enrichment paths tolerate — fences, prose around the payload,
+        trailing commas, content blocks, leaked reasoning. A model whose output
+        needs recovery must not be the difference between an answer and the
+        "unable to parse" placeholder.
+        """
         try:
-            return json.loads(content)
-        except json.JSONDecodeError as e:
+            return parse_json_object(content)
+        except ValueError as e:
             logger.error("JSON parsing error: %s", e)
-            logger.error("Content (first 1000 chars): %s", content[:1000])
+            logger.error(
+                "Content (first 1000 chars): %s",
+                normalize_model_text(content)[:1000],
+            )
             return {
                 "answer": "Unable to parse response. Please try again.",
                 "overall_confidence": "low",
