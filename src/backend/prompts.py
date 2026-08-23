@@ -313,6 +313,9 @@ CRITICAL RULES:
 10. Clearly indicate when findings are preliminary vs well-established.
 11. If sources disagree, present both perspectives.
 12. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract or passage text. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
+13. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations.
+14. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
+15. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -359,6 +362,8 @@ CRITICAL RULES:
 4. Mention general knowledge sources where applicable (e.g., "according to WHO guidelines").
 5. Clearly distinguish between well-established facts and emerging research.
 6. If the user's country/region is known, localize the answer only when you can do so safely; otherwise say the guidance may vary by country.
+7. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
+8. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -640,6 +645,9 @@ CRITICAL RULES:
 8. If the user's country/region is known, prefer country- or region-specific guidance when the retrieved evidence supports it; otherwise state that the answer is general.
 9. Clearly indicate when findings are preliminary vs well-established.
 10. If sources disagree, present both perspectives.
+11. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations.
+12. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
+13. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
 
 OUTPUT PROTOCOL (two parts, in this exact order):
 PART 1 — Write the answer as plain markdown with inline citation links. This part is streamed to the user as you write it. Do NOT wrap it in JSON or code fences.

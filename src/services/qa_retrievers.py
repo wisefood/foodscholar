@@ -184,6 +184,18 @@ def normalize_article_hit(
     result["source_type"] = "article"
     result["retriever"] = retriever
     result["relevance_score"] = result.get("_score", 0.0)
+
+    def _count(*keys: str) -> Optional[int]:
+        for key in keys:
+            value = result.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+        return None
+
     retrieved = RetrievedSource(
         source_type="article",
         urn=text_value(result.get("urn") or result.get("_id")),
@@ -197,6 +209,13 @@ def normalize_article_hit(
         category=text_value(result.get("category"), default=None),
         tags=normalize_string_list(result.get("tags")),
         similarity_score=score_value(result.get("_score")),
+        # Prioritization signals, surfaced so the UI can show WHY a source
+        # ranked where it did (date, reach, study design).
+        citation_count=_count("citationCount", "citation_count"),
+        influential_citation_count=_count(
+            "influentialCitationCount", "influential_citation_count"
+        ),
+        study_type=text_value(result.get("ai_category"), default=None),
     )
     return result, retrieved
 

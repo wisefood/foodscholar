@@ -111,6 +111,20 @@ def _store_notes(
     )
 
 
+def _repair_action_phrase(action: Dict[str, Any]) -> str:
+    """A repair action as a sentence a reader understands, not an enum leak."""
+    kind = action.get("action")
+    value = str(action.get("new_query") or "").strip()
+    if kind == "reformulate":
+        return f'Reworded a search: "{value}"' if value else "Reworded a search"
+    if kind == "switch_branch":
+        target = "guidelines" if value == "guidelines" else "the literature"
+        return f"Switched a search to {target}"
+    if kind == "add_sub_question":
+        return f'Added a search: "{value}"' if value else "Added a search"
+    return str(kind or "Adjusted a search")
+
+
 def _merged_facets(
     sub_questions: List[PlannedSubQuestion],
 ) -> SubQuestionFilters:
@@ -713,7 +727,7 @@ async def run_pipeline(
                     "repair",
                     "Refining the search",
                     detail="; ".join(
-                        f"{action['action']}: {action.get('new_query', '')}".strip(": ")
+                        _repair_action_phrase(action)
                         for action in repair_plan.actions[:3]
                     )
                     or None,

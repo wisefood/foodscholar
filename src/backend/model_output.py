@@ -63,6 +63,32 @@ def normalize_model_text(content: Any) -> str:
     return text.strip()
 
 
+# Answer-prose hygiene. Some model families wrap citations in fullwidth CJK
+# brackets (【label](url)】) — markdown cannot parse those, so the citation
+# renders as raw text and every downstream affordance (click-through, hover
+# peek, passage highlight) silently dies. Em/en-dashes are banned by product
+# style. Prompts forbid both, but prompts are advisory; this is the guarantee.
+_SPACED_DASH_RE = re.compile(r"[ \t]*[—–][ \t]+")
+_BARE_DASH_RE = re.compile(r"[—–]")
+
+
+def normalize_answer_prose(text: Any) -> str:
+    """
+    Repair citation brackets and strip em/en-dashes from user-facing prose.
+
+    ``【`` becomes ``[`` and ``】`` is dropped, so a malformed
+    ``【label](url)】`` parses as a normal markdown link. A dash used as a
+    clause break (spaced) becomes a comma; a dash used in a range (bare)
+    becomes a plain hyphen. Verbatim citation quotes are separate fields and
+    never pass through here — their exact-substring guarantee stays intact.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    text = text.replace("【", "[").replace("】", "")
+    text = _SPACED_DASH_RE.sub(", ", text)
+    return _BARE_DASH_RE.sub("-", text)
+
+
 def _flatten(content: Any) -> str:
     """Reduce a str / content-block list / anything else to a single string."""
     if content is None:

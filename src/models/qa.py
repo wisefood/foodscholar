@@ -510,6 +510,21 @@ class RetrievedSource(BaseModel):
         default=None,
         description="PDF page a guideline rule came from, when known",
     )
+    citation_count: Optional[int] = Field(
+        default=None,
+        description=(
+            "Semantic Scholar citation count, when stored — surfaces the "
+            "prioritization signal to the reader"
+        ),
+    )
+    influential_citation_count: Optional[int] = Field(
+        default=None,
+        description="Semantic Scholar influential citation count, when stored",
+    )
+    study_type: Optional[str] = Field(
+        default=None,
+        description="Enrichment-assigned study design (ai_category), when set",
+    )
 
 
 class DualAnswerFeedback(BaseModel):

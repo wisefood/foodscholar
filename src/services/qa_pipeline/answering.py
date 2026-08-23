@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from langchain.prompts import ChatPromptTemplate
 
 from agents.json_output import parse_json_object
+from backend.model_output import normalize_answer_prose
 from agents.qa_agent import (
     COMPLEXITY_INSTRUCTIONS,
     build_qa_answer,
@@ -223,7 +224,9 @@ async def stream_answer(
             parsed_trailer = True
         except ValueError:
             parsed = {}
-        answer_text = str(parsed.get("answer") or "").strip()
+        answer_text = normalize_answer_prose(
+            str(parsed.get("answer") or "").strip()
+        )
         if answer_text:
             emitted = answer_text
             yield {"kind": "delta", "text": answer_text}
@@ -234,7 +237,10 @@ async def stream_answer(
             emitted += pending
             yield {"kind": "delta", "text": pending}
             pending = ""
-        answer_text = emitted.strip()
+        # Repair CJK citation brackets and banned dashes before citations are
+        # recovered from the text. (Live deltas stay raw; the UI applies the
+        # same normalization at render time, so the streamed view matches.)
+        answer_text = normalize_answer_prose(emitted.strip())
         if trailer.strip():
             try:
                 parsed = parse_json_object(trailer)

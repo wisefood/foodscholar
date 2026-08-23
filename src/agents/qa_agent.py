@@ -13,7 +13,7 @@ from langchain.prompts import ChatPromptTemplate
 
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
-from backend.model_output import normalize_model_text
+from backend.model_output import normalize_answer_prose, normalize_model_text
 from agents.json_output import parse_json_object
 from backend.prompts import (
     QA_ANSWER_RAG_SYSTEM,
@@ -549,7 +549,7 @@ def build_qa_answer(
                 citations.append(citation)
 
     return QAAnswer(
-        answer=parsed.get("answer", ""),
+        answer=normalize_answer_prose(parsed.get("answer", "")),
         citations=citations,
         confidence=parsed.get("overall_confidence", "medium"),
         model_used=model_used,

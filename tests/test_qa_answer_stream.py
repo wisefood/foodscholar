@@ -171,6 +171,58 @@ class SentinelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["answer"].citations, [])
 
 
+class AnswerProseNormalizationTests(unittest.TestCase):
+    """CJK citation brackets and banned dashes are repaired, not trusted away."""
+
+    def test_cjk_brackets_become_a_parseable_link(self):
+        from backend.model_output import normalize_answer_prose
+
+        broken = "Fiber helps【Marcobal et al. (2024)](/articles/urn:article:a1)】."
+        self.assertEqual(
+            normalize_answer_prose(broken),
+            "Fiber helps[Marcobal et al. (2024)](/articles/urn:article:a1).",
+        )
+
+    def test_spaced_dashes_become_commas_and_ranges_become_hyphens(self):
+        from backend.model_output import normalize_answer_prose
+
+        text = "Slows digestion — a traffic jam for sugar — over 20–35 % of intake."
+        self.assertEqual(
+            normalize_answer_prose(text),
+            "Slows digestion, a traffic jam for sugar, over 20-35 % of intake.",
+        )
+        self.assertNotIn("—", normalize_answer_prose(text))
+        self.assertNotIn("–", normalize_answer_prose(text))
+
+    def test_empty_and_non_string_are_safe(self):
+        from backend.model_output import normalize_answer_prose
+
+        self.assertEqual(normalize_answer_prose(None), "")
+        self.assertEqual(normalize_answer_prose(""), "")
+
+
+class BrokenModelFormattingStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cjk_bracket_citations_still_resolve_and_answer_is_clean(self):
+        answer = (
+            "Fiber slows sugar absorption — a lot"
+            "【Doe et al. (2021)](/articles/urn:article:a1)】."
+        )
+        events = await _collect([answer])
+        final = _final(events)
+        # The settled answer parses as normal markdown with no banned glyphs.
+        self.assertIn(
+            "[Doe et al. (2021)](/articles/urn:article:a1)",
+            final["answer"].answer,
+        )
+        self.assertNotIn("【", final["answer"].answer)
+        self.assertNotIn("—", final["answer"].answer)
+        # And the citation was recovered from the repaired inline link.
+        self.assertEqual(
+            [c.source_id for c in final["answer"].citations],
+            ["urn:article:a1"],
+        )
+
+
 class InlineCitationRecoveryTests(unittest.TestCase):
     def test_unknown_urns_are_ignored(self):
         cited = answering.citations_from_inline_links(
