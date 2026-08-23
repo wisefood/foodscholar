@@ -1654,7 +1654,7 @@ class QAService:
             "Falling back to static-safe starter questions after %d failed attempts.",
             MAX_SIMPLE_QUESTION_REGEN_ATTEMPTS,
         )
-        return self._generate_fallback_questions(count=count)
+        return self._generate_fallback_questions(count=count, language=language)
 
     def _generate_simple_questions_once(
         self, count: int, language: str = "en"
@@ -3164,14 +3164,12 @@ class QAService:
 
         return text[start:]
 
-    def _generate_fallback_questions(self, count: int) -> List[str]:
-        """Emergency fallback without a fixed question pool.
-
-        Everyday, household-friendly phrasing (RCSI/Claire feedback: the starter
-        questions must read like a regular shopper or home cook would ask, not a
-        nutrition textbook).
-        """
-        pool = [
+    # Emergency starter pools per language: the LLM path localizes via the
+    # prompt, but the static fallback must not answer a Slovene UI in English.
+    # Everyday, household-friendly phrasing (RCSI/Claire feedback), including
+    # the food-safety/food-waste angle. Unlisted languages fall back to "en".
+    FALLBACK_STARTER_QUESTIONS: Dict[str, List[str]] = {
+        "en": [
             "Are frozen vegetables as healthy as fresh ones?",
             "Is brown bread really better than white bread?",
             "What foods are high in fibre?",
@@ -3182,13 +3180,55 @@ class QAService:
             "How much salt is too much in a day?",
             "Are all fats bad for you?",
             "Is honey healthier than sugar?",
-            # Food safety / sustainability, so that side of the assistant is
-            # discoverable from the starter chips too.
             "How long can I keep chicken in the fridge?",
             "How can I reduce food waste at home?",
             "Can I refreeze food after it has thawed?",
             "How long are leftovers safe to eat?",
-        ]
+        ],
+        "sl": [
+            "Ali je zamrznjena zelenjava enako zdrava kot sveža?",
+            "Ali je črn kruh res boljši od belega?",
+            "Katera živila vsebujejo veliko vlaknin?",
+            "Ali kava šteje k dnevnemu vnosu vode?",
+            "So jajca dobra ali slaba za zdravje?",
+            "Je bolje jesti sadje ali piti sadni sok?",
+            "Kateri so dobri viri beljakovin?",
+            "Koliko soli na dan je preveč?",
+            "So vse maščobe škodljive?",
+            "Je med bolj zdrav od sladkorja?",
+            "Kako dolgo lahko hranim piščanca v hladilniku?",
+            "Kako lahko doma zmanjšam zavržke hrane?",
+            "Ali lahko odtajano hrano ponovno zamrznem?",
+            "Kako dolgo so ostanki hrane še varni za uživanje?",
+        ],
+        "hu": [
+            "A fagyasztott zöldség ugyanolyan egészséges, mint a friss?",
+            "A barna kenyér tényleg jobb, mint a fehér?",
+            "Milyen ételekben van sok rost?",
+            "A kávé beleszámít a napi folyadékbevitelbe?",
+            "A tojás jó vagy rossz az egészségnek?",
+            "Jobb gyümölcsöt enni vagy gyümölcslevet inni?",
+            "Mik a jó fehérjeforrások?",
+            "Mennyi só számít túl soknak naponta?",
+            "Minden zsír káros?",
+            "A méz egészségesebb, mint a cukor?",
+            "Meddig tartható a csirkehús a hűtőben?",
+            "Hogyan csökkenthetem otthon az ételpazarlást?",
+            "Újrafagyaszthatom a kiolvasztott ételt?",
+            "Meddig ehetők biztonságosan a maradékok?",
+        ],
+    }
+
+    def _generate_fallback_questions(
+        self, count: int, language: str = "en"
+    ) -> List[str]:
+        """Emergency fallback without an LLM, localized to the UI language."""
+        lang = (language or "en").strip().lower().split("-")[0]
+        pool = list(
+            self.FALLBACK_STARTER_QUESTIONS.get(
+                lang, self.FALLBACK_STARTER_QUESTIONS["en"]
+            )
+        )
         random.shuffle(pool)
         selected = self._normalize_simple_questions(pool, count=count)
 
