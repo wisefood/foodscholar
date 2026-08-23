@@ -8,10 +8,11 @@ from services.qa_pipeline import evaluator
 from services.qa_pipeline.state import EvidenceItem, PipelineState
 
 
-def _state(round_index=0, evidence=None, branch_statuses=None, country=None):
+def _state(round_index=0, evidence=None, branch_statuses=None, country=None,
+           language="en"):
     from agents.qa_planner import build_fallback_pipeline_plan
 
-    request = QARequest(question="How much fiber per day?")
+    request = QARequest(question="How much fiber per day?", language=language)
     plan = build_fallback_pipeline_plan(
         question=request.question,
         request=request,
@@ -152,6 +153,32 @@ class LlmVerdictTests(unittest.IsolatedAsyncioTestCase):
         values = [o.value for o in result.clarification.options]
         self.assertEqual(values[:2], ["EU", "US"])
         self.assertIn("general", values)
+
+    async def test_evaluator_clarification_speaks_the_request_language(self):
+        # The evaluator's evidence-backed region clarification must not fall
+        # back to English on a Slovene thread (reported by testers).
+        content = '{"verdict": "needs_user_clarification", "reason": ""}'
+        state = _state(
+            evidence=[_guideline_item("g1", "EU"), _guideline_item("g2", "US")],
+            branch_statuses=[{"ok": True}],
+            language="sl",
+        )
+        with patch.object(
+            evaluator.GROQ_CHAT, "get_client", return_value=self._llm(content)
+        ):
+            result = await evaluator.evaluate(
+                state, clarification_allowed=True, max_repair_rounds=1
+            )
+        clarification = result.clarification
+        self.assertEqual(
+            clarification.question,
+            "Katero državo ali regijo smernic naj upošteva odgovor?",
+        )
+        labels = {o.value: o.label for o in clarification.options}
+        self.assertEqual(labels["EU"], "Evropska unija")
+        self.assertEqual(labels["general"], "Brez posebne izbire")
+        # Values stay canonical codes for matching/retrieval.
+        self.assertIn("US", labels)
 
     async def test_unknown_verdict_defaults_to_sufficient(self):
         content = '{"verdict": "shrug", "reason": "?"}'

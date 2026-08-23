@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.clarifier_fallback_i18n import localize as _clarify_i18n
 from agents.json_output import parse_json_object
 from agents.qa_planner import _coerce_sub_questions
 from backend.groq import GROQ_CHAT
@@ -74,30 +75,40 @@ def guideline_regions(evidence: List[EvidenceItem]) -> List[str]:
     return regions
 
 
-def region_clarification(regions: List[str], reason: str) -> ClarificationRequest:
-    """An evidence-backed country/region clarification, general option included."""
+def region_clarification(
+    regions: List[str],
+    reason: Optional[str],
+    *,
+    language: Optional[str] = None,
+) -> ClarificationRequest:
+    """An evidence-backed country/region clarification, general option included.
+
+    User-facing strings come from the clarifier i18n table, so a Slovene
+    question never gets an English clarification just because the evaluator
+    (rather than the planner) raised it. Region values stay canonical codes.
+    """
+    strings = _clarify_i18n("country_or_region", language)
+    labels = strings.get("labels", {}) if isinstance(strings, dict) else {}
     options = [
         ClarificationOption(
-            label=region,
+            label=str(labels.get(region, region)),
             value=region,
-            description="Found matching guideline candidates for this region.",
         )
         for region in regions[:4]
     ]
     options.append(
         ClarificationOption(
-            label="No preference",
+            label=str(labels.get("general", "No preference")),
             value="general",
-            description="Use the best available evidence across regions.",
         )
     )
     return ClarificationRequest(
         id="country_or_region",
-        question="Which country or guideline region should the answer use?",
+        question=str(strings.get("question", "")),
         input_type="single_choice",
         options=options,
         allow_free_text=True,
-        reason=reason,
+        reason=reason or str(strings.get("reason", "")) or None,
     )
 
 
@@ -307,9 +318,8 @@ async def evaluate(
             if regions:
                 result.clarification = region_clarification(
                     regions,
-                    result.reason
-                    or "Guideline candidates vary by region, and regional "
-                    "dietary guidance can change the practical recommendation.",
+                    result.reason or None,
+                    language=state.request.language,
                 )
             else:
                 result.verdict = "sufficient"

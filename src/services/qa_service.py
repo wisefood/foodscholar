@@ -3182,6 +3182,12 @@ class QAService:
             "How much salt is too much in a day?",
             "Are all fats bad for you?",
             "Is honey healthier than sugar?",
+            # Food safety / sustainability, so that side of the assistant is
+            # discoverable from the starter chips too.
+            "How long can I keep chicken in the fridge?",
+            "How can I reduce food waste at home?",
+            "Can I refreeze food after it has thawed?",
+            "How long are leftovers safe to eat?",
         ]
         random.shuffle(pool)
         selected = self._normalize_simple_questions(pool, count=count)

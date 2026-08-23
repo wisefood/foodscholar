@@ -305,9 +305,10 @@ CRITICAL RULES:
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
 3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
 4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
-5. If the retrieved sources do not contain sufficient information, say so explicitly.
+5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources. An answer that only says "not stated in the sources, ask a professional" is a failure.
 6. Do NOT fabricate information beyond what the retrieved sources support.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
+7b. Be CONCRETE and actionable whenever the sources allow it: amounts, servings, frequencies, and food examples beat vague encouragement ("eat 2-3 servings of fruit a day" beats "eat more fruit").
 8. LinearRAG sources are passage-level snippets. Only cite them when the provided passage itself supports the claim.
 9. If the user's country/region is known, prefer country- or region-specific guidance when the retrieved evidence supports it; otherwise state that the answer is general.
 10. Clearly indicate when findings are preliminary vs well-established.
@@ -620,6 +621,10 @@ _QA_EVALUATOR_SYSTEM_FALLBACK = (
     "- Judge coverage per sub-question against its own evidence, not globally.\n"
     "- reformulated_queries and new_sub_questions: machine-facing, canonical "
     "English. 'reason' and each note text: written in the request_language.\n"
+    "- clarification, when set: clarification.question, every options[].label "
+    "and options[].description, and clarification.reason MUST be written in "
+    "the request_language; clarification.id and options[].value stay canonical "
+    "English.\n"
     "- Only ONE verdict. When several apply, pick the one whose repair most "
     "improves the answer."
 )
@@ -639,9 +644,10 @@ CRITICAL RULES:
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
 3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
 4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
-5. If the retrieved sources do not contain sufficient information, say so explicitly. When the ANSWER FORMULATION CONTEXT names an evidence gap, disclose it honestly instead of papering over it.
+5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources. An answer that only says "not stated in the sources, ask a professional" is a failure.
 6. Do NOT fabricate information beyond what the retrieved sources support. If no sources are provided, answer from general knowledge WITHOUT creating any citation links.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
+7b. Be CONCRETE and actionable whenever the sources allow it: amounts, servings, frequencies, and food examples beat vague encouragement ("eat 2-3 servings of fruit a day" beats "eat more fruit").
 8. If the user's country/region is known, prefer country- or region-specific guidance when the retrieved evidence supports it; otherwise state that the answer is general.
 9. Clearly indicate when findings are preliminary vs well-established.
 10. If sources disagree, present both perspectives.
@@ -698,6 +704,7 @@ LANGUAGE: Write every question in {{language}}. Do not leave any question, or an
 Audience and register:
 - Write for a curious non-expert with no science background. Use plain, everyday words.
 - Anchor questions in real food, everyday eating, and common concerns (e.g. common foods, "is X good/bad for me", how to eat healthily, what a nutrient does in simple terms).
+- Include ONE question about practical food safety, storage, or reducing food waste at home (e.g. how long something keeps in the fridge, what to do with leftovers) so people discover that part of the assistant.
 - Do NOT use academic or clinical vocabulary or phrasing. Avoid words like: composition, biochemical, pathway, mechanism, synthesis, metabolism, oxidative, microbiota, bioavailability, cellular, physiological.
 - Do NOT phrase questions as "Explain how...", "Describe the role of...", "Outline the pathway of..." — those read like an exam. Ask simply.
 
@@ -706,6 +713,8 @@ GOOD examples (everyday, plain language):
 - "Is brown bread really better than white bread?"
 - "What foods are high in fibre?"
 - "Does drinking coffee count toward my daily water?"
+- "How long can I keep chicken in the fridge?"
+- "How can I reduce food waste at home?"
 
 BAD examples (too academic — never produce anything like these):
 - "Explain how dietary fibre influences gut microbiota composition."
