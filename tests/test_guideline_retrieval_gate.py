@@ -95,6 +95,20 @@ class GuidelineContextClauseTests(unittest.TestCase):
 
         self.assertEqual(guideline_context_should_clauses(None), [])
 
+    AGE_WINDOW_FIELDS = {"age_min_months", "age_max_months"}
+
+    def _referenced_fields(self, clauses):
+        referenced = set()
+        for clause in clauses:
+            if "multi_match" in clause:
+                for field in clause["multi_match"]["fields"]:
+                    referenced.add(field.split("^", 1)[0])
+            elif "bool" in clause:
+                # The age-window boost: ranges over the mapped month fields.
+                for sub in clause["bool"].get("must", []):
+                    referenced.update(sub.get("range", {}).keys())
+        return referenced
+
     def test_context_clauses_only_reference_mapped_fields(self):
         from models.qa import QAUserContext
         from services.qa_retrievers import guideline_context_should_clauses
@@ -104,11 +118,7 @@ class GuidelineContextClauseTests(unittest.TestCase):
         )
 
         self.assertTrue(clauses)
-        referenced = set()
-        for clause in clauses:
-            for field in clause["multi_match"]["fields"]:
-                referenced.add(field.split("^", 1)[0])
-
+        referenced = self._referenced_fields(clauses)
         for phantom in GuidelineSearchFieldTests.PHANTOM_FIELDS:
             self.assertNotIn(phantom, referenced)
 
@@ -116,29 +126,67 @@ class GuidelineContextClauseTests(unittest.TestCase):
         from models.qa import QAUserContext
         from services.qa_retrievers import guideline_context_should_clauses
 
-        clauses = guideline_context_should_clauses(QAUserContext(country="IE"))
+        clauses = guideline_context_should_clauses(
+            QAUserContext(country="IE", member_age_group="toddler")
+        )
 
         # A `should` clause reorders; anything else would silently hide the
-        # guidelines of every other country from a user who set one.
+        # guidelines of every other country from a user who set one. The
+        # age-window clause is a bool-with-boost over the month ranges — a
+        # scoring clause, never a top-level filter.
         for clause in clauses:
-            self.assertIn("multi_match", clause)
             self.assertNotIn("filter", clause)
-            self.assertNotIn("must", clause)
+            if "bool" in clause:
+                self.assertIn("boost", clause["bool"])
+                self.assertTrue(
+                    self.AGE_WINDOW_FIELDS.issuperset(
+                        self._referenced_fields([clause])
+                    )
+                )
+            else:
+                self.assertIn("multi_match", clause)
+
+    def test_age_group_maps_to_life_stage_and_month_window(self):
+        from services.qa_retrievers import guideline_age_should_clauses
+
+        clauses = guideline_age_should_clauses("toddler")
+        self.assertEqual(len(clauses), 2)
+        life_stage_clause, window_clause = clauses
+        self.assertIn(
+            "early_childhood", life_stage_clause["multi_match"]["query"]
+        )
+        musts = window_clause["bool"]["must"]
+        self.assertEqual(
+            musts[0]["range"]["age_min_months"], {"gte": 0, "lte": 48}
+        )
+        self.assertEqual(musts[1]["range"]["age_max_months"], {"gte": 12})
+
+        # Pregnancy has a life stage but no month window.
+        pregnancy = guideline_age_should_clauses("pregnant")
+        self.assertEqual(len(pregnancy), 1)
+        self.assertIn("pregnancy", pregnancy[0]["multi_match"]["query"])
+
+        # Unknown groups add nothing rather than guessing.
+        self.assertEqual(guideline_age_should_clauses("martian"), [])
+        self.assertEqual(guideline_age_should_clauses(None), [])
 
 
 class HybridRetrievalTests(unittest.TestCase):
     """
-    Hybrid retrieval is off until guidelines have been embedded, and when on it
-    must gate the vector leg exactly as it gates the keyword leg — a kNN query
-    with no filter would surface draft rules the BM25 leg correctly hides.
+    Hybrid retrieval is the default now that guidelines carry embeddings, and
+    it must gate the vector leg exactly as it gates the keyword leg — a kNN
+    query with no filter would surface draft rules the BM25 leg correctly
+    hides. bm25-only remains the opt-out for un-embedded deployments.
     """
 
-    def test_hybrid_is_off_by_default(self):
+    def test_hybrid_is_on_by_default(self):
+        from config import config
         from services.qa_retrievers import guideline_hybrid_enabled
 
-        self.assertFalse(guideline_hybrid_enabled())
+        self.assertEqual(config.settings.get("QA_GUIDELINE_RETRIEVAL_MODE"), "hybrid")
+        self.assertTrue(guideline_hybrid_enabled())
 
-    def test_flag_enables_hybrid(self):
+    def test_flag_toggles_hybrid(self):
         from config import config
         from services.qa_retrievers import guideline_hybrid_enabled
 
@@ -282,11 +330,33 @@ class NoDuplicateQueryBodyTests(unittest.TestCase):
         self.assertIn("guideline_base_query", source)
         self.assertNotIn("must_not", source)
 
+    def test_pipeline_guideline_leg_uses_the_shared_builders(self):
+        from services.qa_pipeline import retrieval as pipeline_retrieval
+
+        source = self._source_of(pipeline_retrieval.search_guidelines_lexical)
+        self.assertIn("guideline_base_query", source)
+        self.assertNotIn("must_not", source)
+        self.assertNotIn(
+            "status",
+            source.replace("guideline_base_query", ""),
+            msg="pipeline guideline leg appears to filter on status itself",
+        )
+
+    def test_pipeline_guideline_knn_leg_is_gated(self):
+        from services.qa_pipeline import retrieval as pipeline_retrieval
+
+        source = self._source_of(pipeline_retrieval.search_guidelines_knn)
+        self.assertIn("guideline_retrieval_filter", source)
+        self.assertNotIn(
+            "status",
+            source.replace("guideline_retrieval_filter", ""),
+            msg="pipeline guideline kNN leg appears to filter on status itself",
+        )
+
     def test_qa_service_guideline_paths_use_the_shared_builders(self):
         from services.qa_service import QAService
 
         for method, builder in (
-            (QAService._retrieve_guideline_rag_sources, "guideline_base_query"),
             (QAService._search_tip_source_guidelines, "guideline_tip_pool_query"),
             (QAService._get_random_tip_source_guidelines, "guideline_tip_pool_query"),
         ):

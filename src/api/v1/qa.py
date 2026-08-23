@@ -3,7 +3,10 @@ import asyncio
 import logging
 import os
 from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional
+
+from config import config
 
 from models.qa import (
     QARequest,
@@ -78,8 +81,13 @@ async def ask_question(request: QARequest):
         # Consent nudges: durable preferences phrased inside the question
         # ("I love lentils — enough protein?") become suggestions the user
         # answers via POST /qa/memory. Best-effort and off the event loop —
-        # a failed nudge must never break an answered question.
-        if request.member_id and not result.needs_clarification:
+        # a failed nudge must never break an answered question. The agentic
+        # pipeline computes them itself; only fill in when absent (legacy).
+        if (
+            request.member_id
+            and not result.needs_clarification
+            and result.memory_suggestions is None
+        ):
             try:
                 suggestions = await asyncio.to_thread(
                     MEMORY_SERVICE.suggest, request.member_id, request.question
@@ -100,6 +108,85 @@ async def ask_question(request: QARequest):
             detail="Error generating answer. Please try again.",
             extra={"cause": e.__class__.__name__},
         )
+
+
+@router.post("/ask/stream")
+async def ask_question_stream(request: QARequest):
+    """
+    Ask a question and receive the pipeline's reasoning as Server-Sent Events.
+
+    The stream narrates every stage of the agentic pipeline and delivers the
+    answer token by token:
+
+    - `stage.start`, `stage.plan` (sub-questions with rationales),
+      `stage.search_started` / `stage.search_results` per search,
+      `stage.rerank`, `stage.notes` (research notes), `stage.evaluate`,
+      `stage.repair`, `stage.cache`
+    - `answer_started`, then incremental `answer_delta` events
+    - `citations` with validated quotes
+    - terminal: `done` (full QAResponse payload), or `clarification`
+      (re-POST with `qa_thread_id` + `clarification_response`, exactly the
+      non-streaming round-trip), or `error`
+
+    Every event's data carries `request_id` and a monotonic `seq`. Comment
+    frames (`: keep-alive`) are sent during quiet stretches.
+    """
+    from services.qa_pipeline.events import SSE_HEARTBEAT_FRAME, sse_format
+    from services.qa_pipeline.events import PipelineEvent
+
+    logger.info(
+        "QA stream request: mode=%s, question='%s...'",
+        request.mode, request.question[:80],
+    )
+
+    # Validate before the stream starts so a bad request is still a 400,
+    # not an error event on a 200 response.
+    qa_service._validate_request(request)
+
+    heartbeat_seconds = int(
+        config.settings.get("QA_STREAM_HEARTBEAT_SECONDS", 15)
+    )
+
+    async def event_frames():
+        events = qa_service.run_pipeline(request).__aiter__()
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        events.__anext__(), timeout=heartbeat_seconds
+                    )
+                except asyncio.TimeoutError:
+                    yield SSE_HEARTBEAT_FRAME
+                    continue
+                except StopAsyncIteration:
+                    break
+                yield sse_format(event)
+                if event.is_terminal:
+                    break
+        except Exception as e:
+            # Streaming already returned 200; failures become an event.
+            logger.error("Error in ask_question_stream: %s", e, exc_info=True)
+            yield sse_format(
+                PipelineEvent(
+                    name="error",
+                    data={
+                        "title": "Error generating answer",
+                        "detail": "Error generating answer. Please try again.",
+                        "cause": e.__class__.__name__,
+                    },
+                )
+            )
+
+    return StreamingResponse(
+        event_frames(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Tell nginx-style proxies not to buffer the stream.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/memory", response_model=MemoryDecisionResponse)

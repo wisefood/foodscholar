@@ -1,4 +1,5 @@
 """Q&A service for non-contextual question answering."""
+import asyncio
 import json
 import logging
 import random
@@ -539,6 +540,35 @@ class QAService:
                 session.commit()
 
     async def answer_question(self, request: QARequest) -> QAResponse:
+        """Answer a question; agentic pipeline by default, legacy on rollback.
+
+        The agentic pipeline (``services.qa_pipeline``) plans typed
+        sub-questions, runs hybrid retrieval with influence/recency-aware
+        ranking, evaluates evidence sufficiency with bounded repair, and
+        streams the answer. This non-streaming entrypoint drains the event
+        stream and returns the terminal payload, so ``POST /qa/ask`` keeps
+        its exact contract. ``QA_PIPELINE_MODE=legacy`` restores the previous
+        single-pass flow.
+        """
+        if str(config.settings.get("QA_PIPELINE_MODE", "agentic")).lower() == "legacy":
+            return await self._answer_question_legacy(request)
+
+        final: Optional[QAResponse] = None
+        async for event in self.run_pipeline(request):
+            if event.name in ("done", "clarification"):
+                payload = {k: v for k, v in event.data.items() if k != "seq"}
+                final = QAResponse(**payload)
+        if final is None:  # pragma: no cover - the pipeline always terminates
+            raise RuntimeError("QA pipeline produced no terminal event")
+        return final
+
+    def run_pipeline(self, request: QARequest):
+        """The agentic pipeline as an async generator of PipelineEvents."""
+        from services.qa_pipeline.orchestrator import run_pipeline
+
+        return run_pipeline(self, request)
+
+    async def _answer_question_legacy(self, request: QARequest) -> QAResponse:
         """
         Main orchestration: validate, clarify if needed, retrieve, generate.
 
@@ -587,7 +617,9 @@ class QAService:
             request.clarification_response,
         )
         answered_ids = self._answered_clarification_ids(thread_context, request)
-        plan = self._plan_clarification_safety(
+        # The clarifier LLM call is synchronous; keep it off the event loop.
+        plan = await asyncio.to_thread(
+            self._plan_clarification_safety,
             question=effective_question,
             request=request,
             user_context=user_context,
@@ -654,7 +686,8 @@ class QAService:
         # Retrieval
         source_payloads: List[Dict[str, Any]] = []
         retrieved_sources: List[RetrievedSource] = []
-        retrieval_result = self._retrieve_sources(
+        retrieval_result = await asyncio.to_thread(
+            self._retrieve_sources,
             question=effective_question,
             plan=plan,
             top_k=request.top_k,
@@ -730,7 +763,8 @@ class QAService:
             source_payloads,
         )
         if effective_rag and source_payloads:
-            primary_answer, follow_ups = primary_agent.generate_answer_with_rag(
+            primary_answer, follow_ups = await asyncio.to_thread(
+                primary_agent.generate_answer_with_rag,
                 question=effective_question,
                 articles=source_payloads,
                 expertise_level=request.expertise_level,
@@ -740,7 +774,8 @@ class QAService:
                 prior_conversation=conversation_summary,
             )
         else:
-            primary_answer, follow_ups = primary_agent.generate_answer_without_rag(
+            primary_answer, follow_ups = await asyncio.to_thread(
+                primary_agent.generate_answer_without_rag,
                 question=effective_question,
                 expertise_level=request.expertise_level,
                 language=request.language,
@@ -756,7 +791,8 @@ class QAService:
             effective_question
         ):
             secondary_answer, dual_feedback, dual_strategy = (
-                self._generate_secondary_answer(
+                await asyncio.to_thread(
+                    self._generate_secondary_answer,
                     request,
                     source_payloads,
                     request_id,
@@ -797,7 +833,8 @@ class QAService:
 
         # Update the running thread summary for the next free-form follow-up.
         # Best-effort and mode-agnostic (facts only); never blocks the answer.
-        self._update_conversation_summary(
+        await asyncio.to_thread(
+            self._update_conversation_summary,
             thread_id=conversation_thread_id,
             previous_summary=conversation_summary,
             question=effective_question,
@@ -880,11 +917,6 @@ class QAService:
         excludes them in the query; this second pass covers retrievers that cannot
         (LinearRAG) and applies the tier boost uniformly.
         """
-        self._retriever_adapters = QARetrieverAdapters(
-            embed_query=self._embed_query,
-            articles_index=self.INDEX_NAME,
-            guidelines_index=self.GUIDELINES_INDEX_NAME,
-        )
         adapter = self._retriever_adapters.get(retriever)
 
         result = adapter.retrieve(
@@ -1511,6 +1543,7 @@ class QAService:
         effective_model: str,
         effective_rag: bool,
         dual_strategy: Optional[str] = None,
+        pipeline_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist the QA request and response to PostgreSQL (best-effort)."""
         from backend.postgres import POSTGRES_ASYNC_SESSION_FACTORY
@@ -1520,6 +1553,7 @@ class QAService:
             factory = POSTGRES_ASYNC_SESSION_FACTORY()
             async with factory() as session:
                 record = QARequestRecord(
+                    pipeline_meta=pipeline_meta,
                     id=uuid.UUID(response.request_id),
                     question=request.question,
                     mode=request.mode,
@@ -1555,38 +1589,6 @@ class QAService:
                 response.request_id, e, exc_info=True,
             )
 
-    def _contextualize_retrieval_question(
-        self,
-        question: str,
-        user_context: Optional[QAUserContext],
-    ) -> str:
-        """Append lightweight context that helps heterogeneous retrievers."""
-        if not user_context:
-            return question
-
-        hints = []
-        if user_context.country:
-            hints.append(f"country {user_context.country}")
-        if user_context.region and user_context.region != user_context.country:
-            hints.append(f"region {user_context.region}")
-        if user_context.member_age_group:
-            hints.append(f"age group {user_context.member_age_group}")
-        if user_context.experience_group:
-            hints.append(f"audience {user_context.experience_group}")
-
-        if not hints:
-            return question
-        return f"{question}\nContext: {', '.join(hints)}"
-
-    @staticmethod
-    def _infer_source_type(source: Dict[str, Any]) -> str:
-        source_type = source.get("source_type")
-        if source_type in {"article", "guideline"}:
-            return source_type
-        if source.get("rule_text") or source.get("guide_region") or source.get("guide_urn"):
-            return "guideline"
-        return "article"
-
     def _guideline_context_should_clauses(
         self,
         user_context: Optional[QAUserContext],
@@ -1620,125 +1622,6 @@ class QAService:
             expertise_level=expertise_level,
         )
         return result.source_payloads, result.retrieved_sources
-
-    def _retrieve_article_rag_sources(
-        self,
-        question: str,
-        top_k: int,
-        user_context: Optional[QAUserContext] = None,
-        expertise_level: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
-        """Retrieve article sources for default Elasticsearch RAG."""
-        try:
-            query_vector = self._embed_query(question)
-            raw_results = ELASTIC_CLIENT.knn_search(
-                index_name=self.INDEX_NAME,
-                query_vector=query_vector,
-                k=top_k,
-                num_candidates=max(top_k * 20, 100),
-                field="embedding",
-                filter_query=article_filter_query(expertise_level),
-                source_excludes=["embedding"],
-            )
-        except Exception as e:
-            logger.error("Article RAG retrieval failed: %s", e, exc_info=True)
-            return [], []
-
-        articles: List[Dict[str, Any]] = []
-        retrieved_models: List[RetrievedSource] = []
-        for result in raw_results:
-            result["source_type"] = "article"
-            result["retriever"] = "rag"
-            result["relevance_score"] = result.get("_score", 0.0)
-            articles.append(result)
-            retrieved_models.append(
-                RetrievedSource(
-                    source_type="article",
-                    urn=result.get("urn", result.get("_id", "")),
-                    title=result.get("title", ""),
-                    authors=result.get("authors"),
-                    venue=result.get("venue"),
-                    publication_year=result.get("publication_year"),
-                    category=result.get("category"),
-                    tags=result.get("tags"),
-                    similarity_score=result.get("_score", 0.0),
-                )
-            )
-        return articles, retrieved_models
-
-    def _retrieve_guideline_rag_sources(
-        self,
-        question: str,
-        top_k: int,
-        user_context: Optional[QAUserContext] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[RetrievedSource]]:
-        """Retrieve dietary guideline rule_text sources for default RAG."""
-        if top_k <= 0:
-            return [], []
-
-        context_should = self._guideline_context_should_clauses(user_context)
-        body = {
-            "size": top_k,
-            "query": guideline_base_query(question),
-            "_source": {"excludes": GUIDELINE_SOURCE_EXCLUDES},
-        }
-        if context_should:
-            body["query"]["bool"]["should"] = context_should
-
-        try:
-            response = ELASTIC_CLIENT.client.search(
-                index=self.GUIDELINES_INDEX_NAME,
-                body=body,
-            )
-        except Exception as e:
-            logger.error("Guideline RAG retrieval failed: %s", e, exc_info=True)
-            return [], []
-
-        guidelines: List[Dict[str, Any]] = []
-        retrieved_models: List[RetrievedSource] = []
-        for hit in response.get("hits", {}).get("hits", []):
-            source = hit.get("_source", {})
-            if not isinstance(source, dict):
-                continue
-
-            guideline = {
-                **source,
-                "_id": hit.get("_id"),
-                "_score": hit.get("_score", 0.0),
-                "source_type": "guideline",
-                "retriever": "rag",
-            }
-            rule_text = self._extract_guideline_rule_text(guideline)
-            if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
-                continue
-
-            urn = self._guideline_document_urn(guideline)
-            guideline["urn"] = urn
-            guideline["abstract"] = rule_text
-            guideline["description"] = rule_text
-            guideline["venue"] = guideline.get("guide_region")
-            guideline["relevance_score"] = guideline.get("_score", 0.0)
-            guideline["publication_year"] = self._guideline_publication_year(
-                guideline
-            )
-
-            tags = self._guideline_tags(guideline)
-            guidelines.append(guideline)
-            retrieved_models.append(
-                RetrievedSource(
-                    source_type="guideline",
-                    urn=urn,
-                    title=guideline.get("title", "Dietary guideline"),
-                    authors=None,
-                    venue=guideline.get("guide_region"),
-                    publication_year=guideline.get("publication_year"),
-                    category="guideline",
-                    tags=tags,
-                    similarity_score=guideline.get("_score", 0.0),
-                )
-            )
-
-        return guidelines, retrieved_models
 
     def _generate_simple_nutri_questions(
         self, count: int = 4, language: str = "en"
@@ -3378,7 +3261,7 @@ class QAService:
         return self.cache_manager.generate_cache_key(
             prefix="qa",
             data={
-                "version": 3,
+                "version": 4,
                 "question": effective_question.strip().lower(),
                 "mode": request.mode,
                 "model": self._resolve_model(request),
@@ -3389,6 +3272,14 @@ class QAService:
                 "experience_group": request.experience_group,
                 "language": request.language,
                 "user_context": context,
+                # A pipeline switch or ranking retune must miss the old cache:
+                # the same question now legitimately produces a different answer.
+                "pipeline": config.settings.get("QA_PIPELINE_MODE", "agentic"),
+                "ranking": {
+                    "half_life": config.settings.get("QA_RECENCY_HALF_LIFE_YEARS"),
+                    "influence": config.settings.get("QA_INFLUENCE_WEIGHT"),
+                    "min_score": config.settings.get("QA_MIN_SCORE"),
+                },
             },
         )
 

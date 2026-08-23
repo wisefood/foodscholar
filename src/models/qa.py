@@ -135,6 +135,190 @@ class QAClarifierSafetyPlan(BaseModel):
     )
 
 
+class SubQuestionFilters(BaseModel):
+    """Structured attribute constraints the planner extracted for one search.
+
+    Metadata-aware retrieval: deterministic, mapping-backed constraints
+    (publication year window, open access) become hard Elasticsearch filters
+    on BOTH legs — the kNN leg is informed by them, not just the BM25 leg.
+    Vocabulary-shaped attributes (study design, regions, facets) become
+    strong boosts instead, so an enrichment gap never silently empties
+    retrieval.
+    """
+
+    year_min: Optional[int] = Field(
+        default=None, description="Earliest publication year, inclusive"
+    )
+    year_max: Optional[int] = Field(
+        default=None, description="Latest publication year, inclusive"
+    )
+    open_access: Optional[bool] = Field(
+        default=None, description="Restrict to open-access articles when true"
+    )
+    study_types: List[str] = Field(
+        default_factory=list,
+        description="Preferred study designs, e.g. 'meta-analysis', 'rct'",
+    )
+    regions: List[str] = Field(
+        default_factory=list,
+        description="Guideline regions/countries the question targets",
+    )
+    target_populations: List[str] = Field(
+        default_factory=list,
+        description="Populations/life stages, e.g. 'pregnant_people', 'infants'",
+    )
+    food_groups: List[str] = Field(
+        default_factory=list,
+        description="Food groups the question concerns",
+    )
+    nutrients: List[str] = Field(
+        default_factory=list,
+        description="Nutrients the question concerns",
+    )
+    health_conditions: List[str] = Field(
+        default_factory=list,
+        description="Health conditions the question concerns, e.g. 'diabetes'",
+    )
+
+    def is_empty(self) -> bool:
+        return not any(
+            [
+                self.year_min,
+                self.year_max,
+                self.open_access,
+                self.study_types,
+                self.regions,
+                self.target_populations,
+                self.food_groups,
+                self.nutrients,
+                self.health_conditions,
+            ]
+        )
+
+
+class PlannedSubQuestion(BaseModel):
+    """One typed sub-question the planner decided to search, and why."""
+
+    id: str = Field(description="Stable id within the plan, e.g. 'sq1'")
+    text: str = Field(description="The sub-question in natural language")
+    why: str = Field(
+        default="",
+        description="One-line user-visible rationale for running this search",
+    )
+    qtype: Literal[
+        "quantity",
+        "mechanism",
+        "safety",
+        "recommendation",
+        "comparison",
+        "general",
+    ] = Field(default="general", description="What kind of evidence it seeks")
+    branch: Literal["articles", "guidelines", "both"] = Field(
+        default="both",
+        description="Which evidence branch(es) this sub-question targets",
+    )
+    lexical_query: str = Field(
+        default="",
+        description="Keyword-style query for the BM25 leg",
+    )
+    dense_query: str = Field(
+        default="",
+        description="Natural-sentence query for the vector leg",
+    )
+    filters: SubQuestionFilters = Field(
+        default_factory=SubQuestionFilters,
+        description="Attribute constraints applied to both retrieval legs",
+    )
+    round_added: int = Field(
+        default=0,
+        description="Pipeline round in which this sub-question was added",
+    )
+
+
+class QAPipelinePlan(QAClarifierSafetyPlan):
+    """Clarifier/safety plan extended with the retrieval decomposition."""
+
+    sub_questions: List[PlannedSubQuestion] = Field(
+        default_factory=list,
+        description="Typed sub-questions with reasoned queries",
+    )
+
+
+class ResearchNote(BaseModel):
+    """A working note the pipeline keeps while researching a question.
+
+    Notes accumulate across retrieval rounds ("found strong RCT evidence on X",
+    "gap: no pediatric guidance retrieved", "lead: search for 'alpha-linolenic
+    acid' instead") and persist on the QA thread so a follow-up question starts
+    from what earlier searches already established.
+    """
+
+    text: str = Field(description="The note itself, one short sentence")
+    kind: Literal["finding", "gap", "lead"] = Field(
+        default="finding",
+        description=(
+            "finding = evidence located; gap = something the corpus lacked; "
+            "lead = a promising direction for a subsequent search"
+        ),
+    )
+    sub_question_id: Optional[str] = Field(
+        default=None,
+        description="Sub-question this note came from, when attributable",
+    )
+    source_urns: List[str] = Field(
+        default_factory=list,
+        description="Source URNs the note refers to",
+    )
+
+
+class ReasoningStep(BaseModel):
+    """One user-visible step of the agentic pipeline, for collapsible UI.
+
+    Streamed as ``step`` SSE events while running (same ``id`` re-emitted with
+    an updated status) and included in full on the final response, so the UI
+    can render a ChatGPT-style inline step disclosure both live and after the
+    fact (page reload, cached answers, the non-streaming endpoint).
+
+    ``title``/``detail`` are ready-to-render text (dynamic parts such as the
+    planner's "why" come localized from the prompts); ``kind`` plus ``data``
+    carry the structured form for UIs that prefer to compose their own labels.
+    """
+
+    id: str = Field(description="Stable step id within the request")
+    kind: Literal[
+        "plan",
+        "search",
+        "rank",
+        "notes",
+        "evaluate",
+        "repair",
+        "answer",
+        "cache",
+        "clarification",
+    ] = Field(description="What kind of pipeline step this is")
+    status: Literal["running", "done"] = Field(
+        default="running",
+        description="Steps stream twice: once running, once done",
+    )
+    title: str = Field(description="Short ready-to-render step label")
+    detail: Optional[str] = Field(
+        default=None,
+        description="One optional supporting line under the title",
+    )
+    round: int = Field(
+        default=0,
+        description="Pipeline round the step belongs to (repairs bump it)",
+    )
+    elapsed_ms: Optional[int] = Field(
+        default=None,
+        description="Wall-clock duration, set when the step completes",
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured payload (queries, counts, notes, verdicts...)",
+    )
+
+
 class QARequest(BaseModel):
     """Request model for the Q&A endpoint."""
 
@@ -240,6 +424,22 @@ class QACitation(BaseModel):
         default=None,
         description="Short display label for inline citation, e.g. G1, G2 for guidelines",
     )
+    guide_urn: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent guide of a guideline citation. Lets a client land on the "
+            "guide page even when the rule itself is no longer publicly "
+            "readable (same contract as TipEvidence)."
+        ),
+    )
+    region: Optional[str] = Field(
+        default=None,
+        description="Guide region of a guideline citation, for guide routing",
+    )
+    page_no: Optional[int] = Field(
+        default=None,
+        description="PDF page the cited rule came from, when known",
+    )
 
 
 class QAAnswer(BaseModel):
@@ -298,6 +498,17 @@ class RetrievedSource(BaseModel):
     tags: Optional[List[str]] = Field(default=None, description="Source tags")
     similarity_score: float = Field(
         description="Retriever relevance score"
+    )
+    guide_urn: Optional[str] = Field(
+        default=None,
+        description=(
+            "Parent guide of a guideline source, so the UI can deep-link the "
+            "guide page even when the rule is not publicly readable"
+        ),
+    )
+    page_no: Optional[int] = Field(
+        default=None,
+        description="PDF page a guideline rule came from, when known",
     )
 
 
@@ -364,6 +575,14 @@ class QAResponse(BaseModel):
             "Consent nudges for durable preferences the user expressed in the "
             "question ('It seems you love lentils — remember this?'). Written "
             "to the member profile only via POST /qa/memory on an explicit yes."
+        ),
+    )
+    reasoning_steps: Optional[List[ReasoningStep]] = Field(
+        default=None,
+        description=(
+            "The pipeline steps that produced this answer (searches with "
+            "rationales, ranking, evidence checks, notes), for transparent "
+            "collapsible rendering. Null on the legacy pipeline."
         ),
     )
 

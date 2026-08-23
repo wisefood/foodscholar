@@ -3,3 +3,5 @@ foodscholar/
 __pycache__/
 *.py[cod]
 src/data/*
+# Confidential research material — never commit
+docs/ACCRETE_RESEARCH_PROPOSAL.md

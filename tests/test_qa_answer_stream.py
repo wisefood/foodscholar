@@ -1,0 +1,191 @@
+"""Tests for the sentinel-protocol streaming answer generator."""
+
+import unittest
+from unittest.mock import patch
+
+from services.qa_pipeline import answering
+
+
+class _FakeChunk:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeStreamingLLM:
+    """Yields the given chunk texts from astream."""
+
+    def __init__(self, chunks, fail_after=None):
+        self.chunks = chunks
+        self.fail_after = fail_after
+
+    async def astream(self, _messages, config=None):
+        for index, chunk in enumerate(self.chunks):
+            if self.fail_after is not None and index >= self.fail_after:
+                raise RuntimeError("provider dropped the stream")
+            yield _FakeChunk(chunk)
+
+
+PAYLOADS = [
+    {
+        "urn": "urn:article:a1",
+        "source_type": "article",
+        "title": "Whole grains and lipids",
+        "authors": ["Doe"],
+        "publication_year": "2021",
+        "abstract": (
+            "Whole-grain intake reduced LDL cholesterol in adults. "
+            "Effects were consistent across cohorts."
+        ),
+        "relevance_score": 0.9,
+    },
+    {
+        "urn": "guideline-1",
+        "source_type": "guideline",
+        "title": "Healthy eating guide",
+        "rule_text": "Choose whole-grain cereals, bread, rice, or pasta more often.",
+        "relevance_score": 5.0,
+    },
+]
+
+TRAILER = (
+    '{"cited_sources": [{"urn": "urn:article:a1", "section": "abstract", '
+    '"quote": "Whole-grain intake reduced LDL cholesterol in adults.", '
+    '"confidence": "high"}], "overall_confidence": "high", '
+    '"follow_ups": ["What about oats?"]}'
+)
+
+
+async def _collect(chunks, payloads=PAYLOADS, fail_after=None):
+    events = []
+    llm = _FakeStreamingLLM(chunks, fail_after=fail_after)
+    with patch.object(answering.GROQ_CHAT, "get_client", return_value=llm):
+        async for event in answering.stream_answer(
+            question="Do whole grains lower cholesterol?",
+            payloads=payloads,
+            expertise_level="intermediate",
+            language="en",
+            model="test-model",
+        ):
+            events.append(event)
+    return events
+
+
+def _deltas(events):
+    return "".join(e["text"] for e in events if e["kind"] == "delta")
+
+
+def _final(events):
+    finals = [e for e in events if e["kind"] == "final"]
+    assert len(finals) == 1
+    return finals[0]
+
+
+class SentinelStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_happy_path_streams_answer_and_parses_trailer(self):
+        answer = "Whole grains help [Doe et al. (2021)](/articles/urn:article:a1)."
+        events = await _collect(
+            [answer, "\n", answering.ANSWER_SENTINEL, "\n", TRAILER]
+        )
+        final = _final(events)
+        self.assertEqual(_deltas(events).strip(), answer)
+        self.assertNotIn(answering.ANSWER_SENTINEL, _deltas(events))
+        self.assertTrue(final["parsed_trailer"])
+        self.assertEqual(final["answer"].confidence, "high")
+        self.assertEqual(len(final["answer"].citations), 1)
+        citation = final["answer"].citations[0]
+        self.assertEqual(citation.source_id, "urn:article:a1")
+        # Quote is an exact substring of the source text.
+        self.assertIn(citation.quote, PAYLOADS[0]["abstract"])
+        self.assertEqual(final["follow_ups"], ["What about oats?"])
+
+    async def test_sentinel_split_across_chunks_is_never_emitted(self):
+        answer = "Answer text here."
+        events = await _collect(
+            [answer, " <<<END_", "ANSWER>>>", TRAILER[:20], TRAILER[20:]]
+        )
+        deltas = _deltas(events)
+        self.assertNotIn("<<<", deltas)
+        self.assertNotIn("END_ANSWER", deltas)
+        self.assertEqual(deltas.strip(), answer)
+        self.assertTrue(_final(events)["parsed_trailer"])
+
+    async def test_missing_trailer_recovers_citations_from_links(self):
+        answer = (
+            "Whole grains help [Doe et al. (2021)](/articles/urn:article:a1) and "
+            "guidelines agree [G1](/guidelines/guideline-1)."
+        )
+        events = await _collect([answer])
+        final = _final(events)
+        self.assertFalse(final["parsed_trailer"])
+        cited_ids = {c.source_id for c in final["answer"].citations}
+        self.assertEqual(cited_ids, {"urn:article:a1", "guideline-1"})
+        # Best-effort quotes still land as exact source substrings.
+        for citation in final["answer"].citations:
+            self.assertTrue(citation.quote)
+
+    async def test_json_mode_output_is_buffered_not_streamed_raw(self):
+        # A model that ignored the protocol and returned the legacy JSON shape.
+        legacy = (
+            '{"answer": "Whole grains help.", "cited_sources": [], '
+            '"overall_confidence": "medium", "follow_ups": []}'
+        )
+        events = await _collect([legacy[:30], legacy[30:]])
+        final = _final(events)
+        self.assertEqual(_deltas(events), "Whole grains help.")
+        self.assertEqual(final["answer"].answer, "Whole grains help.")
+
+    async def test_midstream_failure_still_produces_an_answer(self):
+        events = await _collect(
+            ["A partial answer that streamed fine before the crash. Then more words arrive here."],
+            fail_after=None,
+        )
+        # Baseline sanity: full stream works.
+        self.assertTrue(_final(events)["answer"].answer)
+
+        events = await _collect(
+            [
+                "A partial answer that streamed fine before the crash. Then more words arrive here.",
+                "never delivered",
+            ],
+            fail_after=1,
+        )
+        final = _final(events)
+        self.assertEqual(final["answer"].confidence, "medium")
+        self.assertIn("partial answer", final["answer"].answer)
+
+    async def test_total_failure_yields_error_answer(self):
+        events = await _collect(["ignored"], fail_after=0)
+        final = _final(events)
+        self.assertEqual(final["answer"].confidence, "low")
+        self.assertIn("Unable to generate", final["answer"].answer)
+
+    async def test_no_sources_never_fabricates_citations(self):
+        answer = "General guidance without sources."
+        events = await _collect(
+            [answer, answering.ANSWER_SENTINEL,
+             '{"cited_sources": [], "overall_confidence": "medium", "follow_ups": []}'],
+            payloads=[],
+        )
+        final = _final(events)
+        self.assertFalse(final["answer"].rag_used)
+        self.assertEqual(final["answer"].citations, [])
+
+
+class InlineCitationRecoveryTests(unittest.TestCase):
+    def test_unknown_urns_are_ignored(self):
+        cited = answering.citations_from_inline_links(
+            "See [X](/articles/urn:article:a1) and [Y](/articles/urn:article:unknown).",
+            PAYLOADS,
+        )
+        self.assertEqual([c["urn"] for c in cited], ["urn:article:a1"])
+
+    def test_duplicates_collapse(self):
+        text = (
+            "[A](/articles/urn:article:a1) then again [A](/articles/urn:article:a1)"
+        )
+        cited = answering.citations_from_inline_links(text, PAYLOADS)
+        self.assertEqual(len(cited), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

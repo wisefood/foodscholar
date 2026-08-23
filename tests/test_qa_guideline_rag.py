@@ -5,10 +5,10 @@ from unittest.mock import patch
 class _FakeGuidelineSearchClient:
     def search(self, index, body):
         assert index == "guidelines"
-        # Default retrieval is keyword-only: no vector leg unless hybrid mode
-        # is switched on. Checked structurally rather than by searching the
-        # serialized body for "embedding", because the query legitimately names
-        # that field in `_source.excludes`.
+        # This test pins QA_GUIDELINE_RETRIEVAL_MODE=bm25, so no vector leg.
+        # Checked structurally rather than by searching the serialized body
+        # for "embedding", because the query legitimately names that field in
+        # `_source.excludes`.
         assert "knn" not in body
         # The vector is never returned; once the corpus is embedded it would
         # otherwise be the bulk of every hit.
@@ -40,7 +40,16 @@ class _FakeGuidelineSearchClient:
 class QAGuidelineRagTests(unittest.TestCase):
     def test_default_rag_retrieves_articles_and_guidelines(self):
         import services.qa_retrievers as qa_retrievers_module
+        from config import config
         from services.qa_service import QAService
+
+        original_mode = config.settings.get("QA_GUIDELINE_RETRIEVAL_MODE")
+        config.settings["QA_GUIDELINE_RETRIEVAL_MODE"] = "bm25"
+        self.addCleanup(
+            config.settings.__setitem__,
+            "QA_GUIDELINE_RETRIEVAL_MODE",
+            original_mode,
+        )
 
         service = QAService(cache_enabled=False)
         service._embed_query = lambda _question: [0.1, 0.2]  # type: ignore[assignment]
@@ -96,6 +105,9 @@ class QAGuidelineRagTests(unittest.TestCase):
             "title": "Healthy eating guide",
             "rule_text": "Choose whole-grain cereals, bread, rice, or pasta more often.",
             "publication_year": "2024-01-01",
+            "guide_urn": "urn:guide:eu-healthy-eating",
+            "guide_region": "EU",
+            "page_no": 12,
         }
         parsed = {
             "answer": (
@@ -126,6 +138,96 @@ class QAGuidelineRagTests(unittest.TestCase):
         self.assertEqual(answer.citations[0].source_title, "Healthy eating guide")
         self.assertEqual(answer.citations[0].section, "rule_text")
         self.assertEqual(answer.citations[0].quote, guideline["rule_text"])
+        # Guide-routing hints ride the citation so the UI can land on the
+        # guide page (rule highlighted, PDF page open) even when the rule
+        # itself is not publicly readable.
+        self.assertEqual(
+            answer.citations[0].guide_urn, "urn:guide:eu-healthy-eating"
+        )
+        self.assertEqual(answer.citations[0].region, "EU")
+        self.assertEqual(answer.citations[0].page_no, 12)
+
+
+class SourceContextFacetTests(unittest.TestCase):
+    """The answer prompt must surface applicability facets and bibliometrics."""
+
+    def test_guideline_block_carries_enrichment_facets(self):
+        from agents.qa_agent import prepare_source_context
+
+        block = prepare_source_context(
+            [
+                {
+                    "source_type": "guideline",
+                    "urn": "guideline-1",
+                    "title": "Toddler eating guide",
+                    "rule_text": "Provide portions of red meat twice a week.",
+                    "guide_region": "IE",
+                    "life_stage": ["early_childhood"],
+                    "age_min_months": 12,
+                    "age_max_months": 48,
+                    "nutrients": ["iron"],
+                    "health_conditions": ["anemia"],
+                    "action_type": "eat",
+                    "frequency": "weekly",
+                }
+            ]
+        )
+        self.assertIn("Life Stage: early_childhood", block)
+        self.assertIn("Applies To Ages: 1 year to 4 years", block)
+        self.assertIn("Nutrients: iron", block)
+        self.assertIn("Health Conditions: anemia", block)
+        self.assertIn("Action/Frequency: eat / weekly", block)
+
+    def test_guideline_block_omits_absent_facets(self):
+        from agents.qa_agent import prepare_source_context
+
+        block = prepare_source_context(
+            [
+                {
+                    "source_type": "guideline",
+                    "urn": "guideline-2",
+                    "title": "General guide",
+                    "rule_text": "Eat a variety of vegetables every day.",
+                    "age_min_months": -1,
+                    "age_max_months": -1,
+                }
+            ]
+        )
+        self.assertNotIn("Life Stage:", block)
+        self.assertNotIn("Applies To Ages:", block)
+        self.assertNotIn("Health Conditions:", block)
+
+    def test_article_block_carries_citation_counts(self):
+        from agents.qa_agent import prepare_source_context
+
+        block = prepare_source_context(
+            [
+                {
+                    "source_type": "article",
+                    "urn": "urn:article:a1",
+                    "title": "Whole grains and lipids",
+                    "abstract": "Whole grains lower LDL.",
+                    "citationCount": 240,
+                    "influentialCitationCount": 12,
+                }
+            ]
+        )
+        self.assertIn("Citations: 240 (influential: 12)", block)
+
+    def test_article_block_omits_unstored_bibliometrics(self):
+        from agents.qa_agent import prepare_source_context
+
+        block = prepare_source_context(
+            [
+                {
+                    "source_type": "article",
+                    "urn": "urn:article:a2",
+                    "title": "Uncounted",
+                    "abstract": "No metrics yet.",
+                }
+            ]
+        )
+        self.assertNotIn("Citations:", block)
 
 
 if __name__ == "__main__":

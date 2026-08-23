@@ -171,6 +171,93 @@ class LinearragRetrieverAdapter:
         )
 
 
+def normalize_article_hit(
+    result: Dict[str, Any],
+    *,
+    retriever: str = "rag",
+) -> tuple[Dict[str, Any], RetrievedSource]:
+    """Shape a raw article hit into the payload + display source pair.
+
+    Shared by the legacy adapter and the agentic pipeline so both feed the
+    answer prompt and the UI the exact same article shape.
+    """
+    result["source_type"] = "article"
+    result["retriever"] = retriever
+    result["relevance_score"] = result.get("_score", 0.0)
+    retrieved = RetrievedSource(
+        source_type="article",
+        urn=text_value(result.get("urn") or result.get("_id")),
+        title=text_value(result.get("title")),
+        authors=normalize_string_list(result.get("authors")),
+        venue=text_value(result.get("venue"), default=None),
+        publication_year=text_value(
+            result.get("publication_year"),
+            default=None,
+        ),
+        category=text_value(result.get("category"), default=None),
+        tags=normalize_string_list(result.get("tags")),
+        similarity_score=score_value(result.get("_score")),
+    )
+    return result, retrieved
+
+
+def normalize_guideline_hit(
+    hit: Dict[str, Any],
+    *,
+    retriever: str = "rag",
+) -> Optional[tuple[Dict[str, Any], RetrievedSource]]:
+    """Shape a raw guideline ES hit; None when the rule text is unusable."""
+    source = hit.get("_source", {})
+    if not isinstance(source, dict):
+        return None
+
+    guideline = {
+        **source,
+        "_id": hit.get("_id"),
+        "_score": hit.get("_score", 0.0),
+        "source_type": "guideline",
+        "retriever": retriever,
+    }
+    rule_text = extract_guideline_rule_text(guideline)
+    if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
+        return None
+
+    urn = guideline_document_urn(guideline)
+    guideline["urn"] = urn
+    guideline["abstract"] = rule_text
+    guideline["description"] = rule_text
+    guideline["venue"] = guideline.get("guide_region")
+    guideline["relevance_score"] = guideline.get("_score", 0.0)
+    guideline["publication_year"] = guideline_publication_year(guideline)
+
+    raw_page = guideline.get("page_no")
+    page_no = (
+        int(raw_page)
+        if isinstance(raw_page, (int, float)) and not isinstance(raw_page, bool)
+        else None
+    )
+    retrieved = RetrievedSource(
+        source_type="guideline",
+        urn=urn,
+        title=text_value(
+            guideline.get("title"),
+            default="Dietary guideline",
+        ),
+        authors=None,
+        venue=text_value(guideline.get("guide_region"), default=None),
+        publication_year=text_value(
+            guideline.get("publication_year"),
+            default=None,
+        ),
+        category="guideline",
+        tags=guideline_tags(guideline),
+        similarity_score=score_value(guideline.get("_score")),
+        guide_urn=text_value(guideline.get("guide_urn"), default=None),
+        page_no=page_no,
+    )
+    return guideline, retrieved
+
+
 class ElasticRagRetrieverAdapter:
     """Adapter for default Elastic article + guideline retrieval."""
 
@@ -264,26 +351,11 @@ class ElasticRagRetrieverAdapter:
         payloads: List[Dict[str, Any]] = []
         retrieved: List[RetrievedSource] = []
         for result in raw_results:
-            result["source_type"] = "article"
-            result["retriever"] = self.retriever_name
-            result["relevance_score"] = result.get("_score", 0.0)
-            payloads.append(result)
-            retrieved.append(
-                RetrievedSource(
-                    source_type="article",
-                    urn=text_value(result.get("urn") or result.get("_id")),
-                    title=text_value(result.get("title")),
-                    authors=normalize_string_list(result.get("authors")),
-                    venue=text_value(result.get("venue"), default=None),
-                    publication_year=text_value(
-                        result.get("publication_year"),
-                        default=None,
-                    ),
-                    category=text_value(result.get("category"), default=None),
-                    tags=normalize_string_list(result.get("tags")),
-                    similarity_score=score_value(result.get("_score")),
-                )
+            payload, source = normalize_article_hit(
+                result, retriever=self.retriever_name
             )
+            payloads.append(payload)
+            retrieved.append(source)
 
         return (
             payloads,
@@ -359,49 +431,14 @@ class ElasticRagRetrieverAdapter:
         payloads: List[Dict[str, Any]] = []
         retrieved: List[RetrievedSource] = []
         for hit in response.get("hits", {}).get("hits", []):
-            source = hit.get("_source", {})
-            if not isinstance(source, dict):
-                continue
-
-            guideline = {
-                **source,
-                "_id": hit.get("_id"),
-                "_score": hit.get("_score", 0.0),
-                "source_type": "guideline",
-                "retriever": self.retriever_name,
-            }
-            rule_text = extract_guideline_rule_text(guideline)
-            if len(rule_text) < TIP_SOURCE_GUIDELINE_MIN_RULE_CHARS:
-                continue
-
-            urn = guideline_document_urn(guideline)
-            guideline["urn"] = urn
-            guideline["abstract"] = rule_text
-            guideline["description"] = rule_text
-            guideline["venue"] = guideline.get("guide_region")
-            guideline["relevance_score"] = guideline.get("_score", 0.0)
-            guideline["publication_year"] = guideline_publication_year(guideline)
-
-            payloads.append(guideline)
-            retrieved.append(
-                RetrievedSource(
-                    source_type="guideline",
-                    urn=urn,
-                    title=text_value(
-                        guideline.get("title"),
-                        default="Dietary guideline",
-                    ),
-                    authors=None,
-                    venue=text_value(guideline.get("guide_region"), default=None),
-                    publication_year=text_value(
-                        guideline.get("publication_year"),
-                        default=None,
-                    ),
-                    category="guideline",
-                    tags=guideline_tags(guideline),
-                    similarity_score=score_value(guideline.get("_score")),
-                )
+            normalized = normalize_guideline_hit(
+                hit, retriever=self.retriever_name
             )
+            if normalized is None:
+                continue
+            guideline, source = normalized
+            payloads.append(guideline)
+            retrieved.append(source)
 
         return (
             payloads,
@@ -550,12 +587,13 @@ def guideline_hybrid_enabled() -> bool:
     """
     Whether guideline retrieval combines BM25 with vector search.
 
-    Off by default: the vector leg is only useful once guidelines have been
-    embedded, and enabling it before the backfill completes would rank the
-    embedded minority above everything else.
+    On by default now that the guideline embedding backfill has run. Set
+    QA_GUIDELINE_RETRIEVAL_MODE=bm25 on a deployment whose guidelines are not
+    embedded yet — there the vector leg would rank the embedded minority
+    above everything else.
     """
     return str(
-        config.settings.get("QA_GUIDELINE_RETRIEVAL_MODE", "bm25")
+        config.settings.get("QA_GUIDELINE_RETRIEVAL_MODE", "hybrid")
     ).strip().lower() == "hybrid"
 
 
@@ -607,6 +645,70 @@ def guideline_tip_pool_query(query: Optional[str] = None) -> Dict[str, Any]:
     return {"bool": {"must": must, "filter": guideline_retrieval_filter()}}
 
 
+# Age groups → the enrichment facets they correspond to. ``member_age_group``
+# arrives as free-ish text ("toddler", "adult", "0-3") while ``life_stage`` is
+# a closed vocabulary and the age window is integer months — a lexical match
+# between them never fires, so the mapping is explicit.
+AGE_GROUP_FACETS: List[tuple] = [
+    # (tokens that identify the group, life_stage terms, months_min, months_max)
+    (("infant", "baby", "0-1", "0-12"), ["infancy"], 0, 12),
+    (("toddler", "1-3", "1-4", "0-3"), ["early_childhood"], 12, 48),
+    (("child", "kid", "4-8", "school", "5-12"), ["early_childhood", "school_age"], 48, 144),
+    (("teen", "adolescent", "13-18"), ["adolescence"], 144, 216),
+    (("adult", "18-64", "19-64"), ["adulthood"], 216, 780),
+    (("elder", "older", "senior", "65"), ["older_adulthood"], 780, 1560),
+    (("pregnan",), ["pregnancy"], None, None),
+    (("lactat", "breastfeed"), ["lactation"], None, None),
+]
+
+
+def age_group_facets(age_group: Optional[str]) -> Optional[tuple]:
+    """Resolve an age-group string to (life_stage terms, months_min, months_max)."""
+    if not isinstance(age_group, str) or not age_group.strip():
+        return None
+    lowered = age_group.strip().lower()
+    for tokens, life_stages, months_min, months_max in AGE_GROUP_FACETS:
+        if any(token in lowered for token in tokens):
+            return life_stages, months_min, months_max
+    return None
+
+
+def guideline_age_should_clauses(age_group: Optional[str]) -> List[Dict[str, Any]]:
+    """Boosts for rules whose life_stage / age window matches the age group.
+
+    Boost-only, like every context clause. The age-window clause requires the
+    rule's window to OVERLAP the group's window; rules with the "not stated"
+    sentinel (-1) simply never earn this particular boost.
+    """
+    resolved = age_group_facets(age_group)
+    if not resolved:
+        return []
+    life_stages, months_min, months_max = resolved
+
+    clauses: List[Dict[str, Any]] = [
+        {
+            "multi_match": {
+                "query": " ".join(life_stages),
+                "fields": ["life_stage^4", "target_populations^2"],
+                "type": "best_fields",
+            }
+        }
+    ]
+    if months_min is not None and months_max is not None:
+        clauses.append(
+            {
+                "bool": {
+                    "must": [
+                        {"range": {"age_min_months": {"gte": 0, "lte": months_max}}},
+                        {"range": {"age_max_months": {"gte": months_min}}},
+                    ],
+                    "boost": 3.0,
+                }
+            }
+        )
+    return clauses
+
+
 def guideline_context_should_clauses(
     user_context: Optional[QAUserContext],
 ) -> List[Dict[str, Any]]:
@@ -620,6 +722,7 @@ def guideline_context_should_clauses(
         return []
 
     clauses: List[Dict[str, Any]] = []
+    clauses.extend(guideline_age_should_clauses(user_context.member_age_group))
     geography_terms = [
         term
         for term in [user_context.country, user_context.region]

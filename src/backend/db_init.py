@@ -59,6 +59,10 @@ def _apply_schema_updates(conn) -> None:
         ALTER TABLE IF EXISTS {SCHEMA}.qa_feedback
         ALTER COLUMN feedback_mode SET NOT NULL
         """,
+        f"""
+        ALTER TABLE IF EXISTS {SCHEMA}.qa_requests
+        ADD COLUMN IF NOT EXISTS pipeline_meta JSONB
+        """,
     ]
 
     for stmt in statements:

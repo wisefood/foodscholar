@@ -42,6 +42,9 @@ class QARequestRecord(Base):
     dual_strategy = Column(String(64), nullable=True)
 
     retrieved_article_urns = Column(JSONB, nullable=True)
+    # Agentic pipeline metadata: sub-questions (with rationales), rounds,
+    # evaluator verdicts, repairs, research notes, timings. Null on legacy.
+    pipeline_meta = Column(JSONB, nullable=True)
     confidence = Column(String(16), nullable=True)
     articles_consulted = Column(Integer, nullable=False, default=0)
     cache_hit = Column(Boolean, nullable=False, default=False)

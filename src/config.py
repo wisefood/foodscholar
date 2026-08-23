@@ -137,11 +137,12 @@ class Config:
             os.getenv("GUIDELINE_ENRICHMENT_LOCK_TIMEOUT", "7200")
         )
 
-        # Guideline retrieval mode: "bm25" (default) or "hybrid" (BM25 + kNN).
-        # Hybrid only helps once the guideline embedding backfill has run; until
-        # then the vector leg would favour the embedded minority.
+        # Guideline retrieval mode: "hybrid" (BM25 + kNN, default now that the
+        # guideline embedding backfill has run) or "bm25" (keyword only — the
+        # fallback for deployments whose guidelines are not yet embedded, where
+        # the vector leg would favour the embedded minority).
         self.settings["QA_GUIDELINE_RETRIEVAL_MODE"] = os.getenv(
-            "QA_GUIDELINE_RETRIEVAL_MODE", "bm25"
+            "QA_GUIDELINE_RETRIEVAL_MODE", "hybrid"
         )
         self.settings["QA_GUIDELINE_KNN_BOOST"] = float(
             os.getenv("QA_GUIDELINE_KNN_BOOST", "1.0")
@@ -220,6 +221,49 @@ class Config:
         )
         self.settings["GUIDELINE_ENRICHMENT_MODEL"] = os.getenv(
             "GUIDELINE_ENRICHMENT_MODEL", "openai/gpt-oss-20b"
+        )
+
+        # ------------------------------------------------------------------
+        # Agentic QA pipeline (plan → retrieve → rank → evaluate → answer)
+        # ------------------------------------------------------------------
+        # "agentic" runs the reasoning pipeline; "legacy" is the rollback flag
+        # for the pre-pipeline single-pass flow.
+        self.settings["QA_PIPELINE_MODE"] = os.getenv("QA_PIPELINE_MODE", "agentic")
+        # The planner decomposes the question; the evaluator judges evidence
+        # sufficiency. Both are structured JSON calls where the small reasoning
+        # model is the right cost point.
+        self.settings["QA_PLANNER_MODEL"] = os.getenv(
+            "QA_PLANNER_MODEL", self.settings["QA_FAST_MODEL"]
+        )
+        self.settings["QA_EVALUATOR_MODEL"] = os.getenv(
+            "QA_EVALUATOR_MODEL", self.settings["QA_UTILITY_MODEL"]
+        )
+        self.settings["QA_MAX_SUBQUESTIONS"] = int(
+            os.getenv("QA_MAX_SUBQUESTIONS", "3")
+        )
+        self.settings["QA_MAX_REPAIR_ROUNDS"] = int(
+            os.getenv("QA_MAX_REPAIR_ROUNDS", "1")
+        )
+        # Client-side reciprocal rank fusion of the lexical and vector legs.
+        self.settings["QA_RRF_K"] = int(os.getenv("QA_RRF_K", "60"))
+        self.settings["QA_RRF_CANDIDATES"] = int(os.getenv("QA_RRF_CANDIDATES", "30"))
+        # Ranking adjustment: exponential recency decay with a floor (an old
+        # meta-analysis is discounted, not erased) and a log-scaled citation
+        # boost that never punishes missing bibliometrics.
+        self.settings["QA_RECENCY_HALF_LIFE_YEARS"] = float(
+            os.getenv("QA_RECENCY_HALF_LIFE_YEARS", "6.0")
+        )
+        self.settings["QA_RECENCY_FLOOR"] = float(os.getenv("QA_RECENCY_FLOOR", "0.35"))
+        self.settings["QA_INFLUENCE_WEIGHT"] = float(
+            os.getenv("QA_INFLUENCE_WEIGHT", "0.3")
+        )
+        self.settings["QA_INFLUENCE_CITATION_CAP"] = int(
+            os.getenv("QA_INFLUENCE_CITATION_CAP", "1000")
+        )
+        self.settings["QA_MIN_SCORE"] = float(os.getenv("QA_MIN_SCORE", "0.05"))
+        self.settings["QA_PER_DOC_CAP"] = int(os.getenv("QA_PER_DOC_CAP", "2"))
+        self.settings["QA_STREAM_HEARTBEAT_SECONDS"] = int(
+            os.getenv("QA_STREAM_HEARTBEAT_SECONDS", "15")
         )
 
         self._validate_models()
