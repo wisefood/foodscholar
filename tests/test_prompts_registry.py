@@ -133,6 +133,8 @@ JSON structure:
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
 }}
 
+follow_ups are questions the USER would type to FoodScholar next (e.g. "How do I safely thaw chicken?") — NEVER questions aimed at the user (no "Do you need...", "Would you like...", "Are you interested...").
+
 IMPORTANT: Return ONLY the JSON object."""
         self.assertEqual(msgs[0].content, legacy_sys)
         self.assertIn("Q?", msgs[1].content)
@@ -297,12 +299,57 @@ class TestPromptSync(unittest.TestCase):
         # The UI-edited existing prompt is left untouched.
         self.assertNotIn(ns + "p-existing-diff", fake.created)
         self.assertEqual(result["created"], 1)
+        self.assertEqual(result["updated"], 0)
         self.assertEqual(result["skipped"], 2)
+
+    def test_force_sync_updates_only_changed_prompts(self):
+        """--force publishes the fallback as a new version where the live text
+        differs; identical prompts are still skipped and missing ones created."""
+        from backend import prompts as P
+
+        class FakeManaged:
+            def __init__(self, prompt):
+                self.prompt = prompt
+
+        ns = P._PROMPT_NAMESPACE
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.store = {
+                    ns + "p-existing-same": "SAME",     # identical -> skip
+                    ns + "p-existing-diff": "UI EDIT",  # differs -> new version
+                }
+
+            def get_prompt(self, name, **kwargs):
+                if name not in self.store:
+                    raise Exception(f"Prompt not found: '{name}'")
+                return FakeManaged(self.store[name])
+
+            def create_prompt(self, *, name, type, prompt, labels):
+                self.created.append((name, prompt, tuple(labels)))
+
+        fake = FakeClient()
+        result = P.sync_prompts(client=fake, registry=self._registry(), force=True)
+
+        created_names = [name for name, _, _ in fake.created]
+        self.assertIn(ns + "p-existing-diff", created_names)
+        self.assertIn(ns + "p-missing", created_names)
+        self.assertNotIn(ns + "p-existing-same", created_names)
+        # The new version carries the fallback text and the production label.
+        updated = next(c for c in fake.created if c[0] == ns + "p-existing-diff")
+        self.assertEqual(updated[1], "NEW TEXT")
+        self.assertEqual(updated[2], ("production",))
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["skipped"], 1)
 
     def test_sync_noop_when_client_none(self):
         from backend import prompts as P
         result = P.sync_prompts(client=None, registry=self._registry())
-        self.assertEqual(result, {"created": 0, "skipped": 0, "failed": 0})
+        self.assertEqual(
+            result, {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
+        )
 
 
 if __name__ == "__main__":

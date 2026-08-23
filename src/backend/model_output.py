@@ -70,21 +70,31 @@ def normalize_model_text(content: Any) -> str:
 # style. Prompts forbid both, but prompts are advisory; this is the guarantee.
 _SPACED_DASH_RE = re.compile(r"[ \t]*[—–][ \t]+")
 _BARE_DASH_RE = re.compile(r"[—–]")
+# "[Zhao et al. (2025)(/articles/urn)" — the model dropped the "](" between
+# label and URL, so markdown never forms the link. The non-greedy label plus
+# the /articles|/guidelines requirement makes this repair only ever fire on a
+# citation whose closing bracket is missing; well-formed links can't match
+# because "]" is excluded from the label class.
+_UNCLOSED_CITATION_RE = re.compile(
+    r"\[([^\[\]]+?)\((/(?:articles|guidelines)/[^)\s]+)\)"
+)
 
 
 def normalize_answer_prose(text: Any) -> str:
     """
-    Repair citation brackets and strip em/en-dashes from user-facing prose.
+    Repair citation markdown and strip em/en-dashes from user-facing prose.
 
     ``【`` becomes ``[`` and ``】`` is dropped, so a malformed
-    ``【label](url)】`` parses as a normal markdown link. A dash used as a
-    clause break (spaced) becomes a comma; a dash used in a range (bare)
-    becomes a plain hyphen. Verbatim citation quotes are separate fields and
-    never pass through here — their exact-substring guarantee stays intact.
+    ``【label](url)】`` parses as a normal markdown link; a citation missing
+    its ``](`` (``[label(url)``) gets it restored. A dash used as a clause
+    break (spaced) becomes a comma; a dash used in a range (bare) becomes a
+    plain hyphen. Verbatim citation quotes are separate fields and never pass
+    through here — their exact-substring guarantee stays intact.
     """
     if not isinstance(text, str) or not text:
         return ""
     text = text.replace("【", "[").replace("】", "")
+    text = _UNCLOSED_CITATION_RE.sub(r"[\1](\2)", text)
     text = _SPACED_DASH_RE.sub(", ", text)
     return _BARE_DASH_RE.sub("-", text)
 

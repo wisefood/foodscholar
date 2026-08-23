@@ -337,6 +337,8 @@ JSON structure:
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
 }
 
+follow_ups are questions the USER would type to FoodScholar next (e.g. "How do I safely thaw chicken?") — NEVER questions aimed at the user (no "Do you need...", "Would you like...", "Are you interested...").
+
 IMPORTANT: Return ONLY the JSON object."""
 
 _QA_ANSWER_RAG_USER_FALLBACK = """Question: {{question}}
@@ -373,7 +375,9 @@ Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON 
   "answer": "Markdown-formatted concise answer",
   "overall_confidence": "high or medium or low",
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
-}"""
+}
+
+follow_ups are questions the USER would type to FoodScholar next (e.g. "How do I safely thaw chicken?") — NEVER questions aimed at the user (no "Do you need...", "Would you like...", "Are you interested...")."""
 
 _QA_ANSWER_NORAG_USER_FALLBACK = """Question: {{question}}
 
@@ -452,8 +456,13 @@ _QA_CLARIFIER_SYSTEM_FALLBACK = (
     '  "reasoning_summary": "short operational note"\n'
     '}\n\n'
     "Responsibilities:\n"
-    "- Ask clarification only when the missing detail materially changes safety, retrieval, or practical advice.\n"
-    "- Prefer one short clarification with structured options.\n"
+    "- Ask clarification ONLY for a missing PERSONAL or contextual fact (age group, "
+    "country/region, pregnancy or a health condition, a quantity's units) that would "
+    "change the safety or the practical advice.\n"
+    "- NEVER ask the user to disambiguate scientific concepts, terminology, or angles "
+    "of a topic — cover the main interpretations in one answer instead. Options must "
+    "be plain everyday words matched to the expertise_level, never technical taxonomy.\n"
+    "- Prefer one short clarification with structured options; when in doubt, do not ask.\n"
     "- Do not ask conversational follow-up questions for curiosity.\n"
     "- Create article_query for scientific articles and guideline_query for food-based dietary guidance.\n"
     "- LANGUAGE: write every string the user will READ in the request_language given in the input: "
@@ -551,9 +560,15 @@ _QA_PLANNER_SYSTEM_FALLBACK = (
     "re-search what a note already establishes, and turn 'lead' notes into "
     "sub-questions when they serve the current question.\n\n"
     "Clarifier and safety responsibilities:\n"
-    "- Ask clarification only when the missing detail materially changes safety, "
-    "retrieval, or practical advice. Prefer one short clarification with "
-    "structured options. Do not ask conversational follow-ups for curiosity.\n"
+    "- Ask clarification ONLY for a missing PERSONAL or contextual fact (age "
+    "group, country/region, pregnancy or a health condition, a quantity's "
+    "units) that would change the safety or the practical advice. NEVER ask "
+    "the user to disambiguate scientific concepts, terminology, or angles of "
+    "a topic (never 'do you mean amino acid composition or digestibility?') — "
+    "cover the main interpretations in one answer instead. Options must be "
+    "plain everyday words a non-expert understands, matched to the "
+    "expertise_level; never offer technical taxonomy as choices. Prefer one "
+    "short clarification with structured options; when in doubt, do not ask.\n"
     "- Also fill article_query and guideline_query as single fallback queries "
     "summarizing the whole question (legacy consumers still read them).\n"
     "- LANGUAGE: write every string the user will READ in the request_language "
@@ -603,10 +618,11 @@ _QA_EVALUATOR_SYSTEM_FALLBACK = (
     "it in new_sub_questions (1-2 at most).\n"
     "- corpus_gap: the corpus genuinely does not cover this. Do NOT suggest "
     "retries; the answer will disclose the gap honestly.\n"
-    "- needs_user_clarification: only when a missing user detail (e.g. country or "
-    "region for regional guidance) decides between materially different answers "
-    "AND the evidence shows both alternatives exist. Fill 'clarification' with "
-    "options derived from the evidence.\n\n"
+    "- needs_user_clarification: only when a missing PERSONAL detail (e.g. country "
+    "or region for regional guidance) decides between materially different answers "
+    "AND the evidence shows both alternatives exist. Never for disambiguating "
+    "concepts or terminology. Fill 'clarification' with options derived from the "
+    "evidence, worded in plain everyday language.\n\n"
     "Research notes (ALWAYS fill, whatever the verdict):\n"
     "- 'finding': evidence located, one sentence, name what it establishes and "
     "cite the source_urns (e.g. 'Two RCTs support omega-3 lowering triglycerides "
@@ -672,7 +688,8 @@ Then output ONLY a JSON object (no fences, no prose):
   "overall_confidence": "high or medium or low",
   "follow_ups": ["follow-up question 1", "follow-up question 2", "follow-up question 3"]
 }
-List every source you cited inline in PART 1, and no others. If you cited nothing, use an empty cited_sources list."""
+List every source you cited inline in PART 1, and no others. If you cited nothing, use an empty cited_sources list.
+follow_ups are questions the USER would type to FoodScholar next (e.g. "How do I safely thaw chicken?") — NEVER questions aimed at the user (no "Do you need...", "Would you like...", "Are you interested...")."""
 
 _QA_ANSWER_STREAM_USER_FALLBACK = """Question: {{question}}
 
@@ -1054,16 +1071,27 @@ ALL_PROMPTS: List["_Prompt"] = [
 
 
 def sync_prompts(
-    *, client: Optional[Any] = None, registry: Optional[List["_Prompt"]] = None
+    *,
+    client: Optional[Any] = None,
+    registry: Optional[List["_Prompt"]] = None,
+    force: bool = False,
 ) -> Dict[str, int]:
-    """Seed registry prompts into Langfuse, creating ONLY those that are missing.
+    """Seed registry prompts into Langfuse; optionally push fallback updates.
 
+    Default (``force=False``, what startup runs): create ONLY missing prompts.
     Langfuse is the source of truth for prompt content; the in-code fallbacks
-    are only a resilience net (used when Langfuse is unreachable) and a one-time
-    seed for prompts that don't exist yet. An existing prompt is NEVER
-    overwritten — even if its live text differs from the fallback — because that
-    text may be a deliberate edit made in the Langfuse UI. This makes startup
-    idempotent (``create_prompt`` is not) and means UI edits always win.
+    are a resilience net and a one-time seed. An existing prompt is NEVER
+    overwritten — even if its live text differs from the fallback — because
+    that text may be a deliberate edit made in the Langfuse UI. This makes
+    startup idempotent (``create_prompt`` is not) and means UI edits win.
+
+    ``force=True`` (deliberate, via ``scripts/seed_langfuse_prompts.py
+    --force``): for every prompt whose live production text differs from the
+    in-code fallback, publish the fallback as a NEW VERSION carrying the
+    production label. Nothing is destroyed — Langfuse keeps every prior
+    version, and the UI can roll back by moving the label — but any UI edit
+    stops being the served version, so force is for releases that changed the
+    fallbacks on purpose. Identical prompts are skipped either way.
 
     Safe no-op when ``client`` is None (Langfuse disabled). Per-prompt failures
     are logged and counted, never raised, so startup is never blocked.
@@ -1073,7 +1101,7 @@ def sync_prompts(
     if registry is None:
         registry = ALL_PROMPTS
 
-    counts = {"created": 0, "skipped": 0, "failed": 0}
+    counts = {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
     if client is None:
         return counts
 
@@ -1087,8 +1115,24 @@ def sync_prompts(
                 existing = None  # treated as "missing"
 
             if existing is not None:
-                # Already in Langfuse — leave it (UI is source of truth).
-                counts["skipped"] += 1
+                live_text = getattr(existing, "prompt", None)
+                if not force or live_text == prompt.fallback:
+                    # Already in Langfuse and either untouched-by-this-release
+                    # or identical — leave it.
+                    counts["skipped"] += 1
+                    continue
+                client.create_prompt(
+                    name=prompt.name,
+                    type="text",
+                    prompt=prompt.fallback,
+                    labels=[prompt.label],
+                )
+                counts["updated"] += 1
+                logger.info(
+                    "Published new '%s' version of prompt '%s' from the fallback.",
+                    prompt.label,
+                    prompt.name,
+                )
                 continue
 
             client.create_prompt(

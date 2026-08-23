@@ -38,8 +38,32 @@ from models.qa import QAAnswer
 logger = logging.getLogger(__name__)
 
 ANSWER_SENTINEL = "<<<END_ANSWER>>>"
+# Models approximate the sentinel ("<<END_ANSWER>>", stray spaces), and an
+# exact find() that misses it streams the whole JSON trailer at the user.
+# Detect it fuzzily, and hold back enough tail to cover the sloppiest form.
+_SENTINEL_RE = re.compile(r"<{2,}\s*END_ANSWER\s*>{2,}")
+_SENTINEL_HOLDBACK = 24
+# Salvage marker when the sentinel is missing entirely but the trailer leaked
+# into the prose: no legitimate answer contains this key.
+_LEAKED_TRAILER_RE = re.compile(r"\{\s*\"cited_sources\"")
 
 _INLINE_CITATION_RE = re.compile(r"\]\(/(articles|guidelines)/([^)\s]+)\)")
+
+
+def split_leaked_trailer(text: str) -> tuple[str, str]:
+    """Separate answer prose from a trailer that leaked into it.
+
+    Returns (prose, trailer_json_or_empty). Handles both a malformed sentinel
+    the streaming scan missed and a sentinel-less leak where the JSON object
+    simply follows the prose.
+    """
+    match = _SENTINEL_RE.search(text)
+    if match:
+        return text[: match.start()].rstrip(), text[match.end():]
+    match = _LEAKED_TRAILER_RE.search(text)
+    if match:
+        return text[: match.start()].rstrip(), text[match.start():]
+    return text, ""
 
 
 def _chunk_text(chunk: Any) -> str:
@@ -181,10 +205,10 @@ async def stream_answer(
             if json_mode:
                 continue
 
-            sentinel_at = pending.find(ANSWER_SENTINEL)
-            if sentinel_at >= 0:
-                to_emit = pending[:sentinel_at]
-                trailer = pending[sentinel_at + len(ANSWER_SENTINEL):]
+            sentinel_match = _SENTINEL_RE.search(pending)
+            if sentinel_match:
+                to_emit = pending[: sentinel_match.start()]
+                trailer = pending[sentinel_match.end():]
                 pending = ""
                 in_trailer = True
                 if to_emit:
@@ -194,7 +218,7 @@ async def stream_answer(
 
             # Hold back a sentinel-sized tail so a sentinel split across
             # chunks is never emitted to the user.
-            holdback = len(ANSWER_SENTINEL) - 1
+            holdback = _SENTINEL_HOLDBACK
             if len(pending) > holdback:
                 to_emit = pending[:-holdback]
                 pending = pending[-holdback:]
@@ -237,6 +261,13 @@ async def stream_answer(
             emitted += pending
             yield {"kind": "delta", "text": pending}
             pending = ""
+        # A trailer the streaming scan missed (malformed or absent sentinel)
+        # must never end up in the settled answer: salvage it out of the prose.
+        if not trailer.strip():
+            emitted, leaked = split_leaked_trailer(emitted)
+            if leaked:
+                logger.warning("Answer sentinel missed; salvaged leaked trailer")
+                trailer = leaked
         # Repair CJK citation brackets and banned dashes before citations are
         # recovered from the text. (Live deltas stay raw; the UI applies the
         # same normalization at render time, so the streamed view matches.)

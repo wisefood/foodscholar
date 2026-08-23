@@ -223,6 +223,54 @@ class BrokenModelFormattingStreamTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SentinelRobustnessTests(unittest.IsolatedAsyncioTestCase):
+    """The trailer must never reach the settled answer, however the model
+    mangles the sentinel (observed live: '<<>' rendering + full JSON leak)."""
+
+    TRAILER_JSON = (
+        '{"cited_sources": [{"urn": "urn:article:a1", "section": "abstract", '
+        '"quote": "Whole-grain intake reduced LDL cholesterol in adults.", '
+        '"confidence": "high"}], "overall_confidence": "high", "follow_ups": []}'
+    )
+
+    async def test_malformed_sentinel_variants_still_split(self):
+        for sentinel in ("<<END_ANSWER>>", "<<< END_ANSWER >>>", "<<<END_ANSWER>>"):
+            with self.subTest(sentinel=sentinel):
+                events = await _collect(
+                    [f"The answer body. {sentinel}", self.TRAILER_JSON]
+                )
+                final = _final(events)
+                self.assertEqual(final["answer"].answer, "The answer body.")
+                self.assertNotIn("cited_sources", _deltas(events))
+                self.assertTrue(final["parsed_trailer"])
+                self.assertEqual(len(final["answer"].citations), 1)
+
+    async def test_sentinel_missing_entirely_trailer_is_salvaged(self):
+        events = await _collect(
+            ["The answer body.\n", self.TRAILER_JSON]
+        )
+        final = _final(events)
+        self.assertEqual(final["answer"].answer, "The answer body.")
+        self.assertNotIn("cited_sources", final["answer"].answer)
+        self.assertTrue(final["parsed_trailer"])
+        self.assertEqual(
+            final["answer"].citations[0].source_id, "urn:article:a1"
+        )
+
+    async def test_unclosed_citation_link_is_repaired(self):
+        # "[Zhao et al. (2025)(/articles/urn)" — the model dropped the "](" .
+        answer = (
+            "Fiber helps [Doe et al. (2021)(/articles/urn:article:a1)."
+            f" {answering.ANSWER_SENTINEL}"
+        )
+        events = await _collect([answer, TRAILER])
+        final = _final(events)
+        self.assertIn(
+            "[Doe et al. (2021)](/articles/urn:article:a1)",
+            final["answer"].answer,
+        )
+
+
 class InlineCitationRecoveryTests(unittest.TestCase):
     def test_unknown_urns_are_ignored(self):
         cited = answering.citations_from_inline_links(
