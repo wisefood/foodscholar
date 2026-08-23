@@ -600,6 +600,31 @@ class QAResponse(BaseModel):
             "collapsible rendering. Null on the legacy pipeline."
         ),
     )
+    conversation_context: Optional["ConversationContext"] = Field(
+        default=None,
+        description=(
+            "What this thread is carrying into the next turn — the compacted "
+            "summary of earlier exchanges and the accumulated research notes — "
+            "so the UI can show the user what FoodScholar remembers."
+        ),
+    )
+
+
+class ConversationContext(BaseModel):
+    """The thread memory made visible: summary + notes carried forward."""
+
+    summary: Optional[str] = Field(
+        default=None,
+        description="Compacted summary of exchanges before the recent window",
+    )
+    notes: List[ResearchNote] = Field(
+        default_factory=list,
+        description="Research notes carried on this thread",
+    )
+    turn_count: int = Field(
+        default=0,
+        description="How many answered exchanges this thread has seen",
+    )
 
 
 class MemorySuggestion(BaseModel):

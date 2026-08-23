@@ -80,7 +80,13 @@ logger = logging.getLogger(__name__)
 TTL_QA_RESPONSE = 86400  # 1 day
 TTL_QA_FEEDBACK = 2592000  # 30 days
 TTL_QA_CLARIFICATION_THREAD = 1800  # 30 minutes
-TTL_QA_CONVERSATION = 3600  # 1 hour — running follow-up thread summary
+# A day, not an hour: a conversation the user resumes after lunch or the next
+# morning should still know itself. The UI persists the thread id just as long.
+TTL_QA_CONVERSATION = 86400
+# How many recent exchanges travel verbatim alongside the compacted summary
+# (sliding window: full fidelity for what was just said, compaction for the rest).
+QA_CONVERSATION_VERBATIM_TURNS = 2
+QA_CONVERSATION_TURN_ANSWER_CHARS = 1500
 TTL_SIMPLE_NUTRI_QUESTIONS = 1800  # 30 minutes
 TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
 TIP_GROUNDING_TOP_K = 3
@@ -1275,20 +1281,56 @@ class QAService:
     def _conversation_cache_key(self, thread_id: str) -> str:
         return f"qa_conversation:{thread_id}"
 
-    def _load_conversation_summary(self, thread_id: Optional[str]) -> Optional[str]:
-        """Load the running summary for a conversation thread, if any.
+    def _load_conversation_state(self, thread_id: Optional[str]) -> Dict[str, Any]:
+        """Load the thread's memory: compacted summary + recent verbatim turns.
 
         Stateless by default: only returns context when the client opts into a
         thread by echoing back a ``qa_thread_id`` from a prior answer. The UI
         decides when a thread continues.
         """
+        state: Dict[str, Any] = {"summary": None, "turns": []}
         if not thread_id:
-            return None
+            return state
         cached = self.cache_manager.get(self._conversation_cache_key(thread_id))
         if isinstance(cached, dict):
             summary = cached.get("summary")
-            return summary if isinstance(summary, str) and summary.strip() else None
-        return None
+            if isinstance(summary, str) and summary.strip():
+                state["summary"] = summary
+            turns = cached.get("turns")
+            if isinstance(turns, list):
+                state["turns"] = [
+                    turn
+                    for turn in turns
+                    if isinstance(turn, dict) and turn.get("question")
+                ][-QA_CONVERSATION_VERBATIM_TURNS:]
+        return state
+
+    def _load_conversation_summary(self, thread_id: Optional[str]) -> Optional[str]:
+        """Just the compacted summary (legacy path)."""
+        return self._load_conversation_state(thread_id)["summary"]
+
+    @staticmethod
+    def compose_prior_conversation(state: Dict[str, Any]) -> Optional[str]:
+        """The prompt-facing thread memory: summary + recent verbatim turns.
+
+        The sliding window: the last exchanges ride verbatim so precise
+        follow-ups ("what was the second reason?") resolve, while everything
+        older lives in the iteratively compacted summary.
+        """
+        parts: List[str] = []
+        summary = state.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            parts.append(summary.strip())
+        turns = state.get("turns") or []
+        if turns:
+            lines = ["MOST RECENT EXCHANGES (verbatim):"]
+            for turn in turns:
+                lines.append(f"User: {str(turn.get('question', '')).strip()}")
+                answer = str(turn.get("answer", "")).strip()
+                if answer:
+                    lines.append(f"FoodScholar: {answer}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts) if parts else None
 
     def _update_conversation_summary(
         self,
@@ -1327,11 +1369,23 @@ class QAService:
             summary = (getattr(response, "content", "") or "").strip()
             if not summary:
                 return
+            # The sliding window: keep the last exchanges verbatim next to the
+            # compacted summary. Re-read here (not passed in) so the write is
+            # correct even when the caller only held the summary.
+            previous_turns = self._load_conversation_state(thread_id)["turns"]
+            turns = [
+                *previous_turns,
+                {
+                    "question": question[:500],
+                    "answer": answer_text[:QA_CONVERSATION_TURN_ANSWER_CHARS],
+                },
+            ][-QA_CONVERSATION_VERBATIM_TURNS:]
             self.cache_manager.set(
                 self._conversation_cache_key(thread_id),
                 {
                     "thread_id": thread_id,
                     "summary": summary,
+                    "turns": turns,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 },
                 ttl=TTL_QA_CONVERSATION,
@@ -1656,11 +1710,42 @@ class QAService:
         )
         return self._generate_fallback_questions(count=count, language=language)
 
+    # Rotating theme seeds for starter-question generation. Without a seed the
+    # model converges on the same few questions every cache refresh; sampling
+    # themes per batch keeps returning users seeing fresh, varied chips —
+    # including the food-safety/food-waste side of the assistant.
+    STARTER_QUESTION_THEMES = [
+        "fruit and vegetables",
+        "whole grains and bread",
+        "protein foods",
+        "dairy and alternatives",
+        "hydration and drinks",
+        "salt and sugar",
+        "fats and oils",
+        "food storage and leftovers",
+        "reducing food waste at home",
+        "budget-friendly healthy eating",
+        "everyday snacks",
+        "cooking methods and nutrients",
+        "reading food labels",
+        "seasonal and local eating",
+        "family and kids' meals",
+        "breakfast habits",
+    ]
+
     def _generate_simple_questions_once(
         self, count: int, language: str = "en"
     ) -> List[str]:
         """Single pass generation for starter nutrition questions."""
-        prompt = QA_STARTER_QUESTIONS.compile(count=count, language=language)
+        themes = ", ".join(
+            random.sample(
+                self.STARTER_QUESTION_THEMES,
+                k=min(3, len(self.STARTER_QUESTION_THEMES)),
+            )
+        )
+        prompt = QA_STARTER_QUESTIONS.compile(
+            count=count, language=language, themes=themes
+        )
         response = self.simple_question_llm.invoke(
             prompt,
             config=build_trace_config(

@@ -699,6 +699,8 @@ _QA_STARTER_QUESTIONS_FALLBACK = """You are creating starter questions that an o
 
 Generate exactly {{count}} short, everyday nutrition questions the way a regular shopper, parent, or home cook would actually type them — NOT the way a scientist, dietitian, or textbook would phrase them.
 
+THIS BATCH'S THEMES: {{themes}}. Anchor the questions in these themes (at least one question per theme where natural), keeping the everyday register. The themes rotate between batches so returning users see fresh questions.
+
 LANGUAGE: Write every question in {{language}}. Do not leave any question, or any word within a question, in English when {{language}} is not English (proper nouns and established scientific Latin terms with no common {{language}} equivalent may remain).
 
 Audience and register:

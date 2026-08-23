@@ -162,7 +162,10 @@ IMPORTANT: Return ONLY the JSON object."""
 
     def test_qa_starter_renders_and_constrains_register(self):
         from backend.prompts import QA_STARTER_QUESTIONS
-        out = QA_STARTER_QUESTIONS.compile(count=4, language="sl")
+        out = QA_STARTER_QUESTIONS.compile(
+            count=4, language="sl", themes="hydration and drinks, everyday snacks"
+        )
+        self.assertIn("hydration and drinks", out)
         # Variables substituted, no leftover mustache.
         self.assertNotIn("{{", out)
         self.assertIn("exactly 4", out)

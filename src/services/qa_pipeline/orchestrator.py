@@ -21,6 +21,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, TYPE_CHECKING
 from config import config
 from models.qa import (
     ClarificationRequest,
+    ConversationContext,
     PlannedSubQuestion,
     QARequest,
     QAResponse,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-TTL_QA_NOTES = 3600  # matches the conversation-summary horizon
+TTL_QA_NOTES = 86400  # matches the conversation-summary horizon (a day)
 MAX_THREAD_NOTES = 20
 CACHE_REPLAY_CHUNK_CHARS = 400
 
@@ -90,12 +91,9 @@ def _load_prior_notes(service: "QAService", thread_id: Optional[str]) -> List[Re
     return notes
 
 
-def _store_notes(
-    service: "QAService",
-    thread_id: str,
-    prior: List[ResearchNote],
-    new: List[ResearchNote],
-) -> None:
+def _merged_notes(
+    prior: List[ResearchNote], new: List[ResearchNote]
+) -> List[ResearchNote]:
     merged: List[ResearchNote] = []
     seen: Set[str] = set()
     for note in [*prior, *new]:
@@ -104,9 +102,18 @@ def _store_notes(
             continue
         seen.add(key)
         merged.append(note)
+    return merged[-MAX_THREAD_NOTES:]
+
+
+def _store_notes(
+    service: "QAService",
+    thread_id: str,
+    prior: List[ResearchNote],
+    new: List[ResearchNote],
+) -> None:
     service.cache_manager.set(
         _notes_cache_key(thread_id),
-        {"notes": [note.model_dump() for note in merged[-MAX_THREAD_NOTES:]]},
+        {"notes": [note.model_dump() for note in _merged_notes(prior, new)]},
         ttl=TTL_QA_NOTES,
     )
 
@@ -214,9 +221,11 @@ async def run_pipeline(
         service._load_qa_thread, request.qa_thread_id
     )
     user_context = service._merge_thread_user_context(user_context, thread_context)
-    conversation_summary = await asyncio.to_thread(
-        service._load_conversation_summary, request.qa_thread_id
+    conversation_state = await asyncio.to_thread(
+        service._load_conversation_state, request.qa_thread_id
     )
+    conversation_summary = conversation_state["summary"]
+    prior_conversation_text = service.compose_prior_conversation(conversation_state)
     prior_notes = await asyncio.to_thread(
         _load_prior_notes, service, request.qa_thread_id
     )
@@ -860,7 +869,7 @@ async def run_pipeline(
         language=request.language,
         model=effective_model,
         user_context=context_payload,
-        prior_conversation=conversation_summary,
+        prior_conversation=prior_conversation_text,
         trace_context=trace_context,
     ):
         if event["kind"] == "delta":
@@ -911,6 +920,13 @@ async def run_pipeline(
         clarification=None,
         user_context=user_context,
         reasoning_steps=steps.snapshot(),
+        # What the thread carries forward, made visible so the user can see
+        # (and trust) that follow-ups build on this exchange.
+        conversation_context=ConversationContext(
+            summary=conversation_summary,
+            notes=_merged_notes(prior_notes, state.notes),
+            turn_count=len(conversation_state["turns"]) + 1,
+        ),
     )
 
     # Memory nudges ride the done payload; best-effort, never blocks.

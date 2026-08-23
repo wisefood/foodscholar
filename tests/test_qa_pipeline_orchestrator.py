@@ -227,6 +227,12 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         for expected in ("plan", "search", "rank", "evaluate", "answer"):
             self.assertIn(expected, kinds)
 
+        # The thread memory is visible on the response: a fresh thread has no
+        # summary yet, one answered exchange, and the notes carried forward.
+        self.assertIsNotNone(response.conversation_context)
+        self.assertEqual(response.conversation_context.turn_count, 1)
+        self.assertIsNone(response.conversation_context.summary)
+
     async def test_vocabulary_mismatch_repairs_only_flagged_sub_question(self):
         mismatch = EvaluationResult(
             verdict="vocabulary_mismatch",
