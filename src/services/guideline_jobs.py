@@ -837,6 +837,110 @@ class GuidelineJobService:
 
         return candidates
 
+    async def backfill_page_summaries(
+        self, guide_id: str, *, dry_run: bool = True
+    ) -> dict[str, Any]:
+        """Write extraction page summaries onto a guide's existing rules.
+
+        The import path has carried ``page_summary`` onto new rules for a
+        while, but every rule imported before that shipped without one — and
+        re-running an import skips existing rules rather than patching them.
+        This reads the stored extraction result(s) behind the guide's rules,
+        rebuilds the page → summary map, and PATCHes the summary onto each
+        rule that lacks one. Idempotent: rules that already carry a summary
+        are never touched.
+        """
+        client = self.platform_pool.get_client()
+        counts = {
+            "guide": guide_id,
+            "dry_run": dry_run,
+            "rules": 0,
+            "already_have": 0,
+            "no_page_or_artifact": 0,
+            "no_summary_for_page": 0,
+            "updated": 0,
+            "failed": 0,
+            "artifacts": 0,
+            "artifacts_without_results": [],
+        }
+        try:
+            guide = client.guides.get(guide_id)
+            fields = [
+                "id",
+                "page_no",
+                "page_summary",
+                "extractor_run_id",
+                "source_refs",
+            ]
+            try:
+                rules = guide.guidelines.fetch_all(fl=fields)
+            except AttributeError:
+                rules = list(guide.guidelines[0:1000])
+            counts["rules"] = len(rules)
+
+            per_artifact: dict[str, list[tuple[Any, int]]] = {}
+            for rule in rules:
+                existing = self._guideline_attr(rule, "page_summary")
+                if isinstance(existing, str) and existing.strip():
+                    counts["already_have"] += 1
+                    continue
+                page_no = self._guideline_attr(rule, "page_no")
+                artifact = self._guideline_attr(rule, "extractor_run_id")
+                if not artifact:
+                    refs = self._guideline_attr(rule, "source_refs") or []
+                    first = refs[0] if refs else None
+                    artifact = self._guideline_attr(first, "artifact_id") if first else None
+                if page_no is None or not artifact:
+                    counts["no_page_or_artifact"] += 1
+                    continue
+                try:
+                    per_artifact.setdefault(str(artifact), []).append(
+                        (rule, int(page_no))
+                    )
+                except (TypeError, ValueError):
+                    counts["no_page_or_artifact"] += 1
+
+            counts["artifacts"] = len(per_artifact)
+            for artifact_uuid, rule_pages in per_artifact.items():
+                result = await self.result_store.fetch_result(artifact_uuid)
+                if result is None:
+                    counts["artifacts_without_results"].append(artifact_uuid)
+                    counts["no_summary_for_page"] += len(rule_pages)
+                    continue
+                summaries = self._page_summaries(result)
+                for rule, page_no in rule_pages:
+                    summary = summaries.get(page_no)
+                    if not summary:
+                        counts["no_summary_for_page"] += 1
+                        continue
+                    if dry_run:
+                        counts["updated"] += 1
+                        continue
+                    rule_id = self._guideline_attr(rule, "id")
+                    try:
+                        response = client.patch(
+                            f"guidelines/{rule_id}",
+                            json={"page_summary": summary},
+                        )
+                        if getattr(response, "ok", False):
+                            counts["updated"] += 1
+                        else:
+                            counts["failed"] += 1
+                            logger.warning(
+                                "page_summary patch for %s returned %s",
+                                rule_id,
+                                getattr(response, "status_code", "?"),
+                            )
+                    except Exception:
+                        counts["failed"] += 1
+                        logger.warning(
+                            "page_summary patch for %s failed", rule_id,
+                            exc_info=True,
+                        )
+            return counts
+        finally:
+            self.platform_pool.return_client(client)
+
     def _load_existing_guide_guidelines(
         self,
         guide: Any,

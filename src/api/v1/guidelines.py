@@ -216,6 +216,28 @@ async def get_guideline_enrichment_worker_status():
     return get_guideline_enrichment_worker().get_stats()
 
 
+@router.post("/corpus/page-summaries/backfill/{guide_urn:path}")
+async def backfill_guide_page_summaries(guide_urn: str, dry_run: bool = True):
+    """
+    Write extraction page summaries onto a guide's existing rules.
+
+    Rules imported before page summaries were kept have none, and re-imports
+    skip existing rules. Reads the stored extraction results behind the
+    guide's rules and patches ``page_summary`` onto each rule missing one.
+    Idempotent; ``dry_run`` (default) only counts what would change.
+    """
+    try:
+        return await job_service.backfill_page_summaries(
+            guide_urn, dry_run=dry_run
+        )
+    except Exception as exc:
+        logger.error(
+            "Page-summary backfill for %s failed: %s", guide_urn, exc,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.get("/corpus/audit")
 async def audit_guideline_corpus():
     """

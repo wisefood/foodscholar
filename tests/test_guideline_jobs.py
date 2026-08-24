@@ -749,5 +749,93 @@ class GuidelineJobConcurrencyTests(unittest.TestCase):
             self.assertTrue(service.try_claim_job(artifact))
 
 
+class PageSummaryBackfillTests(unittest.IsolatedAsyncioTestCase):
+    """Backfilling extraction page summaries onto already-imported rules."""
+
+    def _make_backfill_fixture(self, tmpdir):
+        from types import SimpleNamespace
+        from services.guideline_extractor import GuidelineExtractorService
+        from services.guideline_jobs import GuidelineJobService
+
+        rules = [
+            {"id": "r1", "page_no": 1, "page_summary": None,
+             "extractor_run_id": "art-1", "source_refs": []},
+            {"id": "r2", "page_no": 1, "page_summary": "Already here.",
+             "extractor_run_id": "art-1", "source_refs": []},
+            {"id": "r3", "page_no": None, "page_summary": None,
+             "extractor_run_id": "art-1", "source_refs": []},
+            {"id": "r4", "page_no": 7, "page_summary": None,
+             "extractor_run_id": "art-1", "source_refs": []},
+        ]
+
+        class _Collection:
+            def fetch_all(self, *, page_size=500, fl=None):
+                return rules
+
+        class _Client:
+            def __init__(self):
+                self.guides = SimpleNamespace(
+                    get=lambda gid: SimpleNamespace(id=gid, guidelines=_Collection())
+                )
+                self.patches = []
+
+            def patch(self, endpoint, json=None):
+                self.patches.append((endpoint, json))
+                return SimpleNamespace(ok=True, status_code=200)
+
+        class _Pool:
+            def __init__(self):
+                self.client = _Client()
+
+            def get_client(self):
+                return self.client
+
+            def return_client(self, client):
+                return None
+
+        store = _FakeResultStore()
+        store.results["art-1"] = SimpleNamespace(
+            processed_pages=[
+                {"page": 1, "page_summary": "This page covers dairy portions."},
+                {"page": 2, "page_summary": "This page covers beverages."},
+            ]
+        )
+        pool = _Pool()
+        service = GuidelineJobService(
+            redis_client=_FakeRedisWrapper(),
+            extractor=GuidelineExtractorService(workspace_root=tmpdir),
+            result_store=store,
+            platform_pool=pool,
+        )
+        return service, pool
+
+    async def test_dry_run_counts_without_patching(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, pool = self._make_backfill_fixture(tmpdir)
+            counts = await service.backfill_page_summaries(
+                "urn:guide:g1", dry_run=True
+            )
+        self.assertEqual(counts["rules"], 4)
+        self.assertEqual(counts["already_have"], 1)
+        self.assertEqual(counts["no_page_or_artifact"], 1)
+        self.assertEqual(counts["no_summary_for_page"], 1)  # page 7
+        self.assertEqual(counts["updated"], 1)
+        self.assertEqual(pool.client.patches, [])
+
+    async def test_real_run_patches_only_the_missing_rule(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service, pool = self._make_backfill_fixture(tmpdir)
+            counts = await service.backfill_page_summaries(
+                "urn:guide:g1", dry_run=False
+            )
+        self.assertEqual(counts["updated"], 1)
+        self.assertEqual(counts["failed"], 0)
+        self.assertEqual(
+            pool.client.patches,
+            [("guidelines/r1",
+              {"page_summary": "This page covers dairy portions."})],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
