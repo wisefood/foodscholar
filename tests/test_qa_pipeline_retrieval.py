@@ -105,8 +105,30 @@ class GuidelineLegTests(unittest.TestCase):
         self.assertEqual(captured["source_excludes"], ["embedding"])
 
 
+class ArticleFieldTests(unittest.TestCase):
+    """The BM25 leg searches the enrichment fields production actually holds."""
+
+    def test_populated_enrichment_fields_are_searched(self):
+        names = {f.split("^")[0] for f in retrieval.ARTICLE_LEXICAL_FIELDS}
+        for field in ("keywords", "tags", "ai_tags", "topics", "ai_key_takeaways"):
+            self.assertIn(field, names)
+        # Mapped but empty in production (0 docs) — searching it would only
+        # mislead readers of the query.
+        self.assertNotIn("key_takeaways", names)
+
+
 class AttributeFilterTests(unittest.TestCase):
     """Metadata/attribute-aware retrieval: both legs are informed."""
+
+    def test_population_terms_boost_the_population_fields(self):
+        from models.qa import SubQuestionFilters
+
+        _, should = retrieval.article_attribute_clauses(
+            SubQuestionFilters(target_populations=["pregnant_people"])
+        )
+        fields = [f for clause in should for f in clause["multi_match"]["fields"]]
+        self.assertIn("population_group^3", fields)
+        self.assertIn("age_group^2", fields)
 
     def _filters(self, **kwargs):
         from models.qa import SubQuestionFilters

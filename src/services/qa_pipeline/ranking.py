@@ -123,11 +123,30 @@ def influence_factor(payload: Dict[str, Any]) -> float:
 
 
 def study_design_factor(payload: Dict[str, Any]) -> float:
-    """Weight by study design from the enrichment-assigned category."""
-    category = payload.get("ai_category") or payload.get("category") or ""
-    if not isinstance(category, str):
+    """Weight by study design from the enrichment metadata.
+
+    Reads every field the enrichment writes design information to —
+    ``study_type`` and ``biological_model`` are the dedicated fields on the
+    annotated cohort (production carries them on ~8k articles), ``ai_category``
+    the older spelling. ``biological_model: In vitro / Animal`` is what
+    reliably marks preclinical work even when the category string does not.
+    """
+    model = payload.get("biological_model")
+    if isinstance(model, str) and any(
+        term in model.lower() for term in ("in vitro", "animal", "preclinical")
+    ):
+        # Preclinical is preclinical whatever the study design says: an animal
+        # RCT must not outrank human evidence for a human nutrition question.
+        return 0.85
+
+    parts = [
+        payload.get("study_type"),
+        payload.get("ai_category"),
+        payload.get("category"),
+    ]
+    lowered = " ".join(str(p) for p in parts if isinstance(p, str)).lower()
+    if not lowered:
         return 1.0
-    lowered = category.lower()
     for term, weight in STUDY_DESIGN_WEIGHTS:
         if term in lowered:
             return weight

@@ -215,7 +215,9 @@ def normalize_article_hit(
         influential_citation_count=_count(
             "influentialCitationCount", "influential_citation_count"
         ),
-        study_type=text_value(result.get("ai_category"), default=None),
+        study_type=text_value(
+            result.get("study_type") or result.get("ai_category"), default=None
+        ),
     )
     return result, retrieved
 

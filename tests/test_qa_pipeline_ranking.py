@@ -126,6 +126,30 @@ class StudyDesignFactorTests(unittest.TestCase):
             ranking.study_design_factor({"ai_category": "editorial"}), 1.0
         )
 
+    def test_dedicated_study_type_field_is_read(self):
+        # Production carries the design on `study_type` for the annotated
+        # cohort; ai_category is the older spelling.
+        self.assertEqual(
+            ranking.study_design_factor({"study_type": "Systematic Review"}), 1.3
+        )
+
+    def test_biological_model_discount_overrides_design(self):
+        # An animal RCT must not outrank human evidence.
+        factor = ranking.study_design_factor(
+            {"study_type": "Randomized Controlled Trial", "biological_model": "Animal"}
+        )
+        self.assertEqual(factor, 0.85)
+        self.assertEqual(
+            ranking.study_design_factor({"biological_model": "In vitro"}), 0.85
+        )
+        # A human model changes nothing.
+        self.assertEqual(
+            ranking.study_design_factor(
+                {"study_type": "Cohort", "biological_model": "Human"}
+            ),
+            1.1,
+        )
+
 
 class AdjustEvidenceTests(unittest.TestCase):
     def test_multiplicative_formula(self):

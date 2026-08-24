@@ -347,8 +347,19 @@ def prepare_source_context(
 - Authors: {author_str}
 - Year: {article.get('publication_year', 'N/A')}
 - Journal: {article.get('venue', 'N/A')}
-- Study Type: {article.get('ai_category', 'N/A')}
+- Study Type: {article.get('study_type') or article.get('ai_category', 'N/A')}
 - Abstract: {abstract}"""
+
+        # Applicability enrichment, when stated: the model should know a
+        # finding comes from an in-vitro model or a specific population.
+        for label, key in (
+            ("Biological Model", "biological_model"),
+            ("Population", "population_group"),
+            ("Age Group", "age_group"),
+        ):
+            value = article.get(key)
+            if isinstance(value, str) and value.strip() and value.strip().lower() != "not stated":
+                summary += f"\n- {label}: {value.strip()}"
 
         # Bibliometrics, when stored: lets the model weigh well-established
         # vs unproven findings the way rule 9 asks it to.

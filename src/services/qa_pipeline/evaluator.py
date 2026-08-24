@@ -149,7 +149,8 @@ def _evidence_digest(state: PipelineState) -> List[Dict[str, Any]]:
                         or None,
                         # Enrichment metadata so the judge weighs evidence
                         # QUALITY, not just presence: study design and reach.
-                        "study_type": item.payload.get("ai_category"),
+                        "study_type": item.payload.get("study_type")
+                        or item.payload.get("ai_category"),
                         "citations": item.payload.get("citationCount")
                         or item.payload.get("citation_count"),
                         "score": round(item.adjusted_score, 4),

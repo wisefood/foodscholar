@@ -41,13 +41,18 @@ logger = logging.getLogger(__name__)
 
 RETRIEVER_NAME = "agentic"
 
+# Verified against the production mapping: keywords (~105k docs) and tags
+# (~105k) are the broadly populated lexical enrichments; ai_* and topics come
+# from the annotation cohort. key_takeaways is mapped but empty (0 docs) and
+# deliberately not searched — the guideline phantom-field lesson.
 ARTICLE_LEXICAL_FIELDS = [
     "title^3",
     "abstract^2",
+    "keywords^2",
     "ai_key_takeaways^2",
-    "key_takeaways^2",
     "tags^2",
     "ai_tags^2",
+    "topics^2",
     "venue",
 ]
 
@@ -143,12 +148,34 @@ def article_attribute_clauses(
 
     for study_type in filters.study_types[:4]:
         should_clauses.append(
-            {"match": {"ai_category": {"query": study_type, "boost": 2.0}}}
+            {
+                "multi_match": {
+                    "query": study_type,
+                    "fields": ["ai_category^2", "study_type^2"],
+                    "type": "best_fields",
+                }
+            }
+        )
+    # Population terms boost the enrichment's dedicated population fields on
+    # top of the general text fields.
+    for term in filters.target_populations[:4]:
+        should_clauses.append(
+            {
+                "multi_match": {
+                    "query": term,
+                    "fields": [
+                        "population_group^3",
+                        "age_group^2",
+                        "title",
+                        "abstract",
+                    ],
+                    "type": "best_fields",
+                }
+            }
         )
     facet_terms = [
         *filters.food_groups[:4],
         *filters.nutrients[:4],
-        *filters.target_populations[:4],
         *filters.health_conditions[:4],
     ]
     for term in facet_terms:
@@ -159,8 +186,10 @@ def article_attribute_clauses(
                     "fields": [
                         "title^2",
                         "abstract",
+                        "keywords^2",
                         "tags^2",
                         "ai_tags^2",
+                        "topics^2",
                         "ai_key_takeaways",
                     ],
                     "type": "best_fields",
