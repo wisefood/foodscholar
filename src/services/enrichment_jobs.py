@@ -513,7 +513,11 @@ class EnrichmentJobService:
                 },
             },
         }
-        response = ELASTIC_CLIENT.client.search(index="articles", body=body)
+        # The cluster serves enrichment writes at the same time; the default
+        # 10s client timeout is occasionally too tight for the aggregation.
+        response = ELASTIC_CLIENT.client.search(
+            index="articles", body=body, request_timeout=30
+        )
         total = response["hits"]["total"]["value"]
         aggs = response.get("aggregations", {})
         enriched = aggs.get("enriched", {}).get("doc_count", 0)
@@ -569,7 +573,9 @@ class EnrichmentJobService:
             "query": {"bool": {"filter": filters, "must_not": must_not}},
         }
         hits = (
-            ELASTIC_CLIENT.client.search(index="articles", body=body)
+            ELASTIC_CLIENT.client.search(
+                index="articles", body=body, request_timeout=30
+            )
             .get("hits", {})
             .get("hits", [])
         )

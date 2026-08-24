@@ -64,8 +64,13 @@ _DEFAULT_ANNOTATION_OUTPUT: Dict[str, Any] = {
 # minimal reasoning it spends the whole completion on hidden reasoning and
 # returns empty (or truncated) content, which then fails JSON parsing. The
 # annotation payload is the largest in the codebase (glossary + 3x3 Q&A), so
-# it needs a correspondingly generous budget.
-_ANNOTATION_MAX_TOKENS = 8192
+# it needs a correspondingly generous budget — max_tokens caps reasoning AND
+# visible output combined, and production showed 8192 still truncating the
+# JSON mid-string on abstracts whose hidden reasoning ran long. The escalated
+# budget backs the one extra attempt made when truncation is detected
+# (retrying at the same budget just reproduces the same cut at temperature 0).
+_ANNOTATION_MAX_TOKENS = 16384
+_ANNOTATION_MAX_TOKENS_ESCALATED = 24576
 _KEYWORD_MAX_TOKENS = 1024
 
 
@@ -123,6 +128,13 @@ class EnrichmentAgent:
             model=annotation_model,
             temperature=temperature,
             max_tokens=_ANNOTATION_MAX_TOKENS,
+            reasoning_effort="low",
+        )
+        # Last-resort client for completions the standard budget truncated.
+        self.annotation_llm_escalated = GROQ_CHAT.get_client(
+            model=annotation_model,
+            temperature=temperature,
+            max_tokens=_ANNOTATION_MAX_TOKENS_ESCALATED,
             reasoning_effort="low",
         )
 
@@ -377,13 +389,32 @@ class EnrichmentAgent:
 
         return enriched
 
-    def _invoke_annotation(self, chain, article, attempts: int = 2) -> Dict[str, Any]:
+    @staticmethod
+    def _looks_truncated(response, content: str) -> bool:
+        """Whether a completion was cut off by the token budget.
+
+        The provider says so via finish_reason when it is surfaced; the JSON
+        shape is the fallback signal (a completed annotation always closes its
+        top-level object).
+        """
+        metadata = getattr(response, "response_metadata", None) or {}
+        if metadata.get("finish_reason") == "length":
+            return True
+        stripped = content.rstrip()
+        return bool(stripped) and stripped.startswith("{") and not stripped.endswith("}")
+
+    def _invoke_annotation(
+        self, chain, article, attempts: int = 2, escalation_chain=None
+    ) -> Dict[str, Any]:
         """
         Run the annotation chain and parse its JSON payload.
 
         Reasoning models occasionally return an empty completion (the whole
         token budget went to hidden reasoning) or wrap the JSON in prose. Both
-        are transient, so retry once before giving up.
+        are transient, so retry once before giving up. Truncation is NOT
+        transient — at temperature 0 the retry reproduces the same cut — so
+        when the last failure looks budget-truncated, one final attempt runs
+        on the escalation chain (same prompt, much larger token budget).
 
         Raises:
             ValueError: if no attempt produced a parseable JSON object.
@@ -393,27 +424,42 @@ class EnrichmentAgent:
             "abstract": article.abstract,
             "authors": article.authors,
         }
+        trace_config = build_trace_config(
+            run_name="enrichment-annotation",
+            tags=["enrichment", "annotation"],
+        )
 
         last_error: Optional[Exception] = None
+        truncated = False
         for attempt in range(1, attempts + 1):
-            response = chain.invoke(
-                payload,
-                config=build_trace_config(
-                    run_name="enrichment-annotation",
-                    tags=["enrichment", "annotation"],
-                ),
-            )
+            response = chain.invoke(payload, config=trace_config)
             content = normalize_model_text(getattr(response, "content", response))
 
             try:
                 return _parse_json_object(content)
             except ValueError as e:
                 last_error = e
+                truncated = self._looks_truncated(response, content)
                 logger.warning(
-                    "Annotation JSON unusable for %s (attempt %d/%d): %s | raw=%.500r",
+                    "Annotation JSON unusable for %s (attempt %d/%d, truncated=%s): %s | raw=%.500r",
                     getattr(article, "urn", "<unknown>"),
                     attempt,
                     attempts,
+                    truncated,
+                    e,
+                    content,
+                )
+
+        if truncated and escalation_chain is not None:
+            response = escalation_chain.invoke(payload, config=trace_config)
+            content = normalize_model_text(getattr(response, "content", response))
+            try:
+                return _parse_json_object(content)
+            except ValueError as e:
+                last_error = e
+                logger.warning(
+                    "Annotation JSON unusable for %s (escalated budget): %s | raw=%.500r",
+                    getattr(article, "urn", "<unknown>"),
                     e,
                     content,
                 )
@@ -447,16 +493,17 @@ class EnrichmentAgent:
         # parsed by hand rather than with JsonOutputParser so that empty or
         # noisy completions can be salvaged and retried instead of blowing up
         # the whole job.
-        enrichment_chain = (
-            PromptTemplate(
-                input_variables=["title", "abstract", "authors"],
-                template=ENRICHMENT_ANNOTATION.langchain(),
-            )
-            | self.annotation_llm
+        annotation_prompt = PromptTemplate(
+            input_variables=["title", "abstract", "authors"],
+            template=ENRICHMENT_ANNOTATION.langchain(),
         )
+        enrichment_chain = annotation_prompt | self.annotation_llm
+        escalation_chain = annotation_prompt | self.annotation_llm_escalated
 
         # Generate enrichment annotations
-        enriched = self._invoke_annotation(enrichment_chain, article)
+        enriched = self._invoke_annotation(
+            enrichment_chain, article, escalation_chain=escalation_chain
+        )
 
         enriched = self._normalize_enriched(enriched, article.abstract)
 

@@ -439,7 +439,7 @@ class _FakeElasticForBatches:
     def client(self):
         return self
 
-    def search(self, index, body):
+    def search(self, index, body, **kwargs):
         self.bodies.append(body)
         if body.get("size") == 0:  # overview aggregation
             return {
