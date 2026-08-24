@@ -110,7 +110,7 @@ CRITICAL RULES:
 10. Clearly indicate when findings are preliminary vs well-established.
 11. If sources disagree, present both perspectives.
 12. For each cited source, include a "quote" field containing the EXACT verbatim passage from that source that best supports your answer to the user's question. For articles, quote from the abstract or passage text. For guidelines, quote from rule_text. The quote MUST be copied directly from the provided source text (no paraphrasing). Keep it short (ideally 1-2 sentences, <= 60 words).
-13. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations.
+13. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations. NEVER cite by pasting a bare URN in brackets: the link label is always a human-readable name ([First Author et al. (Year)] or [G1]), never the URN itself.
 14. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
 15. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
 

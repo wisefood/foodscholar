@@ -421,6 +421,65 @@ def format_answer_context(
     return "\n".join(parts)
 
 
+def _inline_citation_label(source: Dict[str, Any], g_label: Optional[str]) -> str:
+    """The label a well-behaved model would have written for this source."""
+    if is_guideline_source(source):
+        return g_label or "Guideline"
+    authors = source.get("authors") or []
+    if isinstance(authors, str):
+        authors = [authors]
+    first = str(authors[0]).strip() if authors else ""
+    surname = first.split()[-1] if first else ""
+    year = ""
+    raw_year = str(source.get("publication_year") or "")[:4]
+    if raw_year.isdigit():
+        year = raw_year
+    if surname:
+        label = surname + (" et al." if len(authors) > 1 else "")
+    else:
+        title = str(source.get("title") or "Source").strip()
+        label = title[:40]
+    return f"{label} ({year})" if year else label
+
+
+def repair_citation_links(
+    text: str, sources: Optional[List[Dict[str, Any]]]
+) -> str:
+    """Rewrite bare bracketed URNs into proper labeled citation links.
+
+    Observed live: models sometimes cite as ``【urn:article:slug】`` — no
+    label, no URL — which renders as raw text and loses every citation
+    affordance. Every citable source is known here, so a bracketed source id
+    becomes ``[Author et al. (Year)](/articles/urn)`` (or ``[G1](...)`` for
+    guidelines, numbered in the same order as the prompt context). Proper
+    links never match: inside a URL the id is preceded by ``/``, not a
+    bracket, and a bracketed id already followed by ``(`` is left alone.
+    """
+    if not text or not sources:
+        return text or ""
+    g_counter = 1
+    for source in sources:
+        g_label = None
+        if is_guideline_source(source):
+            g_label = f"G{g_counter}"
+            g_counter += 1
+        source_ids = [
+            value.strip()
+            for key in ("urn", "id", "_id")
+            if isinstance((value := source.get(key)), str) and value.strip()
+        ]
+        if not source_ids:
+            continue
+        base = "/guidelines/" if is_guideline_source(source) else "/articles/"
+        label = _inline_citation_label(source, g_label)
+        for source_id in dict.fromkeys(source_ids):
+            pattern = re.compile(
+                r"[【\[]\s*" + re.escape(source_id) + r"\s*[】\]]?(?!\()"
+            )
+            text = pattern.sub(f"[{label}]({base}{source_id})", text)
+    return text
+
+
 def create_source_citation(
     source: Dict[str, Any],
     section: str,
@@ -549,7 +608,9 @@ def build_qa_answer(
                 citations.append(citation)
 
     return QAAnswer(
-        answer=normalize_answer_prose(parsed.get("answer", "")),
+        answer=normalize_answer_prose(
+            repair_citation_links(parsed.get("answer", ""), articles)
+        ),
         citations=citations,
         confidence=parsed.get("overall_confidence", "medium"),
         model_used=model_used,

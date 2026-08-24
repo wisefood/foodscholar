@@ -209,7 +209,8 @@ class BrokenModelFormattingStreamTests(unittest.IsolatedAsyncioTestCase):
         )
         events = await _collect([answer])
         final = _final(events)
-        # The settled answer parses as normal markdown with no banned glyphs.
+        # The settled answer parses as normal markdown with no banned glyphs
+        # (the model's own label survives; only the brackets are repaired).
         self.assertIn(
             "[Doe et al. (2021)](/articles/urn:article:a1)",
             final["answer"].answer,
@@ -256,6 +257,40 @@ class SentinelRobustnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             final["answer"].citations[0].source_id, "urn:article:a1"
         )
+
+    async def test_bare_bracketed_urn_becomes_a_labeled_link(self):
+        # Observed live: the model cited as 【urn:article:...】 with no label
+        # and no URL at all. The evidence pool knows the source, so the URN
+        # becomes a properly labeled markdown link and a recoverable citation.
+        answer = (
+            "Fiber supports the gut barrier【urn:article:a1】 in trials."
+        )
+        events = await _collect([answer])
+        final = _final(events)
+        self.assertIn(
+            "[Doe (2021)](/articles/urn:article:a1)",
+            final["answer"].answer,
+        )
+        self.assertNotIn("【", final["answer"].answer)
+        self.assertEqual(
+            [c.source_id for c in final["answer"].citations],
+            ["urn:article:a1"],
+        )
+
+    def test_repair_labels_guidelines_with_matching_g_numbers(self):
+        from agents.qa_agent import repair_citation_links
+
+        sources = [
+            PAYLOADS[0],  # article
+            PAYLOADS[1],  # guideline -> G1
+        ]
+        text = "Guidance says so [guideline-1] and evidence agrees【urn:article:a1】."
+        repaired = repair_citation_links(text, sources)
+        self.assertIn("[G1](/guidelines/guideline-1)", repaired)
+        self.assertIn("[Doe (2021)](/articles/urn:article:a1)", repaired)
+        # A proper link is left alone.
+        well_formed = "See [Doe (2021)](/articles/urn:article:a1)."
+        self.assertEqual(repair_citation_links(well_formed, sources), well_formed)
 
     async def test_unclosed_citation_link_is_repaired(self):
         # "[Zhao et al. (2025)(/articles/urn)" — the model dropped the "](" .

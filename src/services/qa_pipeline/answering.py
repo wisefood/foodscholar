@@ -29,6 +29,7 @@ from agents.qa_agent import (
     format_answer_context,
     format_prior_conversation,
     prepare_source_context,
+    repair_citation_links,
 )
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
@@ -268,10 +269,13 @@ async def stream_answer(
             if leaked:
                 logger.warning("Answer sentinel missed; salvaged leaked trailer")
                 trailer = leaked
-        # Repair CJK citation brackets and banned dashes before citations are
+        # Repair citations (bare bracketed URNs become labeled links, CJK
+        # brackets become ASCII) and banned dashes before citations are
         # recovered from the text. (Live deltas stay raw; the UI applies the
         # same normalization at render time, so the streamed view matches.)
-        answer_text = normalize_answer_prose(emitted.strip())
+        answer_text = normalize_answer_prose(
+            repair_citation_links(emitted.strip(), payloads)
+        )
         if trailer.strip():
             try:
                 parsed = parse_json_object(trailer)
