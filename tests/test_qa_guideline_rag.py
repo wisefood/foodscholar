@@ -148,6 +148,77 @@ class QAGuidelineRagTests(unittest.TestCase):
         self.assertEqual(answer.citations[0].page_no, 12)
 
 
+class QuoteContextTests(unittest.TestCase):
+    """Citations carry the source text around the quote, for hover previews."""
+
+    def test_citation_carries_surrounding_fragments(self):
+        from agents.qa_agent import build_qa_answer
+
+        abstract = (
+            "Background sentence setting the scene for the trial. "
+            "Whole-grain intake reduced LDL cholesterol in adults. "
+            "Effects were consistent across all measured cohorts."
+        )
+        article = {
+            "source_type": "article",
+            "urn": "urn:article:a1",
+            "title": "Whole grains and lipids",
+            "abstract": abstract,
+        }
+        parsed = {
+            "answer": "Whole grains help [X](/articles/urn:article:a1).",
+            "cited_sources": [
+                {
+                    "urn": "urn:article:a1",
+                    "section": "abstract",
+                    "quote": "Whole-grain intake reduced LDL cholesterol in adults.",
+                    "confidence": "high",
+                }
+            ],
+            "overall_confidence": "high",
+        }
+        answer = build_qa_answer(
+            parsed,
+            question="Do whole grains lower cholesterol?",
+            articles=[article],
+            rag_used=True,
+            model_used="test-model",
+        )
+        citation = answer.citations[0]
+        self.assertEqual(
+            citation.quote_context_before,
+            "Background sentence setting the scene for the trial.",
+        )
+        self.assertEqual(
+            citation.quote_context_after,
+            "Effects were consistent across all measured cohorts.",
+        )
+
+    def test_quote_at_source_start_has_no_before_fragment(self):
+        from agents.qa_agent import quote_context
+
+        before, after = quote_context("Quote here. Then more text.", "Quote here.")
+        self.assertEqual(before, "")
+        self.assertEqual(after, "Then more text.")
+
+    def test_long_context_is_trimmed_to_word_boundaries(self):
+        from agents.qa_agent import quote_context
+
+        source = ("word " * 100).strip() + " THE QUOTE. " + ("tail " * 100).strip()
+        before, after = quote_context(source, "THE QUOTE.")
+        self.assertLessEqual(len(before), 180)
+        self.assertLessEqual(len(after), 180)
+        self.assertFalse(before.startswith("ord"))  # no mid-word cut
+        self.assertTrue(after.endswith("tail"))
+
+    def test_missing_quote_or_text_is_empty(self):
+        from agents.qa_agent import quote_context
+
+        self.assertEqual(quote_context("", "q"), ("", ""))
+        self.assertEqual(quote_context("text", None), ("", ""))
+        self.assertEqual(quote_context("text", "absent"), ("", ""))
+
+
 class SourceContextFacetTests(unittest.TestCase):
     """The answer prompt must surface applicability facets and bibliometrics."""
 

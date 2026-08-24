@@ -149,6 +149,38 @@ def coerce_quote_to_source_span(
     )
 
 
+def quote_context(
+    source_text: str, quote: Optional[str], max_chars: int = 180
+) -> tuple:
+    """The source text immediately around a quote: (before, after).
+
+    Lets a preview show the cited line inside its surroundings rather than as
+    a bare excerpt. Fragments are trimmed to word boundaries; empty strings
+    when the quote is absent, not found, or sits at an edge of the source.
+    """
+    if not source_text or not quote:
+        return "", ""
+    index = source_text.find(quote)
+    if index < 0:
+        return "", ""
+
+    before = source_text[:index].rstrip()
+    if len(before) > max_chars:
+        before = before[-max_chars:]
+        cut = before.find(" ")
+        if 0 <= cut < len(before) - 1:
+            before = before[cut + 1:]
+
+    after = source_text[index + len(quote):].lstrip()
+    if len(after) > max_chars:
+        after = after[:max_chars]
+        cut = after.rfind(" ")
+        if cut > 0:
+            after = after[:cut]
+
+    return before, after
+
+
 def best_effort_quote_from_source(
     source_text: str, question: Optional[str]
 ) -> Optional[str]:
@@ -608,6 +640,11 @@ def build_qa_answer(
                     confidence=cited.get("confidence", "medium"),
                 )
                 citation.display_label = g_label_map.get(citation.source_id)
+                # Surroundings for the hover preview: the cited line shown
+                # inside its context, not as a bare excerpt.
+                before, after = quote_context(source_text, quote)
+                citation.quote_context_before = before or None
+                citation.quote_context_after = after or None
                 citations.append(citation)
 
     return QAAnswer(

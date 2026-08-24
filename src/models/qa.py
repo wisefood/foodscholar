@@ -413,6 +413,17 @@ class QACitation(BaseModel):
         default=None,
         description="Direct quote from the source if applicable",
     )
+    quote_context_before: Optional[str] = Field(
+        default=None,
+        description=(
+            "Source text immediately preceding the quote, so a preview can "
+            "show the cited line in its surroundings"
+        ),
+    )
+    quote_context_after: Optional[str] = Field(
+        default=None,
+        description="Source text immediately following the quote",
+    )
     confidence: Literal["high", "medium", "low"] = Field(
         description="Confidence level in this citation",
     )
