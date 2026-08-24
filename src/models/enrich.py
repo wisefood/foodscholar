@@ -63,6 +63,85 @@ class EnrichmentBatchRequest(EnrichmentJobRequest):
     )
 
 
+class EnrichmentCriteriaBatchRequest(EnrichmentJobRequest):
+    """Queue enrichment by selection criteria instead of explicit URNs.
+
+    Idempotent across runs: the default ``only_missing`` selection excludes
+    already-enriched articles, and in-flight jobs are never duplicated — so
+    re-running the same criteria continues where the last run stopped.
+    """
+
+    venue: Optional[str] = Field(
+        default=None,
+        description="Restrict the batch to one journal (exact venue value)",
+    )
+    only_missing: bool = Field(
+        default=True,
+        description="Select only articles without enrichment (ai_category absent)",
+    )
+    limit: int = Field(
+        default=200,
+        ge=1,
+        le=2000,
+        description="Maximum articles to queue in this batch",
+    )
+
+
+class VenueEnrichmentStatus(BaseModel):
+    """Enrichment coverage of one journal."""
+
+    venue: str
+    total: int
+    enriched: int
+    pending: int
+
+
+class EnrichmentOverview(BaseModel):
+    """Corpus-wide enrichment coverage, for the admin console."""
+
+    total: int = Field(description="Live (non-deleted) articles in the catalog")
+    enriched: int = Field(description="Articles carrying the enrichment marker")
+    pending: int = Field(description="Articles without enrichment")
+    queue_depth: Optional[int] = Field(
+        default=None,
+        description="Jobs waiting in the on-demand queue; null if Redis is down",
+    )
+    sweeper_paused: bool = Field(
+        description="Whether the background catalog sweeper is paused"
+    )
+    venues: List[VenueEnrichmentStatus] = Field(
+        default_factory=list,
+        description="Per-journal coverage, largest journals first",
+    )
+
+
+class EnrichmentBatchProgress(BaseModel):
+    """Live progress of one criteria batch."""
+
+    total: int
+    done: int
+    percent: float
+    queued: int = 0
+    running: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    unknown: int = 0
+
+
+class EnrichmentBatchSummary(BaseModel):
+    """A recorded criteria batch, without its URN list."""
+
+    batch_id: str
+    criteria: Dict[str, Any]
+    requested_by: Optional[str] = None
+    created_at: str
+    selected: int
+    already_active: int = 0
+    queued: Optional[int] = None
+    progress: Optional[EnrichmentBatchProgress] = None
+    failures: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class EnrichmentJobStatus(BaseModel):
     """Combined on-demand job state and sweeper bookkeeping for one article."""
 

@@ -469,6 +469,212 @@ class EnrichmentJobService:
             jobs.append(self.enqueue(urn, force=force, requested_by=requested_by))
         return jobs
 
+    # ------------------------------------------------------------------ #
+    # Batch operations (admin console): select by criteria, track progress
+    # ------------------------------------------------------------------ #
+
+    BATCH_KEY_PREFIX = "enrichment:batch:"
+    BATCH_INDEX_KEY = "enrichment:batches"
+    BATCH_TTL_SECONDS = 7 * 24 * 3600
+    BATCH_MAX_URNS = 2000
+    # "Enriched" is judged by ai_category: it is set by every enrichment run
+    # (the production audit showed the whole annotated cohort carries it).
+    ENRICHED_MARKER_FIELD = "ai_category"
+
+    def _batch_key(self, batch_id: str) -> str:
+        return f"{self.BATCH_KEY_PREFIX}{batch_id}"
+
+    def overview(self, *, venues_size: int = 30) -> dict[str, Any]:
+        """Corpus-wide enrichment coverage, broken down by journal (venue).
+
+        One aggregation query: total live articles, how many carry the
+        enrichment marker, and the same split per venue — so an administrator
+        can see at a glance which journals are un-enriched and by how much.
+        """
+        from backend.elastic import ELASTIC_CLIENT
+
+        body = {
+            "size": 0,
+            "track_total_hits": True,
+            "query": {"bool": {"must_not": [{"term": {"status": "deleted"}}]}},
+            "aggs": {
+                "enriched": {
+                    "filter": {"exists": {"field": self.ENRICHED_MARKER_FIELD}}
+                },
+                "venues": {
+                    "terms": {"field": "venue", "size": venues_size},
+                    "aggs": {
+                        "enriched": {
+                            "filter": {
+                                "exists": {"field": self.ENRICHED_MARKER_FIELD}
+                            }
+                        }
+                    },
+                },
+            },
+        }
+        response = ELASTIC_CLIENT.client.search(index="articles", body=body)
+        total = response["hits"]["total"]["value"]
+        aggs = response.get("aggregations", {})
+        enriched = aggs.get("enriched", {}).get("doc_count", 0)
+        venues = [
+            {
+                "venue": bucket["key"],
+                "total": bucket["doc_count"],
+                "enriched": bucket.get("enriched", {}).get("doc_count", 0),
+                "pending": bucket["doc_count"]
+                - bucket.get("enriched", {}).get("doc_count", 0),
+            }
+            for bucket in aggs.get("venues", {}).get("buckets", [])
+        ]
+        return {
+            "total": total,
+            "enriched": enriched,
+            "pending": total - enriched,
+            "queue_depth": self.pending_jobs(),
+            "sweeper_paused": self.is_sweeper_paused(),
+            "venues": venues,
+        }
+
+    def enqueue_batch(
+        self,
+        *,
+        venue: Optional[str] = None,
+        only_missing: bool = True,
+        force: bool = False,
+        limit: int = 200,
+        requested_by: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Select articles by criteria, queue them, and record the batch.
+
+        Idempotent across runs by construction: with ``only_missing`` (the
+        default) selection excludes articles that already carry the enrichment
+        marker, and articles with a job already in flight are not re-queued —
+        so re-running the same criteria simply continues where the last run
+        left off. ``force`` re-enriches matches even if already enriched.
+        """
+        from backend.elastic import ELASTIC_CLIENT
+
+        limit = max(1, min(int(limit or 200), self.BATCH_MAX_URNS))
+        must_not: list[dict[str, Any]] = [{"term": {"status": "deleted"}}]
+        filters: list[dict[str, Any]] = []
+        if venue:
+            filters.append({"term": {"venue": venue}})
+        if only_missing and not force:
+            must_not.append({"exists": {"field": self.ENRICHED_MARKER_FIELD}})
+
+        body = {
+            "size": limit,
+            "_source": ["urn"],
+            "query": {"bool": {"filter": filters, "must_not": must_not}},
+        }
+        hits = (
+            ELASTIC_CLIENT.client.search(index="articles", body=body)
+            .get("hits", {})
+            .get("hits", [])
+        )
+        urns = [
+            hit.get("_source", {}).get("urn") or hit.get("_id")
+            for hit in hits
+        ]
+        urns = [urn for urn in urns if urn]
+
+        already_active = 0
+        for urn in urns:
+            state = self.get_job_state(self.normalize_urn(urn))
+            if state and state.get("status") in ACTIVE_JOB_STATUSES:
+                already_active += 1
+        self.enqueue_many(urns, force=force, requested_by=requested_by)
+
+        batch_id = str(uuid.uuid4())
+        record = {
+            "batch_id": batch_id,
+            "criteria": {
+                "venue": venue,
+                "only_missing": only_missing,
+                "force": force,
+                "limit": limit,
+            },
+            "requested_by": requested_by,
+            "created_at": utcnow_iso(),
+            "selected": len(urns),
+            "already_active": already_active,
+            "urns": urns,
+        }
+        self._redis_call(
+            "redis.set(batch)",
+            lambda: self.redis.client.set(
+                self._batch_key(batch_id),
+                json.dumps(record),
+                ex=self.BATCH_TTL_SECONDS,
+            ),
+        )
+        # Newest-first index so listing never needs a KEYS scan.
+        self._redis_call(
+            "redis.lpush(batch-index)",
+            lambda: self.redis.client.lpush(self.BATCH_INDEX_KEY, batch_id),
+        )
+        self._redis_call(
+            "redis.ltrim(batch-index)",
+            lambda: self.redis.client.ltrim(self.BATCH_INDEX_KEY, 0, 49),
+        )
+        summary = {k: v for k, v in record.items() if k != "urns"}
+        summary["queued"] = len(urns) - already_active
+        return summary
+
+    def get_batch(self, batch_id: str) -> Optional[dict[str, Any]]:
+        """A batch's live progress: per-status counts over its articles."""
+        raw = self._redis_call(
+            "redis.get(batch)",
+            lambda: self.redis.client.get(self._batch_key(batch_id)),
+        )
+        if not raw:
+            return None
+        record = json.loads(raw)
+        urns = record.pop("urns", [])
+        counts = {"queued": 0, "running": 0, "succeeded": 0, "failed": 0, "unknown": 0}
+        failures: list[dict[str, Any]] = []
+        for status in self.get_statuses(urns):
+            value = status.get("status")
+            if value in counts:
+                counts[value] += 1
+            else:
+                counts["unknown"] += 1
+            if value == JOB_STATUS_FAILED and len(failures) < 20:
+                failures.append({"urn": status["urn"], "error": status.get("error")})
+        total = len(urns)
+        done = counts["succeeded"] + counts["failed"]
+        record["progress"] = {
+            **counts,
+            "total": total,
+            "done": done,
+            "percent": round(100 * done / total, 1) if total else 100.0,
+        }
+        record["failures"] = failures
+        return record
+
+    def list_batches(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent batches, newest first, without their URN lists."""
+        batch_ids = self._redis_call(
+            "redis.lrange(batch-index)",
+            lambda: self.redis.client.lrange(self.BATCH_INDEX_KEY, 0, limit - 1),
+        ) or []
+        records = []
+        for batch_id in batch_ids:
+            raw = self._redis_call(
+                "redis.get(batch)",
+                lambda b=batch_id: self.redis.client.get(self._batch_key(b)),
+            )
+            if not raw:
+                continue  # expired record; the index entry ages out with LTRIM
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            record.pop("urns", None)
+            records.append(record)
+        return records
+
     def pop_next_job(self, timeout: int) -> Optional[dict[str, Any]]:
         """Block for the next queued job reference."""
         item = self._redis_call(

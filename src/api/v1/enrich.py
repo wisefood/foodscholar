@@ -9,8 +9,11 @@ from models.enrich import (
     ArticleInput,
     EnrichmentBatchRequest,
     EnrichmentBatchResponse,
+    EnrichmentBatchSummary,
+    EnrichmentCriteriaBatchRequest,
     EnrichmentJobRequest,
     EnrichmentJobStatus,
+    EnrichmentOverview,
     EnrichmentResetResponse,
     EnrichmentResponse,
     EnrichmentWorkerRestartRequest,
@@ -89,6 +92,74 @@ async def enrich_article(request: ArticleInput):
             status_code=500,
             detail=f"Error enriching article: {str(e)}",
         )
+
+
+@router.get("/overview", response_model=EnrichmentOverview)
+async def get_enrichment_overview():
+    """
+    Corpus-wide enrichment coverage with a per-journal breakdown.
+
+    One aggregation over the live catalog: how many articles carry enrichment,
+    how many are pending, and the same split for the largest journals — the
+    administrator's map of where to point the next batch.
+    """
+    try:
+        return job_service.overview()
+    except Exception as exc:
+        logger.error("Enrichment overview failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/batches",
+    response_model=EnrichmentBatchSummary,
+    status_code=202,
+)
+async def enqueue_enrichment_batch_by_criteria(
+    request: EnrichmentCriteriaBatchRequest,
+):
+    """
+    Queue an enrichment batch by criteria (journal, missing-only, limit).
+
+    Idempotent across runs: the default selection excludes already-enriched
+    articles and never duplicates in-flight jobs, so re-running the same
+    criteria continues where the previous batch stopped. Returns a batch_id
+    to track progress via GET /enrich/batches/{batch_id}.
+    """
+    try:
+        return job_service.enqueue_batch(
+            venue=request.venue,
+            only_missing=request.only_missing,
+            force=request.force,
+            limit=request.limit,
+            requested_by=request.requested_by,
+        )
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+    except Exception as exc:
+        logger.error("Criteria batch enqueue failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/batches", response_model=list[EnrichmentBatchSummary])
+async def list_enrichment_batches():
+    """Recent criteria batches, newest first."""
+    try:
+        return job_service.list_batches()
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+
+
+@router.get("/batches/{batch_id}", response_model=EnrichmentBatchSummary)
+async def get_enrichment_batch(batch_id: str):
+    """One batch's live progress: per-status counts and recent failures."""
+    try:
+        batch = job_service.get_batch(batch_id)
+    except RedisUnavailable as exc:
+        raise _queue_unavailable(exc) from exc
+    if batch is None:
+        raise HTTPException(status_code=404, detail="Unknown batch id.")
+    return batch
 
 
 @router.post(

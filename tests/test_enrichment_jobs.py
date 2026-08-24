@@ -59,6 +59,19 @@ class _FakeRedisClient:
     def sismember(self, key, value):
         return value in self.sets.get(key, set())
 
+    def lpush(self, key, value):
+        self.queues.setdefault(key, []).insert(0, value)
+        return len(self.queues[key])
+
+    def ltrim(self, key, start, end):
+        queue = self.queues.get(key, [])
+        self.queues[key] = queue[start: end + 1]
+        return True
+
+    def lrange(self, key, start, end):
+        queue = self.queues.get(key, [])
+        return queue[start: end + 1]
+
 
 class _FakeRedisWrapper:
     def __init__(self):
@@ -412,6 +425,128 @@ class TestEnrichmentJobWorker(unittest.TestCase):
         worker._process_job(job)
 
         self.assertEqual(worker.stats["skipped"], 1)
+
+
+class _FakeElasticForBatches:
+    """Records queries; serves canned article hits and aggregations."""
+
+    def __init__(self, urns=None, aggregations=None):
+        self.bodies = []
+        self.urns = urns or []
+        self.aggregations = aggregations or {}
+
+    @property
+    def client(self):
+        return self
+
+    def search(self, index, body):
+        self.bodies.append(body)
+        if body.get("size") == 0:  # overview aggregation
+            return {
+                "hits": {"total": {"value": 100}},
+                "aggregations": self.aggregations,
+            }
+        return {
+            "hits": {
+                "hits": [{"_id": urn, "_source": {"urn": urn}} for urn in self.urns]
+            }
+        }
+
+
+class TestEnrichmentBatches(unittest.TestCase):
+    def _with_fake_es(self, fake):
+        from unittest.mock import patch
+        import backend.elastic as elastic_module
+
+        return patch.object(elastic_module, "ELASTIC_CLIENT", fake)
+
+    def test_criteria_batch_selects_missing_only_and_tracks_progress(self):
+        service, _pool = _make_service(articles={"urn:article:a1": _FakeArticle("urn:article:a1")})
+        fake_es = _FakeElasticForBatches(urns=["urn:article:a1", "urn:article:a2"])
+
+        with self._with_fake_es(fake_es):
+            summary = service.enqueue_batch(
+                venue="Nutrients", limit=50, requested_by="admin"
+            )
+
+        # Selection is idempotent by construction: enriched articles are
+        # excluded and the venue filter is applied.
+        body = fake_es.bodies[0]
+        self.assertIn({"term": {"venue": "Nutrients"}}, body["query"]["bool"]["filter"])
+        self.assertIn(
+            {"exists": {"field": "ai_category"}}, body["query"]["bool"]["must_not"]
+        )
+        self.assertEqual(summary["selected"], 2)
+        self.assertEqual(summary["queued"], 2)
+        self.assertEqual(summary["criteria"]["venue"], "Nutrients")
+        self.assertNotIn("urns", summary)
+
+        # Progress reflects live job states for the batch's articles.
+        batch = service.get_batch(summary["batch_id"])
+        self.assertEqual(batch["progress"]["total"], 2)
+        self.assertEqual(batch["progress"]["queued"], 2)
+        self.assertEqual(batch["progress"]["done"], 0)
+
+        service.mark_running("urn:article:a1")
+        service.mark_succeeded("urn:article:a1", {"ok": True})
+        service.mark_running("urn:article:a2")
+        service.mark_failed("urn:article:a2", "boom")
+
+        batch = service.get_batch(summary["batch_id"])
+        self.assertEqual(batch["progress"]["succeeded"], 1)
+        self.assertEqual(batch["progress"]["failed"], 1)
+        self.assertEqual(batch["progress"]["percent"], 100.0)
+        self.assertEqual(batch["failures"][0]["urn"], "urn:article:a2")
+
+    def test_force_selects_already_enriched_articles_too(self):
+        service, _pool = _make_service()
+        fake_es = _FakeElasticForBatches(urns=["urn:article:a1"])
+        with self._with_fake_es(fake_es):
+            service.enqueue_batch(force=True, limit=10)
+        body = fake_es.bodies[0]
+        self.assertNotIn(
+            {"exists": {"field": "ai_category"}}, body["query"]["bool"]["must_not"]
+        )
+
+    def test_batches_list_newest_first_without_urns(self):
+        service, _pool = _make_service()
+        fake_es = _FakeElasticForBatches(urns=["urn:article:a1"])
+        with self._with_fake_es(fake_es):
+            first = service.enqueue_batch(limit=10)
+            second = service.enqueue_batch(limit=10)
+        batches = service.list_batches()
+        self.assertEqual(
+            [b["batch_id"] for b in batches[:2]],
+            [second["batch_id"], first["batch_id"]],
+        )
+        self.assertTrue(all("urns" not in b for b in batches))
+
+    def test_unknown_batch_is_none(self):
+        service, _pool = _make_service()
+        self.assertIsNone(service.get_batch("nope"))
+
+    def test_overview_reports_totals_and_venues(self):
+        service, _pool = _make_service()
+        fake_es = _FakeElasticForBatches(
+            aggregations={
+                "enriched": {"doc_count": 40},
+                "venues": {
+                    "buckets": [
+                        {"key": "Nutrients", "doc_count": 30,
+                         "enriched": {"doc_count": 10}},
+                    ]
+                },
+            }
+        )
+        with self._with_fake_es(fake_es):
+            overview = service.overview()
+        self.assertEqual(overview["total"], 100)
+        self.assertEqual(overview["enriched"], 40)
+        self.assertEqual(overview["pending"], 60)
+        self.assertEqual(
+            overview["venues"],
+            [{"venue": "Nutrients", "total": 30, "enriched": 10, "pending": 20}],
+        )
 
 
 if __name__ == "__main__":
