@@ -67,6 +67,59 @@ def extract_first_json_object(text: str) -> Optional[str]:
     return _extract_balanced(text, "{", "}")
 
 
+def close_unclosed_json(content: Any) -> Optional[str]:
+    """Repair model output whose only defect is missing closing brackets.
+
+    gpt-oss sometimes stops cleanly (finish_reason "stop") before emitting
+    the last closing brace(s) of a large JSON object — everything except the
+    closers is present, so appending them recovers the payload losslessly.
+
+    Returns the repaired JSON string, or ``None`` when the text is not a
+    simple unclosed tail: no object at all, mismatched brackets, or a
+    top-level object that does close (the defect is then something this
+    repair cannot fix, like an unescaped quote mid-document).
+    """
+    prepared = _prepare(content)
+    start = prepared.find("{")
+    if start < 0:
+        return None
+    fragment = prepared[start:]
+
+    stack: List[str] = []
+    in_string = False
+    escaped = False
+    for ch in fragment:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack or ("}" if stack[-1] == "{" else "]") != ch:
+                return None
+            stack.pop()
+            if not stack:
+                return None
+
+    if not stack:
+        return None
+
+    repaired = fragment.rstrip()
+    if in_string:
+        repaired += '"'
+    # A dangling comma before a synthesized closer would be invalid JSON.
+    repaired = re.sub(r",\s*$", "", repaired)
+    repaired += "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return repaired
+
+
 def extract_first_json_array(text: str) -> Optional[str]:
     """Return the first balanced ``[...]`` block in ``text``, if any."""
     return _extract_balanced(text, "[", "]")

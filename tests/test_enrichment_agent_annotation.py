@@ -42,7 +42,9 @@ _ARTICLE = SimpleNamespace(
     urn="urn:article:x", title="T", abstract="A", authors=["B"]
 )
 
-_TRUNCATED = '{"reader_group":"General Public","tags":["Kefir","Probio'
+# Cut mid-key: closing the open scopes yields a key with no value, so the
+# unclosed-JSON salvage cannot rescue it and escalation must kick in.
+_TRUNCATED = '{"reader_group":"General Public","tags'
 _COMPLETE = '{"reader_group":"General Public","study_type":"RCT"}'
 
 
@@ -113,6 +115,84 @@ class InvokeAnnotationTruncationTests(unittest.TestCase):
         self.assertGreater(
             _ANNOTATION_MAX_TOKENS_ESCALATED, _ANNOTATION_MAX_TOKENS
         )
+
+
+@patch("agents.enrichment_agent.build_trace_config", lambda **_: {})
+class UnclosedJsonSalvageTests(unittest.TestCase):
+    """Production showed gpt-oss ending long annotations with finish_reason
+    "stop" but one closing brace short — the payload is complete except for
+    the closers, so it must be salvaged, not failed."""
+
+    # The exact shape from the prod probe: ends '..."}]}' but the top-level
+    # object needs one more '}'.
+    _UNDER_CLOSED = (
+        '{"reader_group":"General Public","study_type":"Meta-analysis",'
+        '"annotations":{"user_qa":[{"question":"Q?","answer":"A."}]}'
+    )
+
+    def test_under_closed_payload_is_salvaged_on_first_attempt(self):
+        primary = _FakeChain([_response(self._UNDER_CLOSED)])
+
+        result = _agent()._invoke_annotation(primary, _ARTICLE)
+
+        self.assertEqual(result["study_type"], "Meta-analysis")
+        self.assertEqual(
+            result["annotations"]["user_qa"][0]["answer"], "A."
+        )
+        self.assertEqual(primary.calls, 1)
+
+    def test_open_string_and_dangling_comma_are_repaired(self):
+        content = '{"tags":["Dairy","Prostate Cancer"],"verdict":["Some evi'
+        primary = _FakeChain([_response(content)])
+
+        result = _agent()._invoke_annotation(primary, _ARTICLE)
+
+        self.assertEqual(result["tags"], ["Dairy", "Prostate Cancer"])
+        self.assertEqual(result["verdict"], ["Some evi"])
+
+    def test_mid_document_corruption_is_not_papered_over(self):
+        # An unescaped quote breaks the JSON mid-document; the top-level
+        # object still closes, so the closers repair must not fire and the
+        # normal retry path handles it.
+        broken = '{"verdict":["shows "significant" effects"],"score":3}'
+        primary = _FakeChain([_response(broken), _response(broken)])
+
+        with self.assertRaises(ValueError):
+            _agent()._invoke_annotation(primary, _ARTICLE)
+        self.assertEqual(primary.calls, 2)
+
+
+class CloseUnclosedJsonTests(unittest.TestCase):
+    def test_returns_none_for_balanced_json(self):
+        from agents.json_output import close_unclosed_json
+
+        self.assertIsNone(close_unclosed_json('{"a": 1}'))
+
+    def test_returns_none_without_an_object(self):
+        from agents.json_output import close_unclosed_json
+
+        self.assertIsNone(close_unclosed_json("no json here"))
+
+    def test_returns_none_for_mismatched_brackets(self):
+        from agents.json_output import close_unclosed_json
+
+        self.assertIsNone(close_unclosed_json('{"a": [1}'))
+
+    def test_closes_nested_scopes_in_order(self):
+        import json
+
+        from agents.json_output import close_unclosed_json
+
+        repaired = close_unclosed_json('{"a": {"b": [1, 2')
+        self.assertEqual(json.loads(repaired), {"a": {"b": [1, 2]}})
+
+    def test_escaped_quotes_do_not_confuse_string_tracking(self):
+        import json
+
+        from agents.json_output import close_unclosed_json
+
+        repaired = close_unclosed_json('{"a": "say \\"hi\\"", "b": [1')
+        self.assertEqual(json.loads(repaired), {"a": 'say "hi"', "b": [1]})
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ Enrichment agent for scientific articles.
 Runs keyword extraction, homogenization, and full article enrichment.
 """
 
+import json
 import logging
 import unicodedata
 import copy
@@ -12,6 +13,7 @@ from collections import Counter, defaultdict
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.prompts import PromptTemplate
 from agents.json_output import (
+    close_unclosed_json,
     extract_first_json_object,
     parse_json_array,
     parse_json_object,
@@ -390,6 +392,34 @@ class EnrichmentAgent:
         return enriched
 
     @staticmethod
+    def _parse_annotation_content(content: str, urn: str) -> Dict[str, Any]:
+        """Parse annotation JSON, salvaging output that only lacks closers.
+
+        Production showed gpt-oss ending long annotations cleanly
+        (finish_reason "stop") but one or two closing braces short; every
+        field is present, so closing the open scopes recovers the payload.
+
+        Raises:
+            ValueError: if the content is unusable even after the repair.
+        """
+        try:
+            return _parse_json_object(content)
+        except ValueError:
+            repaired = close_unclosed_json(content)
+            if repaired is not None:
+                try:
+                    salvaged = json.loads(repaired)
+                except json.JSONDecodeError:
+                    salvaged = None
+                if isinstance(salvaged, dict):
+                    logger.info(
+                        "Annotation JSON for %s salvaged by closing unbalanced scopes",
+                        urn,
+                    )
+                    return salvaged
+            raise
+
+    @staticmethod
     def _looks_truncated(response, content: str) -> bool:
         """Whether a completion was cut off by the token budget.
 
@@ -429,6 +459,7 @@ class EnrichmentAgent:
             tags=["enrichment", "annotation"],
         )
 
+        urn = getattr(article, "urn", "<unknown>")
         last_error: Optional[Exception] = None
         truncated = False
         for attempt in range(1, attempts + 1):
@@ -436,7 +467,7 @@ class EnrichmentAgent:
             content = normalize_model_text(getattr(response, "content", response))
 
             try:
-                return _parse_json_object(content)
+                return self._parse_annotation_content(content, urn)
             except ValueError as e:
                 last_error = e
                 truncated = self._looks_truncated(response, content)
@@ -454,7 +485,7 @@ class EnrichmentAgent:
             response = escalation_chain.invoke(payload, config=trace_config)
             content = normalize_model_text(getattr(response, "content", response))
             try:
-                return _parse_json_object(content)
+                return self._parse_annotation_content(content, urn)
             except ValueError as e:
                 last_error = e
                 logger.warning(
