@@ -38,13 +38,15 @@ COMPLEXITY_INSTRUCTIONS = {
         "- Use a concrete analogy or everyday example to make each key idea land.\n"
         "- Structure: short sentences, one idea at a time; lead with the practical takeaway, then the 'why'.\n"
         "- Omit: study designs, effect sizes, statistics, mechanism-level detail, and citations-as-argument. Reassure rather than caveat-heavily.\n"
-        "- Tone: warm, encouraging, and confident without oversimplifying to the point of being wrong."
+        "- Tone: warm, encouraging, and confident without oversimplifying to the point of being wrong.\n"
+        "- LENGTH: short — 2 to 3 brief paragraphs, roughly 120-180 words total. Stop when the practical takeaway is clear; never pad."
     ),
     "intermediate": (
         "Write for an informed general reader comfortable with basic science.\n"
         "- Use clear scientific language; define complex terms when first introduced.\n"
         "- Balance the practical takeaway with a brief, honest sense of the evidence behind it.\n"
-        "- Structure: readable prose with the conclusion first, then supporting reasoning."
+        "- Structure: readable prose with the conclusion first, then supporting reasoning.\n"
+        "- LENGTH: 2 to 4 paragraphs, roughly 180-280 words."
     ),
     "expert": (
         "Write for a nutrition/food-science professional or researcher.\n"
@@ -52,7 +54,8 @@ COMPLEXITY_INSTRUCTIONS = {
         "- Framing: foreground mechanism, methodology, and the strength and shape of the evidence.\n"
         "- Where the sources support it, be specific about study designs (RCT, cohort, meta-analysis), effect sizes/direction, and statistical or clinical significance.\n"
         "- Structure: dense, information-first prose; no hand-holding, no motivational framing, no restating the question.\n"
-        "- Surface limitations, heterogeneity, and open questions the way you would for a knowledgeable colleague."
+        "- Surface limitations, heterogeneity, and open questions the way you would for a knowledgeable colleague.\n"
+        "- LENGTH: as long as the evidence warrants, typically 3 to 5 dense paragraphs; completeness over brevity, but no filler."
     ),
 }
 
