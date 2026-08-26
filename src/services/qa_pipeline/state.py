@@ -24,7 +24,7 @@ class EvidenceItem:
     rrf_score: float = 0.0
     rrf_norm: float = 0.0
     adjusted_score: float = 0.0
-    score_parts: Dict[str, float] = field(default_factory=dict)
+    score_parts: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> str:

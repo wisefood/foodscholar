@@ -260,6 +260,30 @@ class Config:
         self.settings["QA_INFLUENCE_CITATION_CAP"] = int(
             os.getenv("QA_INFLUENCE_CITATION_CAP", "1000")
         )
+        # Earned tier: an UNTIERED article whose citation record clears these
+        # thresholds gets prime/core-like standing on its own — almost the
+        # whole corpus carries no editorial tier, and field-shaping work should
+        # not rank as a nobody while it waits for a curator. Earned boosts sit
+        # below the curated ones (1.45 < 1.6, 1.15 < 1.25) and an explicit
+        # tier, promotion or demotion, always wins.
+        self.settings["QA_EARNED_TIER_ENABLED"] = os.getenv(
+            "QA_EARNED_TIER_ENABLED", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.settings["QA_EARNED_PRIME_CITATIONS"] = int(
+            os.getenv("QA_EARNED_PRIME_CITATIONS", "500")
+        )
+        self.settings["QA_EARNED_PRIME_INFLUENTIAL"] = int(
+            os.getenv("QA_EARNED_PRIME_INFLUENTIAL", "25")
+        )
+        self.settings["QA_EARNED_CORE_CITATIONS"] = int(
+            os.getenv("QA_EARNED_CORE_CITATIONS", "150")
+        )
+        self.settings["QA_EARNED_PRIME_BOOST"] = float(
+            os.getenv("QA_EARNED_PRIME_BOOST", "1.45")
+        )
+        self.settings["QA_EARNED_CORE_BOOST"] = float(
+            os.getenv("QA_EARNED_CORE_BOOST", "1.15")
+        )
         self.settings["QA_MIN_SCORE"] = float(os.getenv("QA_MIN_SCORE", "0.05"))
         self.settings["QA_PER_DOC_CAP"] = int(os.getenv("QA_PER_DOC_CAP", "2"))
         self.settings["QA_STREAM_HEARTBEAT_SECONDS"] = int(

@@ -122,6 +122,37 @@ def influence_factor(payload: Dict[str, Any]) -> float:
     return 1.0 + weight * scaled
 
 
+def tier_factor(payload: Dict[str, Any]) -> tuple[float, str]:
+    """Tier multiplier plus where it came from.
+
+    An explicit tier (curator's, else the enrichment agent's proposal) always
+    wins — including demotions. But in production almost the whole corpus is
+    untiered, so standing can also be *earned* from the citation record: work
+    the field demonstrably builds on gets prime/core-like standing without
+    waiting for a curator. Earned boosts sit below their curated counterparts
+    (1.45 < 1.6, 1.15 < 1.25) so a human placement always means more.
+    """
+    explicit = effective_tier(payload)
+    if explicit:
+        return tier_boost(explicit), explicit
+
+    if not config.settings.get("QA_EARNED_TIER_ENABLED", True):
+        return 1.0, ""
+
+    citations = int_field(payload, "citationCount", "citation_count")
+    influential = int_field(
+        payload, "influentialCitationCount", "influential_citation_count"
+    )
+    effective = citations + 2 * influential
+    if effective >= _setting("QA_EARNED_PRIME_CITATIONS", 500) and (
+        influential >= _setting("QA_EARNED_PRIME_INFLUENTIAL", 25)
+    ):
+        return _setting("QA_EARNED_PRIME_BOOST", 1.45), "earned_prime"
+    if effective >= _setting("QA_EARNED_CORE_CITATIONS", 150):
+        return _setting("QA_EARNED_CORE_BOOST", 1.15), "earned_core"
+    return 1.0, ""
+
+
 def study_design_factor(payload: Dict[str, Any]) -> float:
     """Weight by study design from the enrichment metadata.
 
@@ -268,6 +299,7 @@ def adjust_evidence(
 
         if is_guideline:
             tier = 1.0
+            tier_label = ""
             recency = 1.0
             influence = 1.0
             design = 1.0
@@ -275,7 +307,7 @@ def adjust_evidence(
                 payload, user_context=user_context, facets=question_facets
             )
         else:
-            tier = tier_boost(effective_tier(payload))
+            tier, tier_label = tier_factor(payload)
             recency = recency_factor(payload, now_year=now_year)
             influence = influence_factor(payload)
             design = study_design_factor(payload)
@@ -284,6 +316,7 @@ def adjust_evidence(
         item.score_parts = {
             "rrf_norm": round(item.rrf_norm, 6),
             "tier": round(tier, 4),
+            "tier_label": tier_label,
             "recency": round(recency, 4),
             "influence": round(influence, 4),
             "study_design": round(design, 4),

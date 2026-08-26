@@ -151,6 +151,71 @@ class StudyDesignFactorTests(unittest.TestCase):
         )
 
 
+class EarnedTierTests(unittest.TestCase):
+    """Untiered but heavily-cited work earns tier standing on its own;
+    an explicit tier — promotion or demotion — always wins."""
+
+    def test_untiered_highly_influential_earns_prime_standing(self):
+        boost, label = ranking.tier_factor(
+            {"citation_count": 600, "influential_citation_count": 40}
+        )
+        self.assertEqual(label, "earned_prime")
+        self.assertEqual(boost, config.settings["QA_EARNED_PRIME_BOOST"])
+        # Earned standing stays below the curated equivalent.
+        self.assertLess(boost, 1.6)
+
+    def test_citations_without_influential_earn_core_not_prime(self):
+        # 600 raw citations clear the prime citation bar but nothing builds
+        # on the work — that is core standing, not prime.
+        boost, label = ranking.tier_factor({"citationCount": 600})
+        self.assertEqual(label, "earned_core")
+        self.assertEqual(boost, config.settings["QA_EARNED_CORE_BOOST"])
+        self.assertLess(boost, 1.25)
+
+    def test_moderate_record_earns_core(self):
+        boost, label = ranking.tier_factor({"citation_count": 200})
+        self.assertEqual(label, "earned_core")
+
+    def test_thin_record_earns_nothing(self):
+        boost, label = ranking.tier_factor({"citation_count": 40})
+        self.assertEqual((boost, label), (1.0, ""))
+
+    def test_explicit_tier_wins_over_bibliometrics(self):
+        # A curator's demotion is not overridden by a citation record.
+        boost, label = ranking.tier_factor(
+            {"indexing_tier": "archive_only", "citation_count": 5000,
+             "influential_citation_count": 400}
+        )
+        self.assertEqual((boost, label), (0.6, "archive_only"))
+
+    def test_influential_citations_count_double_toward_thresholds(self):
+        # 100 citations + 200 doubled influential = 500 effective.
+        boost, label = ranking.tier_factor(
+            {"citation_count": 100, "influential_citation_count": 200}
+        )
+        self.assertEqual(label, "earned_prime")
+
+    def test_kill_switch_disables_earned_tiers(self):
+        original = config.settings.get("QA_EARNED_TIER_ENABLED", True)
+        config.settings["QA_EARNED_TIER_ENABLED"] = False
+        try:
+            boost, label = ranking.tier_factor(
+                {"citation_count": 600, "influential_citation_count": 40}
+            )
+            self.assertEqual((boost, label), (1.0, ""))
+        finally:
+            config.settings["QA_EARNED_TIER_ENABLED"] = original
+
+    def test_score_parts_carry_the_tier_label(self):
+        item = _item(
+            {"urn": "a1", "citation_count": 600,
+             "influential_citation_count": 40},
+            rrf_norm=0.5,
+        )
+        adjusted = ranking.adjust_evidence([item], now_year=2026)
+        self.assertEqual(adjusted[0].score_parts["tier_label"], "earned_prime")
+
+
 class AdjustEvidenceTests(unittest.TestCase):
     def test_multiplicative_formula(self):
         item = _item(
