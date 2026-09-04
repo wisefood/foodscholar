@@ -36,6 +36,13 @@ class QARequestRecord(Base):
 
     user_id = Column(String(255), nullable=True)
     member_id = Column(String(255), nullable=True)
+    # The gateway's X-Request-Id for the request that produced this question.
+    # `id` above is FoodScholar's own request identifier (the one the UI quotes
+    # back when submitting feedback); this is the platform-wide correlation id,
+    # and it is how a question asked *inside a FoodChat turn* — which reaches
+    # this service without a Keycloak subject — is attributed to a user, by
+    # joining the gateway's activity record for the same id.
+    correlation_id = Column(String(64), nullable=True, index=True)
 
     primary_answer = Column(JSONB, nullable=False)
     secondary_answer = Column(JSONB, nullable=True)
@@ -78,6 +85,13 @@ class QAFeedbackRecord(Base):
     target_answer = Column(String(16), nullable=False, default="overall")
     feedback_mode = Column(String(24), nullable=False, default="general")
     reason = Column(Text, nullable=True)
+
+    # Who is complaining. Previously recoverable only by joining back to
+    # qa_requests, and then only when that row had an identity of its own —
+    # which left feedback on a chat-originated question attributable to nobody.
+    user_id = Column(String(255), nullable=True, index=True)
+    member_id = Column(String(255), nullable=True)
+    correlation_id = Column(String(64), nullable=True, index=True)
 
     created_at = Column(
         DateTime(timezone=True),

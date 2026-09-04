@@ -63,6 +63,38 @@ def _apply_schema_updates(conn) -> None:
         ALTER TABLE IF EXISTS {SCHEMA}.qa_requests
         ADD COLUMN IF NOT EXISTS pipeline_meta JSONB
         """,
+        # Platform correlation id (the gateway's X-Request-Id), and identity on
+        # feedback rows. Both are nullable: every row written before this
+        # migration predates the correlation id, and direct callers may still
+        # arrive without one.
+        f"""
+        ALTER TABLE IF EXISTS {SCHEMA}.qa_requests
+        ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(64)
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS ix_qa_requests_correlation_id
+        ON {SCHEMA}.qa_requests (correlation_id)
+        """,
+        f"""
+        ALTER TABLE IF EXISTS {SCHEMA}.qa_feedback
+        ADD COLUMN IF NOT EXISTS user_id VARCHAR(255)
+        """,
+        f"""
+        ALTER TABLE IF EXISTS {SCHEMA}.qa_feedback
+        ADD COLUMN IF NOT EXISTS member_id VARCHAR(255)
+        """,
+        f"""
+        ALTER TABLE IF EXISTS {SCHEMA}.qa_feedback
+        ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(64)
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS ix_qa_feedback_user_id
+        ON {SCHEMA}.qa_feedback (user_id)
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS ix_qa_feedback_correlation_id
+        ON {SCHEMA}.qa_feedback (correlation_id)
+        """,
     ]
 
     for stmt in statements:

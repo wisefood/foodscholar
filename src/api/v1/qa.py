@@ -13,6 +13,9 @@ from models.qa import (
     QAResponse,
     QAFeedbackRequest,
     QAFeedbackResponse,
+    QAFeedbackListResponse,
+    QARequestDetail,
+    QARequestListResponse,
     MemoryDecisionRequest,
     MemoryDecisionResponse,
     MemorySuggestion,
@@ -22,8 +25,9 @@ from models.qa import (
     DEFAULT_GROQ_MODEL,
 )
 from services.qa_service import QAService
+from services.qa_review_service import QA_REVIEW_SERVICE
 from services.memory_service import MEMORY_SERVICE
-from exceptions import InvalidError, InternalError
+from exceptions import InvalidError, InternalError, NotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +218,97 @@ async def decide_memory(request: MemoryDecisionRequest):
         raise InternalError(
             detail="Error recording your choice. Please try again.",
             extra={"cause": e.__class__.__name__},
+        )
+
+
+# ---------------------------------------------------------------- review ----
+#
+# The read side of the two tables this service has been filling since they were
+# added. There was no GET for either, so the questions people asked and the
+# feedback they left could only be seen from a psql session — which is why no
+# expert has ever reviewed them.
+#
+# Unauthenticated here, like every other route in this service: the gateway is
+# the security perimeter and exposes these behind `auth("admin,expert")`.
+
+
+@router.get("/requests", response_model=QARequestListResponse)
+async def list_qa_requests(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user_id: Optional[str] = Query(None, description="Keycloak subject"),
+    member_id: Optional[str] = Query(None),
+    correlation_id: Optional[str] = Query(
+        None,
+        description=(
+            "The gateway's X-Request-Id. The only way to attribute a question "
+            "asked inside a FoodChat turn, which arrives with no subject."
+        ),
+    ),
+    language: Optional[str] = Query(None),
+    mode: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Case-insensitive substring of the question"),
+    has_feedback: Optional[bool] = Query(None),
+    negative_only: bool = Query(False, description="Only answers somebody marked unhelpful"),
+):
+    """Questions that were asked, newest first, with their feedback counts."""
+    try:
+        return await QA_REVIEW_SERVICE.list_requests(
+            limit=limit,
+            offset=offset,
+            user_id=user_id,
+            member_id=member_id,
+            correlation_id=correlation_id,
+            language=language,
+            mode=mode,
+            search=search,
+            has_feedback=has_feedback,
+            negative_only=negative_only,
+        )
+    except Exception as e:
+        logger.error("Error listing QA requests: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error listing questions.", extra={"cause": e.__class__.__name__}
+        )
+
+
+@router.get("/requests/{request_id}", response_model=QARequestDetail)
+async def get_qa_request(request_id: str):
+    """One question with its answers, sources, pipeline trace and feedback."""
+    try:
+        detail = await QA_REVIEW_SERVICE.get_request(request_id)
+    except Exception as e:
+        logger.error("Error loading QA request %s: %s", request_id, e, exc_info=True)
+        raise InternalError(
+            detail="Error loading question.", extra={"cause": e.__class__.__name__}
+        )
+    if detail is None:
+        # 404, not 400: the request was well-formed, the thing is not there.
+        raise NotFoundError(detail=f"No QA request '{request_id}'")
+    return detail
+
+
+@router.get("/feedback/list", response_model=QAFeedbackListResponse)
+async def list_qa_feedback(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    negative_only: bool = Query(False),
+    user_id: Optional[str] = Query(None),
+):
+    """Feedback received, newest first, each with the question it is about.
+
+    Mounted at `/feedback/list` rather than `/feedback` because the POST that
+    submits feedback already owns that path, and giving one path two meanings
+    is how a client ends up reading when it meant to write.
+    """
+    try:
+        return await QA_REVIEW_SERVICE.list_feedback(
+            limit=limit, offset=offset, negative_only=negative_only, user_id=user_id
+        )
+    except Exception as e:
+        logger.error("Error listing QA feedback: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error listing feedback.", extra={"cause": e.__class__.__name__}
         )
 
 

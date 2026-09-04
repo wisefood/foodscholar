@@ -5,6 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 import logsys
+import obs_context
+import wf_telemetry
 import threading
 import uvicorn
 from contextlib import asynccontextmanager
@@ -38,6 +40,13 @@ from config import config
 # Initialize logger
 logger = logging.getLogger(__name__)
 logsys.configure()
+# Every log line carries the gateway's correlation id for the request that
+# caused it, so one user action can be followed across services.
+obs_context.install_log_filter()
+# Report answered questions and model spend back to the gateway, which
+# owns the analytics store. No-op unless ANALYTICS_ENABLED and an ingest
+# secret are both set.
+wf_telemetry.TELEMETRY.start(app="foodscholar")
 
 
 @asynccontextmanager
@@ -153,6 +162,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Adopt the gateway's X-Request-Id (or mint one for a direct caller). Added
+# last, so it sits outermost and the id exists before anything else can log.
+app.add_middleware(obs_context.RequestContextMiddleware)
 
 # Install error handlers
 install_error_handler(app)

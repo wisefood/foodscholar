@@ -122,6 +122,11 @@ class ClientPool:
                         client_id=config.settings["KEYCLOAK_CLIENT_ID"],
                         client_secret=config.settings["KEYCLOAK_CLIENT_SECRET"],
                     ),
+                    # The platform talking to itself, not a user. The client
+                    # also refuses to report for service credentials, so this
+                    # is belt and braces — but a reader of this file should not
+                    # have to know that to be sure.
+                    telemetry=False,
                 )
                 self._pool.append(client)
                 self._available.append(client)

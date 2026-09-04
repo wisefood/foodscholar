@@ -21,6 +21,21 @@ except Exception as e:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def _current_identity() -> Dict[str, Optional[str]]:
+    """Who a model call belongs to, resolved when the call ends.
+
+    A callable rather than a captured value: the usage handler is built once
+    per pooled client and then serves every request, so an identity read at
+    construction would file every call under whoever warmed the pool.
+    """
+    try:
+        import obs_context
+
+        return {"user_id": obs_context.get_user_sub()}
+    except Exception:  # pragma: no cover - defensive
+        return {}
+
+
 class GroqConnectionPool:
     """
     Connection pool for ChatGroq instances.
@@ -120,6 +135,28 @@ class GroqConnectionPool:
             callbacks = list(kwargs.pop("callbacks", []) or [])
             callbacks.append(langfuse_handler)
             kwargs["callbacks"] = callbacks
+
+        # Token accounting, attached at the pool for the same reason the
+        # Langfuse handler is: an answer is several model calls across the
+        # clarifier, the retrieval scout and the two answer legs, and costing
+        # them one call site at a time guarantees the next one added is missed.
+        # Langfuse holds the traces; this holds the per-user numbers, which the
+        # Langfuse metrics API cannot group by user.
+        try:
+            import wf_telemetry
+
+            usage_handler = wf_telemetry.usage_callback(
+                "foodscholar_llm",
+                provider="groq",
+                app="foodscholar",
+                identity=_current_identity,
+            )
+            if usage_handler is not None:
+                callbacks = list(kwargs.pop("callbacks", []) or [])
+                callbacks.append(usage_handler)
+                kwargs["callbacks"] = callbacks
+        except Exception:  # never block client construction
+            logger.debug("Usage callback unavailable", exc_info=True)
 
         # Thread-safe check and creation
         with self._lock:

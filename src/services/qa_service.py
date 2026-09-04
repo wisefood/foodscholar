@@ -4,7 +4,11 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
+
+import obs_context
+import wf_telemetry
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -202,6 +206,10 @@ DUAL_ANSWER_STRATEGIES = [
 ]
 
 
+#: The product surface this service reports activity under.
+APP_NAME = "foodscholar"
+
+
 class QAService:
     """Service for non-contextual Q&A with optional RAG."""
 
@@ -210,6 +218,9 @@ class QAService:
 
     def __init__(self, cache_enabled: bool = True):
         self.cache_manager = CacheManager(enabled=cache_enabled)
+        # Consecutive failures to persist a question. Reset on the first
+        # success, so a non-zero value means "right now", not "ever".
+        self._persist_failures = 0
         self._embedder = None
         self._simple_question_llm = None
         self._conversation_summary_llm = None
@@ -925,6 +936,7 @@ class QAService:
         """
         adapter = self._retriever_adapters.get(retriever)
 
+        started = time.perf_counter()
         result = adapter.retrieve(
             question=question,
             plan=plan,
@@ -949,7 +961,67 @@ class QAService:
             }
 
         logger.info("QA retrieval status: %s", result.status)
+        self._report_qa_search(
+            question=question,
+            retriever=retriever,
+            top_k=top_k,
+            expertise_level=expertise_level,
+            first_pass=before,
+            final=len(result.source_payloads),
+            status=result.status,
+            started=started,
+        )
         return result
+
+    @staticmethod
+    def _report_qa_search(
+        *,
+        question: str,
+        retriever: str,
+        top_k: int,
+        expertise_level: Optional[str],
+        first_pass: int,
+        final: int,
+        status: Optional[Dict[str, Any]],
+        started: float,
+    ) -> None:
+        """Report the evidence retrieval behind one answer. Never raises.
+
+        This is the only search FoodScholar performs, and it was invisible: the
+        gateway sees a question arrive and an answer leave, so "the answer was
+        thin" and "retrieval found four documents and editorial policy dropped
+        three of them" looked identical from outside. The two counts are what
+        separate them — `first_pass` is what the retriever returned, `final`
+        what survived the audience and tier filter.
+
+        `user_context` is deliberately not reported: it carries the asker's
+        country, allergies and dietary profile, and health attributes have no
+        place in an analytics table.
+        """
+        try:
+            status = status or {}
+            filters: Dict[str, Any] = {
+                "retriever": status.get("retriever") or retriever,
+                "top_k": top_k,
+                "expertise_level": expertise_level,
+                "article_hits": status.get("article_hits"),
+                "guideline_hits": status.get("guideline_hits"),
+            }
+            if status.get("ok") is False:
+                # Why it found nothing, when it found nothing because it broke.
+                filters["error"] = "retrieval_failed"
+            wf_telemetry.TELEMETRY.search(
+                surface="qa",
+                raw_query=question,
+                filters={k: v for k, v in filters.items() if v is not None},
+                result_count_first_pass=first_pass,
+                result_count_final=final,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                user_id=obs_context.get_user_sub(),
+                app=APP_NAME,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("qa.search_report_failed", exc_info=True)
 
     @staticmethod
     def _should_ask_clarification_before_scout(
@@ -1618,6 +1690,7 @@ class QAService:
                     language=request.language,
                     user_id=request.user_id,
                     member_id=request.member_id,
+                    correlation_id=obs_context.get_request_id(),
                     primary_answer=response.primary_answer.model_dump(),
                     secondary_answer=(
                         response.secondary_answer.model_dump()
@@ -1635,13 +1708,63 @@ class QAService:
                 session.add(record)
                 await session.commit()
                 logger.info(
-                    "Persisted QA request %s to PostgreSQL", response.request_id
+                    "qa.persisted",
+                    extra={
+                        "request_id": obs_context.get_request_id(),
+                        "qa_request_id": response.request_id,
+                        "cache_hit": bool(response.cache_hit),
+                    },
                 )
-        except Exception as e:
-            logger.error(
-                "Failed to persist QA request %s: %s",
-                response.request_id, e, exc_info=True,
+            wf_telemetry.TELEMETRY.event(
+                "qa.answered",
+                props={
+                    "qa_request_id": response.request_id,
+                    "mode": request.mode,
+                    "language": request.language,
+                    "model": effective_model,
+                    "rag_enabled": bool(effective_rag),
+                    "cache_hit": bool(response.cache_hit),
+                    "confidence": response.primary_answer.confidence,
+                    "articles_consulted": response.primary_answer.articles_consulted,
+                    "dual_strategy": dual_strategy,
+                },
+                user_id=request.user_id,
+                member_id=request.member_id,
+                app=APP_NAME,
             )
+        except Exception as e:
+            # Best-effort by design — a database blip must not cost the user an
+            # answer they already waited for. But it used to fail *silently*,
+            # which meant an outage looked like nobody asking questions. The
+            # counter makes the difference visible at a glance.
+            self._persist_failures += 1
+            logger.error(
+                "qa.persist_failed",
+                extra={
+                    "request_id": obs_context.get_request_id(),
+                    "qa_request_id": response.request_id,
+                    "consecutive_failures": self._persist_failures,
+                    "cause": e.__class__.__name__,
+                },
+                exc_info=True,
+            )
+            wf_telemetry.TELEMETRY.event(
+                "qa.persist_failed",
+                props={
+                    # The answer's own id, so a failure can be matched to the
+                    # `qa.answered` row for the same question — without it the
+                    # event says only that something failed, which is a count
+                    # and not a diagnosis. The exception class name is the
+                    # reason category; the message and stack stay in the log,
+                    # where they are not keyed to a user.
+                    "qa_request_id": response.request_id,
+                    "cause": e.__class__.__name__,
+                    "consecutive_failures": self._persist_failures,
+                },
+                app=APP_NAME,
+            )
+        else:
+            self._persist_failures = 0
 
     def _guideline_context_should_clauses(
         self,
@@ -3540,9 +3663,27 @@ class QAService:
                     target_answer=feedback.target_answer,
                     feedback_mode=feedback_mode,
                     reason=feedback.reason,
+                    user_id=feedback.user_id,
+                    member_id=feedback.member_id,
+                    correlation_id=obs_context.get_request_id(),
                 )
                 session.add(record)
                 await session.commit()
+                # Mirrored to the gateway so an expert sees this alongside
+                # FoodChat's thumbs and the platform widget, instead of in a
+                # third table nothing joins.
+                wf_telemetry.TELEMETRY.feedback(
+                    target_type="qa_answer",
+                    target_id=str(feedback.request_id),
+                    rating_kind="ab" if feedback.preferred_answer else "helpful",
+                    rating_value=(
+                        feedback.preferred_answer or feedback.helpfulness
+                    ),
+                    reason=feedback.reason,
+                    user_id=feedback.user_id,
+                    member_id=feedback.member_id,
+                    app=APP_NAME,
+                )
                 logger.info(
                     "Recorded QA feedback for request %s: mode=%s, preference=%s, helpfulness=%s, target=%s",
                     feedback.request_id,

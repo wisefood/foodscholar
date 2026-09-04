@@ -1,4 +1,6 @@
 """Q&A models and schemas for non-contextual question answering."""
+from datetime import datetime
+
 from pydantic import BaseModel, Field, model_validator
 from typing import Any, Dict, List, Optional, Literal
 
@@ -705,6 +707,16 @@ class QAFeedbackRequest(BaseModel):
         max_length=500,
         description="Optional reason for preference",
     )
+    user_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Keycloak subject of the person giving feedback. Stamped by the "
+            "gateway from the verified token, never supplied by a browser."
+        ),
+    )
+    member_id: Optional[str] = Field(
+        default=None, description="Household member the feedback was given as."
+    )
 
     @model_validator(mode="after")
     def validate_feedback_signal(self):
@@ -722,6 +734,96 @@ class QAFeedbackResponse(BaseModel):
     request_id: str = Field(description="Request identifier")
     status: str = Field(description="Feedback status")
     message: str = Field(description="Confirmation message")
+
+
+# ----------------------------- Review models -----------------------------
+#
+# The read side of `qa_requests` / `qa_feedback`. Both tables have been written
+# on every question since they were added and never read: there was no GET for
+# either, so the answers experts most need to see — the ones somebody marked
+# unhelpful — were reachable only through a psql session.
+
+
+class QARequestSummary(BaseModel):
+    """One asked question, as it appears in a review list."""
+
+    request_id: str
+    question: str
+    mode: str
+    model: str
+    language: str
+    expertise_level: str
+    created_at: datetime
+    user_id: Optional[str] = None
+    member_id: Optional[str] = None
+    #: The gateway's X-Request-Id. For a question asked inside a FoodChat turn
+    #: this is the only route back to the user, because FoodChat holds a signed
+    #: member assertion rather than a Keycloak subject and cannot say who asked.
+    correlation_id: Optional[str] = None
+    confidence: Optional[str] = None
+    articles_consulted: int = 0
+    cache_hit: bool = False
+    has_feedback: bool = False
+    feedback_count: int = 0
+    #: True when at least one piece of feedback on this answer was negative —
+    #: the filter an expert reviewing quality actually wants.
+    has_negative_feedback: bool = False
+    answer_preview: Optional[str] = None
+
+
+class QARequestDetail(QARequestSummary):
+    """One asked question with everything needed to judge the answer."""
+
+    primary_answer: Optional[Dict[str, Any]] = None
+    secondary_answer: Optional[Dict[str, Any]] = None
+    dual_strategy: Optional[str] = None
+    retrieved_article_urns: List[str] = Field(default_factory=list)
+    pipeline_meta: Optional[Dict[str, Any]] = None
+    rag_enabled: bool = True
+    top_k: int = 5
+    feedback: List["QAFeedbackEntry"] = Field(default_factory=list)
+
+
+class QAFeedbackEntry(BaseModel):
+    """One piece of feedback, with enough context to act on it."""
+
+    id: str
+    request_id: str
+    question: Optional[str] = None
+    preferred_answer: Optional[str] = None
+    helpfulness: Optional[str] = None
+    target_answer: str = "overall"
+    feedback_mode: str = "general"
+    reason: Optional[str] = None
+    user_id: Optional[str] = None
+    member_id: Optional[str] = None
+    correlation_id: Optional[str] = None
+    created_at: datetime
+
+    @property
+    def is_negative(self) -> bool:
+        return self.helpfulness == "not_helpful"
+
+
+QARequestDetail.model_rebuild()
+
+
+class QARequestListResponse(BaseModel):
+    """A page of asked questions."""
+
+    total: int = Field(description="Matching questions, before paging")
+    limit: int
+    offset: int
+    items: List[QARequestSummary] = Field(default_factory=list)
+
+
+class QAFeedbackListResponse(BaseModel):
+    """A page of feedback."""
+
+    total: int
+    limit: int
+    offset: int
+    items: List[QAFeedbackEntry] = Field(default_factory=list)
 
 
 class SimpleNutriQuestionsResponse(BaseModel):
