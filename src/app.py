@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text
 
 from routers.generic import install_error_handler
-from api.v1 import search, sessions, enrich, qa, guidelines
+from api.v1 import search, sessions, enrich, qa, guidelines, integrator
 from services.linearrag_service import get_retriever
 from backend.db_init import init_db
 from workers.enrichment_worker import (
@@ -176,6 +176,7 @@ app.include_router(sessions.router, prefix="/api/v1")
 app.include_router(enrich.router, prefix="/api/v1")
 app.include_router(qa.router, prefix="/api/v1")
 app.include_router(guidelines.router, prefix="/api/v1")
+app.include_router(integrator.router, prefix="/api/v1")
 
 
 @app.get("/")

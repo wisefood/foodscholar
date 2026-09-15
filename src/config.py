@@ -181,6 +181,42 @@ class Config:
         # what /qa/models advertises and what an advanced-mode request is
         # validated against, so the UI picker follows this list without a
         # redeploy.
+        # --- Source Integrator -------------------------------------------
+        # The conversation model. Tool-calling is required; Groq's Compound
+        # systems cannot be used here because they refuse user-defined tools.
+        self.settings["INTEGRATOR_MODEL"] = os.getenv(
+            "INTEGRATOR_MODEL", "openai/gpt-oss-120b"
+        )
+        # The research model, which is the one place a provider executes
+        # anything for us: Compound has built-in web search and decides on its
+        # own when to use it.
+        self.settings["INTEGRATOR_RESEARCH_MODEL"] = os.getenv(
+            "INTEGRATOR_RESEARCH_MODEL", "groq/compound"
+        )
+        # A run that can search the web needs a ceiling, or one question can
+        # spend an afternoon and a month's quota.
+        self.settings["INTEGRATOR_MAX_STEPS"] = int(
+            os.getenv("INTEGRATOR_MAX_STEPS", 12)
+        )
+        self.settings["INTEGRATOR_MAX_TOKENS"] = int(
+            os.getenv("INTEGRATOR_MAX_TOKENS", 120_000)
+        )
+        # Phase 1 ships with writes off: the tools exist and the approval wall
+        # is live, but nothing reaches the catalog until the guide pipeline is
+        # wired behind it in Phase 2.
+        self.settings["INTEGRATOR_WRITES_ENABLED"] = (
+            os.getenv("INTEGRATOR_WRITES_ENABLED", "false").lower() == "true"
+        )
+        # Unpaywall asks callers to identify themselves. Ours, never a user's.
+        self.settings["INTEGRATOR_CONTACT_EMAIL"] = os.getenv(
+            "INTEGRATOR_CONTACT_EMAIL", ""
+        )
+        # Catalog credentials for the integrator's read tools. Unset leaves
+        # those tools unavailable and research still working.
+        self.settings["WISEFOOD_API_URL"] = os.getenv("WISEFOOD_API_URL", "")
+        self.settings["WISEFOOD_CLIENT_ID"] = os.getenv("WISEFOOD_CLIENT_ID", "")
+        self.settings["WISEFOOD_CLIENT_SECRET"] = os.getenv("WISEFOOD_CLIENT_SECRET", "")
+
         self.settings["QA_DEFAULT_MODEL"] = os.getenv(
             "QA_DEFAULT_MODEL", "openai/gpt-oss-120b"
         )

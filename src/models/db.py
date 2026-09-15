@@ -10,6 +10,7 @@ from sqlalchemy import (
     Integer,
     DateTime,
     ForeignKey,
+    Float,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
@@ -209,4 +210,190 @@ class GuidelineEnrichmentRecord(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source Integrator
+#
+# The conversational agent that researches candidate sources and integrates
+# approved ones into the catalog. Four tables, and the shape of them is the
+# design: a session holds the conversation, a proposal is the unit a *person*
+# approves, a run is one attempt at integrating an approved proposal, and a
+# tool call is the audit — every single thing the agent did, with what it was
+# given and what came back.
+#
+# Nothing here trusts the model. The approval state lives in a column, not in
+# a prompt, and `wisefood_mcp.stores.require_approved` reads that column
+# before any write tool will run.
+# ---------------------------------------------------------------------------
+
+
+class IntegratorSession(Base):
+    """One expert's conversation with the integrator.
+
+    Separate from the FoodChat session tables even though the shape rhymes:
+    those are keyed by household member and carry a participant's meal talk;
+    this is keyed by Keycloak subject and carries an expert's research. Sharing
+    them would put a curator's source hunt in a participant's history.
+    """
+
+    __tablename__ = "integrator_sessions"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(String(64), primary_key=True)
+    user_sub = Column(String(100), nullable=False, index=True)
+    title = Column(String(300), nullable=True)
+    status = Column(String(16), nullable=False, default="open")
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class IntegratorMessage(Base):
+    """One turn. Assistant turns keep the tool calls they made.
+
+    The whole message list is replayed to the model on the next turn, which is
+    what "keeps its context" means in practice — so `tool_calls` and
+    `tool_call_id` are stored rather than derived: a tool result that cannot
+    be matched back to the call that produced it breaks the next replay.
+    """
+
+    __tablename__ = "integrator_messages"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=True)
+    tool_calls = Column(JSONB, nullable=True)
+    tool_call_id = Column(String(128), nullable=True)
+    tool_name = Column(String(64), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class IntegrationProposal(Base):
+    """One candidate source, and everything worked out about it.
+
+    `status` is the wall. It reaches ``approved`` only through the console,
+    by a person, and every write tool refuses a proposal that is anything
+    else. `licence` and `licence_evidence` travel together on purpose: a
+    licence without the quotes behind it is a guess that has been promoted to
+    a fact, and this platform has to be able to answer a challenge years later.
+    """
+
+    __tablename__ = "integration_proposals"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(String(32), primary_key=True)
+    session_id = Column(String(64), nullable=True, index=True)
+    backlog_id = Column(String(64), nullable=True, index=True)
+
+    kind = Column(String(24), nullable=False)
+    title = Column(String(500), nullable=False)
+    source_url = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False, default="researching", index=True)
+
+    country = Column(String(120), nullable=True)
+    language = Column(String(80), nullable=True)
+    population_group = Column(String(160), nullable=True)
+
+    licence = Column(String(64), nullable=True)
+    licence_confidence = Column(Float, nullable=True)
+    licence_evidence = Column(JSONB, nullable=False, default=list)
+    #: Set only when a person approved despite an undetermined or restrictive
+    #: licence. Its presence is what makes that approval defensible.
+    licence_override_reason = Column(Text, nullable=True)
+
+    #: What the assistant scored it, and what the expert dragged it to. Both,
+    #: so a rubric that keeps disagreeing with people is visible as a pattern.
+    proposed_rank = Column(Float, nullable=True)
+    expert_rank = Column(Integer, nullable=True)
+    rationale = Column(Text, nullable=True)
+    plan = Column(JSONB, nullable=False, default=list)
+    proposal_metadata = Column("metadata", JSONB, nullable=False, default=dict)
+
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    approved_by = Column(String(100), nullable=True)
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    result = Column(JSONB, nullable=False, default=dict)
+
+
+class IntegratorToolCall(Base):
+    """Every tool the agent ran, whether it worked, and how long it took.
+
+    The audit the provenance chain points at. Kept for read tools too, not
+    only writes: "why did it propose this licence" is answered by the research
+    and evidence calls that came before, and those are exactly the ones a
+    write-only log would have thrown away.
+    """
+
+    __tablename__ = "integrator_tool_calls"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(64), nullable=True, index=True)
+    proposal_id = Column(String(32), nullable=True, index=True)
+    tool = Column(String(64), nullable=False)
+    is_write = Column(Boolean, nullable=False, default=False)
+    ok = Column(Boolean, nullable=False, default=True)
+    arguments = Column(JSONB, nullable=True)
+    result = Column(JSONB, nullable=True)
+    error = Column(JSONB, nullable=True)
+    duration_ms = Column(Float, nullable=True)
+    actor = Column(String(100), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class IntegratorBacklogItem(Base):
+    """A candidate source waiting to be looked at.
+
+    Seeded from the project's own source catalogue spreadsheet (219 rows) and
+    added to by experts or by the assistant. `external_key` is what makes
+    re-seeding idempotent — the spreadsheet will be re-imported, and it must
+    not multiply.
+    """
+
+    __tablename__ = "integrator_backlog"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(String(64), primary_key=True)
+    external_key = Column(String(300), nullable=False, unique=True, index=True)
+    kind = Column(String(24), nullable=False, index=True)
+    title = Column(String(500), nullable=False)
+    url = Column(Text, nullable=True)
+    country = Column(String(120), nullable=True)
+    language = Column(String(80), nullable=True)
+    population_group = Column(String(160), nullable=True)
+    #: Whatever else the source sheet carried — page counts, CiteScore,
+    #: publisher, declared licence. Kept verbatim rather than normalised,
+    #: because the columns differ per sheet and the assistant reads them.
+    attributes = Column(JSONB, nullable=False, default=dict)
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    source_sheet = Column(String(80), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
     )
