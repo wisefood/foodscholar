@@ -22,6 +22,7 @@ from backend.prompts import (
     QA_ANSWER_NORAG_USER,
 )
 from models.qa import QAAnswer, QACitation, DEFAULT_GROQ_MODEL
+from services.topic_coverage import coverage_prompt_lines
 
 logger = logging.getLogger(__name__)
 
@@ -384,10 +385,19 @@ def format_answer_context(
     *,
     retriever: str,
     user_context: Optional[Dict[str, Any]] = None,
+    question: Optional[str] = None,
 ) -> str:
-    """Format retrieval and user context for the answer-formulation prompt."""
+    """Format retrieval and user context for the answer-formulation prompt.
+
+    `question` is optional so existing callers keep working; without it the
+    topic-coverage checklist simply does not fire.
+    """
     context = user_context or {}
     parts = [f"- Retriever: {retriever}"]
+
+    # What a complete answer on this topic covers, for the few topics where a
+    # partial answer misleads. Empty for almost every question.
+    parts.extend(coverage_prompt_lines(question or ""))
 
     if retriever == "linearrag":
         parts.append(

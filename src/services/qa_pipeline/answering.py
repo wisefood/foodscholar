@@ -151,7 +151,7 @@ async def stream_answer(
         ),
         "language": language,
         "answer_context": format_answer_context(
-            retriever=retriever_shape, user_context=user_context
+            retriever=retriever_shape, user_context=user_context, question=question
         ),
         "prior_conversation": format_prior_conversation(prior_conversation),
         "question": question,
