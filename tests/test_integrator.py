@@ -289,3 +289,106 @@ class TestTheBacklog:
                   "url": "https://example.org/one"}]
         assert service.seed_backlog(items) == {"added": 1, "skipped": 0}
         assert service.seed_backlog(items) == {"added": 0, "skipped": 1}
+
+
+class TestItSaysWhatItIsDoing:
+    """Transparency is the feature, so it is tested like one.
+
+    A curator approving a source into a public-health catalog has to be able
+    to check the work: what was searched for, what was opened, what the
+    licence evidence actually said. A badge reading `research` does not carry
+    that; "Searched the web for *Bulgaria dietary guidelines* — 6 results"
+    does, and lets them notice the assistant searched for the wrong thing.
+    """
+
+    def _agent(self, groq, **kw):
+        from wisefood_mcp import ToolContext, build_registry
+        from integrator.agent import IntegratorAgent
+        return IntegratorAgent(registry=build_registry(),
+                               tool_context=ToolContext(proposal_store=None),
+                               groq_client=groq, **kw)
+
+    def test_a_plain_answer_still_shows_that_it_thought(self):
+        out = self._agent(FakeGroq(_say("Bulgaria has three guides."))).run([], "ask")
+        timeline = out["timeline"]
+        assert [s["kind"] for s in timeline] == ["plan"]
+        assert timeline[0]["outcome"] == "Answered from what was already known"
+        assert timeline[0]["status"] == "done"
+
+    def test_the_plan_step_says_what_it_decided_to_do(self):
+        groq = FakeGroq(
+            _say("", _call("licence_evidence", '{"text": "CC BY 4.0"}')),
+            _say("It is CC BY 4.0."),
+        )
+        out = self._agent(groq).run([], "what licence?")
+        assert out["timeline"][0]["outcome"] == "Decided to check the licence"
+
+    def test_each_tool_becomes_a_readable_step(self):
+        groq = FakeGroq(
+            _say("", _call("licence_evidence",
+                           '{"text": "Licensed under CC BY 4.0"}', "c1")),
+            _say("Done."),
+        )
+        out = self._agent(groq).run([], "check it")
+        step = next(s for s in out["timeline"] if s["kind"] == "licence")
+        assert step["title"] == "Checking the licence"
+        assert "CC-BY-4.0" in step["outcome"] and "confident" in step["outcome"]
+        assert step["status"] == "done" and step["ok"] is True
+        assert step["elapsed_ms"] is not None
+
+    def test_a_missing_licence_says_what_that_means_for_approval(self):
+        groq = FakeGroq(
+            _say("", _call("licence_evidence", '{"text": "A recipe for soup."}')),
+            _say("Nothing found."),
+        )
+        out = self._agent(groq).run([], "check it")
+        step = next(s for s in out["timeline"] if s["kind"] == "licence")
+        assert "cannot be approved without a reason" in step["outcome"]
+
+    def test_a_failed_tool_says_why_in_words(self):
+        groq = FakeGroq(
+            _say("", _call("research", '{"query": "x"}')),  # no groq client in ctx
+            _say("I could not search."),
+        )
+        out = self._agent(groq).run([], "find sources")
+        step = next(s for s in out["timeline"] if s["kind"] == "search")
+        assert step["ok"] is False
+        assert step["outcome"].startswith("Could not:")
+        assert "Groq" in step["outcome"], "names what was missing, not just 'failed'"
+
+    def test_the_search_step_shows_the_query_that_was_run(self):
+        # The point of showing this: a curator can see it searched for the
+        # wrong thing, which is invisible if only the result is shown.
+        groq = FakeGroq(_say("", _call("research", '{"query": "Bulgaria FBDG adults"}')),
+                        _say("Found some."))
+        out = self._agent(groq).run([], "find them")
+        step = next(s for s in out["timeline"] if s["kind"] == "search")
+        assert step["detail"] == "Bulgaria FBDG adults"
+        assert step["ok"] is False, "the query survives even when the search fails"
+
+    def test_stopping_early_is_itself_a_step(self):
+        from integrator.agent import Budget
+        groq = FakeGroq(*[_say("", _call("research", '{"query": "x"}', f"c{i}"))
+                          for i in range(20)])
+        out = self._agent(groq, budget=Budget(max_steps=2, max_tokens=10**9)).run([], "go")
+        stop = [s for s in out["timeline"] if s["kind"] == "stop"]
+        assert stop and "step limit" in stop[0]["outcome"]
+
+    def test_the_timeline_rides_the_final_assistant_turn(self):
+        # So reopening the conversation tomorrow shows the same account of
+        # the work, not an empty transcript.
+        groq = FakeGroq(_say("", _call("licence_evidence", '{"text": "CC0"}')),
+                        _say("Public domain."))
+        out = self._agent(groq).run([], "check")
+        finals = [m for m in out["messages"] if m["role"] == "assistant" and m.get("steps")]
+        assert len(finals) == 1, "one account of the turn, not one per round"
+        assert len(finals[0]["steps"]) == out["timeline"].__len__()
+
+    def test_tool_turns_sent_to_the_provider_carry_no_ui_fields(self):
+        # `steps` and `tool_name` are ours; a provider rejects unknown keys.
+        groq = FakeGroq(_say("", _call("licence_evidence", '{"text": "CC0"}')),
+                        _say("ok"))
+        self._agent(groq).run([], "check")
+        sent = groq.calls[1]["messages"]
+        for message in sent:
+            assert not set(message) - {"role", "content", "tool_calls", "tool_call_id"}

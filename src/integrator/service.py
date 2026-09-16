@@ -139,7 +139,7 @@ def history(*, session_id: str, user_sub: str) -> List[Dict[str, Any]]:
         )
         return [
             {"seq": r.seq, "role": r.role, "content": r.content,
-             "tool_name": r.tool_name,
+             "tool_name": r.tool_name, "steps": r.steps,
              "created_at": r.created_at.isoformat() if r.created_at else None}
             for r in rows
         ]
@@ -178,6 +178,10 @@ def chat(*, session_id: str, user_sub: str, message: str) -> Dict[str, Any]:
                 tool_calls=turn.get("tool_calls"),
                 tool_call_id=turn.get("tool_call_id"),
                 tool_name=turn.get("tool_name"),
+                # Only the final assistant turn carries the timeline, so
+                # reopening the conversation shows one account of the work
+                # rather than one per intermediate turn.
+                steps=turn.get("steps"),
             ))
         # The first question names the session, so a curator's list reads as
         # what they asked rather than as a column of ids.
@@ -189,6 +193,7 @@ def chat(*, session_id: str, user_sub: str, message: str) -> Dict[str, Any]:
         "session_id": session_id,
         "reply": outcome["reply"],
         "stop_reason": outcome["stop_reason"],
+        "timeline": outcome["timeline"],
         "steps": outcome["steps"],
         "tokens": outcome["tokens"],
         "model": outcome["model"],

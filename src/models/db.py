@@ -276,6 +276,12 @@ class IntegratorMessage(Base):
     tool_calls = Column(JSONB, nullable=True)
     tool_call_id = Column(String(128), nullable=True)
     tool_name = Column(String(64), nullable=True)
+    #: What the assistant did to produce this turn, as ReasoningSteps — the
+    #: same shape FoodScholar's Q&A already streams, so the console renders
+    #: both the same way. Stored rather than streamed-and-forgotten: a curator
+    #: reopening a conversation tomorrow needs to see how an answer was
+    #: reached, which is most of what makes it checkable.
+    steps = Column(JSONB, nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),

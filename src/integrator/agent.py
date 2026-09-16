@@ -25,31 +25,32 @@ from typing import Any, Dict, List, Optional
 
 from config import config
 
+from integrator.steps import StepTracker, finished_detail, running_title
+
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You help a WiseFood curator find and integrate new sources into the platform's \
-data catalog: national dietary guides, scientific articles, textbooks, food \
-composition tables and recipe collections.
+You help a WiseFood curator find and integrate new sources into the platform's data catalog: national dietary guides, scientific articles, textbooks, food composition tables and recipe collections.
 
-How you work:
+What you can do, and should say so when it is useful:
 
-- Use `research` to search the web. Its URLs are leads, not facts — open the \
-promising ones with `fetch_url` before you rely on what they say.
-- Check `catalog_coverage` before proposing. A source filling a gap is worth \
-more than a fourth guide for a country that already has three.
-- Establish the licence with `licence_evidence` and quote what you found. \
-Never assert a licence you have no evidence for; say plainly that it is \
-undetermined instead.
-- Create a proposal for each candidate worth a curator's attention, with a \
-rank, a short rationale, and the integration steps you intend.
-- You cannot approve anything. A person reviews your proposals in the console \
-and approves them there. Say so rather than implying you will proceed.
+- search the web and open pages and PDFs
+- check the catalog for what is already held, and where the gaps are
+- work out a source's licence from its own statements, and for a DOI from Unpaywall and Crossref
+- file a proposal for a curator to review
 
-Be concise. Prefer official and primary sources: health ministries, public \
-health agencies, WHO, EFSA, FAO, universities, peer-reviewed journals. When \
-you cannot find something, say so — a confident wrong URL costs a curator \
-more time than an honest gap."""
+What you cannot do: approve anything, or put anything into the catalog yourself. A person reviews your proposals in the console and approves them there. Say that plainly rather than implying you will proceed.
+
+How to work:
+
+- Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say.
+- Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three.
+- Establish the licence with `licence_evidence` and quote what you found. Never assert a licence you have no evidence for; say it is undetermined instead, and say what that means — a curator can still approve it, but only by writing down why.
+- Create a proposal for each candidate worth a curator's attention, with a rank, a short rationale, and the integration steps you intend.
+
+Be transparent about your own work. Say what you searched for, which pages you actually read, and which of your conclusions rest on evidence you found versus on inference. When you are unsure, say what would settle it.
+
+Be concise. Prefer official and primary sources: health ministries, public health agencies, WHO, EFSA, FAO, universities, peer-reviewed journals. When you cannot find something, say so — a confident wrong URL costs a curator more time than an honest gap."""
 
 
 class Budget:
@@ -120,6 +121,11 @@ class IntegratorAgent:
         ]
         produced: List[Dict[str, Any]] = []
         stop_reason = "completed"
+        # What the curator sees while this runs and afterwards. Started here
+        # rather than inside the tool loop so a turn that calls no tools still
+        # says that it thought about the question.
+        steps = StepTracker()
+        thinking = steps.start("plan", "Working out what to look for")
 
         while True:
             limit = self.budget.exhausted
@@ -129,8 +135,10 @@ class IntegratorAgent:
                     f"I stopped because I {limit}. Ask me to continue and I will "
                     f"pick up from here."
                 )
-                produced.append({"role": "assistant", "content": note})
-                return self._result(produced, note, stop_reason)
+                steps.add("stop", "Stopped early", outcome=limit)
+                produced.append({"role": "assistant", "content": note,
+                                 "steps": steps.snapshot()})
+                return self._result(produced, note, stop_reason, steps)
 
             completion = self.groq.chat.completions.create(
                 model=self.model,
@@ -145,6 +153,12 @@ class IntegratorAgent:
 
             message = data["choices"][0]["message"]
             calls = message.get("tool_calls") or []
+            if thinking is not None:
+                steps.finish(thinking, outcome=(
+                    f"Decided to {_describe_intent(calls)}" if calls
+                    else "Answered from what was already known"
+                ))
+                thinking = None
             assistant_turn: Dict[str, Any] = {
                 "role": "assistant",
                 "content": message.get("content") or "",
@@ -155,31 +169,74 @@ class IntegratorAgent:
             produced.append(assistant_turn)
 
             if not calls:
-                return self._result(produced, assistant_turn["content"], stop_reason)
+                assistant_turn["steps"] = steps.snapshot()
+                return self._result(produced, assistant_turn["content"], stop_reason, steps)
 
             for call in calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or "?"
-                outcome = self.registry.call(name, fn.get("arguments") or "{}", self.ctx)
-                payload = outcome.get("result") if outcome.get("ok") else outcome.get("error")
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except json.JSONDecodeError:
+                    parsed_args = {}
+
+                kind, title, detail = running_title(name, parsed_args or {})
+                step = steps.start(kind, title, detail=detail,
+                                   data={"tool": name})
+
+                outcome = self.registry.call(name, raw_args, self.ctx)
+                ok = bool(outcome.get("ok"))
+                payload = outcome.get("result") if ok else outcome.get("error")
+                steps.finish(step, ok=ok, outcome=finished_detail(
+                    name, parsed_args or {}, ok, outcome.get("result"),
+                    outcome.get("error")))
+
                 tool_turn = {
                     "role": "tool",
                     "tool_call_id": call.get("id"),
                     "tool_name": name,
                     "content": json.dumps(payload, default=str)[:24_000],
                 }
-                messages.append({k: v for k, v in tool_turn.items() if k != "tool_name"})
+                messages.append({k: v for k, v in tool_turn.items()
+                                 if k not in ("tool_name", "steps")})
                 produced.append(tool_turn)
 
-    def _result(self, produced, text, stop_reason) -> Dict[str, Any]:
+    def _result(self, produced, text, stop_reason, steps) -> Dict[str, Any]:
         return {
             "messages": produced,
             "reply": text,
             "stop_reason": stop_reason,
+            # What it did, in order, for the curator to read.
+            "timeline": steps.snapshot(),
             "steps": self.budget.steps,
             "tokens": self.budget.tokens,
             "model": self.model,
         }
+
+
+def _describe_intent(calls) -> str:
+    """"search the web and check the licence" — the plan, in its own words."""
+    intents = {
+        "research": "search the web",
+        "fetch_url": "read the page",
+        "licence_evidence": "check the licence",
+        "search_catalog": "search the catalog",
+        "catalog_coverage": "check what we already hold",
+        "get_entity": "read a catalog entry",
+        "list_organizations": "look up organisations",
+    }
+    names = []
+    for call in calls:
+        name = (call.get("function") or {}).get("name") or ""
+        phrase = intents.get(name, name.replace("_", " "))
+        if phrase and phrase not in names:
+            names.append(phrase)
+    if not names:
+        return "use a tool"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
 
 
 def replay(rows) -> List[Dict[str, Any]]:
