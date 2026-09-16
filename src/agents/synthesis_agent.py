@@ -19,7 +19,8 @@ from models.search import (
 from utilities.citation_validator import create_citation_from_article
 from agents.qa_agent import COMPLEXITY_INSTRUCTIONS
 from datetime import datetime
-from services.evidence_grade import grade_source, prefer_human
+from services.evidence_grade import grade_source
+from services.population_facet import population_of_query, population_penalty
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +68,33 @@ class SynthesisAgent:
             f"Synthesizing {len(articles)} articles for query: '{query}'"
         )
 
-        # Human evidence first, preclinical last.
+        # Order the evidence before the model sees it.
         #
-        # Round 2 found mouse studies surfacing as key findings for questions
-        # people asked about themselves. Retrieval relevance alone put them
-        # there: a mouse paper can be the closest match for "fibre and
-        # cholesterol" while being the wrong answer for the person asking.
-        # Reordering here rather than filtering keeps a question that only has
-        # preclinical evidence answerable — it just stops that evidence leading.
-        articles = prefer_human(articles)
+        # Two Round 2 findings, one ordering. Mouse studies surfaced as key
+        # findings for questions people asked about themselves, and a broad
+        # search came back full of pregnancy studies. Retrieval relevance alone
+        # put both there: a mouse paper can be the closest match for "fibre and
+        # cholesterol", and a pregnancy cohort the closest for "iron status",
+        # while each is the wrong answer for the person asking.
+        #
+        # One sort rather than two chained ones, because a second sort would
+        # discard the first's ordering. The policy — who the evidence is about
+        # matters more than how well designed it is, and both matter more than
+        # the retriever's score — lives here in the caller rather than inside
+        # either signal.
+        #
+        # Reordering, not filtering: a question with only preclinical or only
+        # pregnancy evidence stays answerable, and the label says what it is.
+        wanted_populations = population_of_query(query)
+        articles = sorted(
+            articles,
+            key=lambda a: (
+                grade_source(a).is_preclinical,
+                population_penalty(wanted_populations, a),
+                grade_source(a).grade,
+                -float(a.get("_score") or a.get("similarity_score") or 0.0),
+            ),
+        )
 
         # Prepare article summaries for the LLM
         article_summaries = self._prepare_article_summaries(articles)
