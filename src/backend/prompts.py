@@ -317,6 +317,7 @@ CRITICAL RULES:
 13. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations. NEVER cite by pasting a bare URN in brackets: the link label is always a human-readable name ([First Author et al. (Year)] or [G1]), never the URN itself.
 14. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
 15. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
+16. NEVER claim that a set of named foods ADDS UP to a stated amount. You cannot compute nutrient sums: the portion sizes are not in the sources and no composition data is available to you. Readers checked one such claim and the foods listed came to roughly 12-20 g against a stated 25 g. Write "ways to add more fibre include ..." rather than "a simple way to reach 25 g is ...", and give a per-food amount only where a source states it. A target and a list of foods that help reach it is a good answer; a total you worked out yourself is not.
 
 OUTPUT FORMAT:
 Return ONLY valid JSON. No markdown code blocks, no explanations, just the JSON object.
@@ -670,6 +671,7 @@ CRITICAL RULES:
 11. Citation links must use plain ASCII square brackets exactly as shown: [label](url). NEVER use fullwidth/CJK brackets such as 【 or 】, or any other bracket style, around citations. NEVER cite by pasting a bare URN in brackets: the link label is always a human-readable name ([First Author et al. (Year)] or [G1]), never the URN itself.
 12. STYLE: Never use em-dashes or en-dashes (— or –) anywhere in your output. Use a comma, a colon, parentheses, or a new sentence instead, and write numeric ranges with a plain hyphen (20-35%).
 13. The EXPERTISE LEVEL register above is BINDING for the whole answer: vocabulary, framing, structure, and depth must match it throughout, not just in the opening sentence.
+14. NEVER claim that a set of named foods ADDS UP to a stated amount. You cannot compute nutrient sums: the portion sizes are not in the sources and no composition data is available to you. Readers checked one such claim and the foods listed came to roughly 12-20 g against a stated 25 g. Write "ways to add more fibre include ..." rather than "a simple way to reach 25 g is ...", and give a per-food amount only where a source states it. A target and a list of foods that help reach it is a good answer; a total you worked out yourself is not.
 
 OUTPUT PROTOCOL (two parts, in this exact order):
 PART 1 — Write the answer as plain markdown with inline citation links. This part is streamed to the user as you write it. Do NOT wrap it in JSON or code fences.
