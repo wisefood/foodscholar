@@ -211,6 +211,23 @@ class Config:
         # How an integration run waits on its extraction. The timeout is not a
         # kill — the job carries on in its own worker — it is how long this run
         # watches before handing the wait back to a person.
+        # Flood control. The routes are already admin-and-expert only, so this
+        # is not about strangers — it is about a client in a loop, or one
+        # person's credentials being used to spend the platform's Groq budget.
+        # Counted from the database rather than a cache, so an outage cannot
+        # quietly turn the limit off.
+        self.settings["INTEGRATOR_MAX_TURNS_PER_HOUR"] = int(
+            os.getenv("INTEGRATOR_MAX_TURNS_PER_HOUR", 60)
+        )
+        # Concurrent integration runs. Each one holds a thread for as long as
+        # its extraction takes, so the global figure is a ceiling on threads
+        # and not only on spend.
+        self.settings["INTEGRATOR_MAX_RUNS_PER_USER"] = int(
+            os.getenv("INTEGRATOR_MAX_RUNS_PER_USER", 3)
+        )
+        self.settings["INTEGRATOR_MAX_RUNS_TOTAL"] = int(
+            os.getenv("INTEGRATOR_MAX_RUNS_TOTAL", 10)
+        )
         self.settings["INTEGRATOR_POLL_INTERVAL"] = float(
             os.getenv("INTEGRATOR_POLL_INTERVAL", 20)
         )

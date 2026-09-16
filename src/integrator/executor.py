@@ -200,6 +200,11 @@ class Integration:
         self.stage = "preflight"
         if self.proposal.status != "approved":
             raise IntegrationError("this proposal has not been approved")
+        if self.ctx.data_client is None:
+            raise IntegrationError(
+                "this run has no catalog access as you — the session token was "
+                "not forwarded or has expired. Sign in again and retry; nothing "
+                "was written.")
         if self.proposal.kind not in CREATE_TOOL:
             raise IntegrationError(
                 f"nothing is wired to integrate a {self.proposal.kind!r} yet; "

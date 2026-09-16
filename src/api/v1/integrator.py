@@ -11,7 +11,7 @@ with a console session can reach it.
 """
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
 from pydantic import BaseModel, Field
 
 from routers.generic import render
@@ -19,11 +19,25 @@ from routers.generic import render
 router = APIRouter(prefix="/integrator", tags=["Source Integrator"])
 
 
+#: The caller's own bearer, forwarded by the gateway.
+#:
+#: A header rather than a field in the body, for two reasons that both matter
+#: here: bodies are logged and this one is persisted to an audit table, and a
+#: credential that travels as data eventually gets treated as data. FoodScholar
+#: does not verify it — the gateway already did — it only passes it to the
+#: catalog, which verifies it properly and applies this person's roles.
+DELEGATED_TOKEN_HEADER = "X-WiseFood-Delegated-Token"
+
+
+def _token(value: Optional[str]) -> Optional[str]:
+    return (value or "").strip() or None
+
+
 def _service():
     """The integrator service, or a readable 503.
 
     Its tool layer lives in `wisefood_mcp`, which ships with wisefood-client
-    0.0.28 and later. An image built against an older pin would otherwise
+    0.0.29 and later. An image built against an older pin would otherwise
     raise ImportError from inside a route, which reads as a bug in the
     integrator rather than as a missing dependency.
     """
@@ -35,7 +49,7 @@ def _service():
         raise APIException(
             status_code=503,
             detail=(
-                "The Source Integrator needs wisefood-client 0.0.28 or later "
+                "The Source Integrator needs wisefood-client 0.0.29 or later "
                 f"(wisefood_mcp is not importable: {exc})."
             ),
         ) from exc
@@ -115,10 +129,26 @@ async def session_history(session_id: str, user_sub: str):
 
 @router.post("/sessions/{session_id}/chat")
 @render()
-async def chat(session_id: str, body: ChatRequest):
-    """One turn. The model may call tools; every call is recorded."""
-    return _service().chat(session_id=session_id, user_sub=body.user_sub,
-                        message=body.message)
+async def chat(session_id: str, body: ChatRequest,
+               delegated: Optional[str] = Header(None, alias=DELEGATED_TOKEN_HEADER)):
+    """One turn. The model may call tools; every call is recorded.
+
+    The catalog tools run as the caller, using their forwarded token. Without
+    one they are simply absent from the turn — the assistant can still search
+    and read the web, and it never reads the catalog with rights the person
+    asking does not have.
+    """
+    from exceptions import APIException
+
+    service = _service()
+    try:
+        return service.chat(session_id=session_id, user_sub=body.user_sub,
+                            message=body.message, access_token=_token(delegated))
+    except service.RateLimited as exc:
+        # 429 with Retry-After, so a looping client is told to stop rather than
+        # left to read a 500 as something worth retrying immediately.
+        raise APIException(status_code=429, detail=str(exc),
+                           headers={"Retry-After": str(exc.retry_after)}) from exc
 
 
 @router.get("/proposals")
@@ -186,18 +216,27 @@ async def backlog(kind: Optional[str] = None, status: Optional[str] = None,
 
 @router.get("/audit")
 @render()
-async def audit(session_id: Optional[str] = None,
+async def audit(user_sub: str,
+                session_id: Optional[str] = None,
                 proposal_id: Optional[str] = None,
+                is_admin: bool = False,
                 limit: int = Query(default=100, le=500)):
-    """Every tool the agent ran, newest first."""
+    """Every tool the agent ran, newest first — the caller's, unless admin.
+
+    `user_sub` and `is_admin` come from the gateway, which took them from the
+    token. They are required rather than optional so that a caller who is
+    somehow not identified sees nothing instead of everything.
+    """
     service = _service()
     return {"tool_calls": service.tool_calls(session_id=session_id,
-                                             proposal_id=proposal_id, limit=limit)}
+                                             proposal_id=proposal_id, limit=limit,
+                                             user_sub=user_sub, is_admin=is_admin)}
 
 
 @router.post("/proposals/{proposal_id}/integrate")
 @render()
-async def integrate(proposal_id: str, body: IntegrateRequest):
+async def integrate(proposal_id: str, body: IntegrateRequest,
+                    delegated: Optional[str] = Header(None, alias=DELEGATED_TOKEN_HEADER)):
     """Run an approved proposal into the catalog. Returns a run to poll.
 
     Approval and integration are separate on purpose. Approving says a person
@@ -207,13 +246,20 @@ async def integrate(proposal_id: str, body: IntegrateRequest):
     """
     from exceptions import APIException
 
+    service = _service()
     try:
-        return _service().start_integration(
-            proposal_id=proposal_id, user_sub=body.user_sub, dry_run=body.dry_run)
+        return service.start_integration(
+            proposal_id=proposal_id, user_sub=body.user_sub, dry_run=body.dry_run,
+            access_token=_token(delegated))
     except LookupError as exc:
         raise APIException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise APIException(status_code=403, detail=str(exc)) from exc
+    except service.RateLimited as exc:
+        # Before RuntimeError, which it subclasses — the other order would
+        # report every limit as a conflict.
+        raise APIException(status_code=429, detail=str(exc),
+                           headers={"Retry-After": str(exc.retry_after)}) from exc
     except RuntimeError as exc:
         # Already running. A second press should not start a second run.
         raise APIException(status_code=409, detail=str(exc)) from exc

@@ -49,11 +49,20 @@ def _groq_client():
     return Groq(api_key=key)
 
 
-def _data_client():
-    """A catalog client, or None if this deployment has no credentials for one.
+def _data_client(access_token: Optional[str] = None):
+    """A catalog client acting as the caller, or None if one cannot be built.
 
-    None disables the catalog tools rather than failing the turn: research
-    still works, and a curator gets a usable assistant instead of an error.
+    `access_token` is the curator's own bearer, forwarded by the gateway. With
+    it, every catalog read and write the agent performs carries that person's
+    roles and is refused by the catalog wherever they would be refused
+    directly — which is the whole point: an assistant must not be a way to do
+    what the person driving it may not do.
+
+    Without one there is no fallback to the service account. A missing token
+    disables the catalog tools instead, because "act as the curator" quietly
+    becoming "act as the platform" is the failure this is here to prevent, and
+    a failure that makes the assistant *more* capable is the kind nobody
+    reports. Research still works, so the turn is degraded rather than broken.
     """
     try:
         from wisefood.client import Credentials, DataClient
@@ -62,22 +71,23 @@ def _data_client():
         return None
 
     base = config.settings.get("WISEFOOD_API_URL")
-    if not base:
+    if not base or not access_token:
+        if not access_token:
+            logger.info("integrator: no caller token, catalog tools disabled")
         return None
     try:
-        return DataClient(base_url=base, credentials=Credentials(
-            client_id=config.settings.get("WISEFOOD_CLIENT_ID"),
-            client_secret=config.settings.get("WISEFOOD_CLIENT_SECRET"),
-        ))
+        return DataClient(base_url=base,
+                          credentials=Credentials(access_token=access_token))
     except Exception:  # noqa: BLE001
         logger.warning("integrator: catalog client unavailable", exc_info=True)
         return None
 
 
-def tool_context(*, user_sub: str, session_id: Optional[str] = None) -> ToolContext:
+def tool_context(*, user_sub: str, session_id: Optional[str] = None,
+                 access_token: Optional[str] = None) -> ToolContext:
     """The context every tool runs under, for this caller and this session."""
     return ToolContext(
-        data_client=_data_client(),
+        data_client=_data_client(access_token),
         groq_client=_groq_client(),
         proposal_store=_STORE,
         writes_enabled=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),
@@ -145,10 +155,47 @@ def history(*, session_id: str, user_sub: str) -> List[Dict[str, Any]]:
         ]
 
 
-def chat(*, session_id: str, user_sub: str, message: str) -> Dict[str, Any]:
+class RateLimited(RuntimeError):
+    """Too much, too fast. Carries how long to wait, so a client can say so."""
+
+    def __init__(self, message: str, retry_after: int = 60):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _turns_last_hour(db, user_sub: str) -> int:
+    """How many questions this person has asked in the last hour.
+
+    Counted from the messages already being written, so there is no separate
+    counter to drift, and no cache whose outage silently lifts the limit. The
+    join is by session owner rather than by message, because a message row
+    does not carry a subject — the session it belongs to does.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    return (db.query(IntegratorMessage)
+              .join(IntegratorSession, IntegratorSession.id == IntegratorMessage.session_id)
+              .filter(IntegratorSession.user_sub == user_sub,
+                      IntegratorMessage.role == "user",
+                      IntegratorMessage.created_at >= since)
+              .count())
+
+
+def chat(*, session_id: str, user_sub: str, message: str,
+         access_token: Optional[str] = None) -> Dict[str, Any]:
     """One turn: persist the question, run the loop, persist what it produced."""
     with _session_factory() as db:
         _owned_session(db, session_id, user_sub)
+        ceiling = int(config.settings.get("INTEGRATOR_MAX_TURNS_PER_HOUR", 60))
+        # Checked before the model is called, because the cost of a turn is
+        # incurred there and refusing afterwards would be an apology rather
+        # than a limit.
+        if _turns_last_hour(db, user_sub) >= ceiling:
+            raise RateLimited(
+                f"that is {ceiling} questions in an hour, which is this "
+                f"deployment's limit. It will clear as the hour rolls forward.",
+                retry_after=300)
         rows = (
             db.query(IntegratorMessage)
             .filter(IntegratorMessage.session_id == session_id)
@@ -168,7 +215,8 @@ def chat(*, session_id: str, user_sub: str, message: str) -> Dict[str, Any]:
                    question=message, model=model) as trace:
         agent = IntegratorAgent(
             registry=_REGISTRY,
-            tool_context=tool_context(user_sub=user_sub, session_id=session_id),
+            tool_context=tool_context(user_sub=user_sub, session_id=session_id,
+                                      access_token=access_token),
             groq_client=_groq_client(),
             allow_writes=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),
             trace=trace,
@@ -294,10 +342,26 @@ def rerank(*, order: List[str], user_sub: str) -> List[Dict[str, Any]]:
 
 
 def tool_calls(*, session_id: Optional[str] = None, proposal_id: Optional[str] = None,
-               limit: int = 100) -> List[Dict[str, Any]]:
-    """The audit trail — what the agent actually did."""
+               limit: int = 100, user_sub: Optional[str] = None,
+               is_admin: bool = False) -> List[Dict[str, Any]]:
+    """The audit trail — what the agent actually did.
+
+    Scoped to the caller unless they are an admin. A tool call carries its
+    arguments, which for this agent means the queries a curator typed and the
+    URLs they were chasing; that is their work, not the room's. Admins see
+    everything because an audit trail nobody can read in full is not one.
+
+    The proposal queue itself stays shared — curators rank each other's
+    candidates, which is the point of it — so this is the narrower rule for
+    the narrower thing.
+    """
     with _session_factory() as db:
         q = db.query(IntegratorToolCall)
+        if not is_admin and user_sub:
+            owned = [row.id for row in
+                     db.query(IntegratorSession.id)
+                       .filter(IntegratorSession.user_sub == user_sub).all()]
+            q = q.filter(IntegratorToolCall.session_id.in_(owned or [""]))
         if session_id:
             q = q.filter(IntegratorToolCall.session_id == session_id)
         if proposal_id:
@@ -487,8 +551,47 @@ def _active_run(db, proposal_id: str):
     return None
 
 
+def _live_runs(db, user_sub: Optional[str] = None) -> int:
+    """Runs genuinely in flight, ignoring ones whose pod died.
+
+    Without discounting stalled runs the ceiling would be a one-way ratchet: a
+    node failure would permanently consume capacity that nothing is using.
+    """
+    from datetime import datetime, timezone
+
+    from models.db import IntegrationRun
+
+    q = db.query(IntegrationRun).filter(
+        IntegrationRun.status.in_(("queued", "running")))
+    if user_sub:
+        q = q.filter(IntegrationRun.started_by == user_sub)
+    now = datetime.now(timezone.utc)
+    return sum(1 for row in q.all() if _run_dict(row, now=now)["status"] != "stalled")
+
+
+def _check_run_capacity(db, user_sub: str) -> None:
+    """Two ceilings: one per person, one for the deployment.
+
+    Each run holds a thread for as long as its extraction takes — minutes,
+    sometimes an hour — so this bounds threads as much as it bounds spend.
+    Without it, approving forty proposals and pressing integrate on each would
+    put forty polling threads in one pod.
+    """
+    per_user = int(config.settings.get("INTEGRATOR_MAX_RUNS_PER_USER", 3))
+    total = int(config.settings.get("INTEGRATOR_MAX_RUNS_TOTAL", 10))
+    if _live_runs(db, user_sub) >= per_user:
+        raise RateLimited(
+            f"you already have {per_user} integrations running. Wait for one to "
+            f"finish — they resume where they left off if anything goes wrong.")
+    if _live_runs(db) >= total:
+        raise RateLimited(
+            f"the platform is already running {total} integrations, which is its "
+            f"limit. Yours will start once one of them finishes.")
+
+
 def start_integration(*, proposal_id: str, user_sub: str,
-                      dry_run: bool = False) -> Dict[str, Any]:
+                      dry_run: bool = False,
+                      access_token: Optional[str] = None) -> Dict[str, Any]:
     """Begin integrating an approved proposal. Returns the run immediately.
 
     The work happens on a thread because it waits on an extraction that takes
@@ -516,6 +619,7 @@ def start_integration(*, proposal_id: str, user_sub: str,
     with _session_factory() as db:
         if _active_run(db, proposal_id) is not None:
             raise RuntimeError("an integration is already running for this proposal")
+        _check_run_capacity(db, user_sub)
         row = IntegrationRun(
             id=new_run_id(), proposal_id=proposal_id, session_id=proposal.session_id,
             status="queued", stage="queued", steps=[], result={},
@@ -531,7 +635,8 @@ def start_integration(*, proposal_id: str, user_sub: str,
     except RuntimeError:
         loop = None
 
-    ctx = tool_context(user_sub=user_sub, session_id=proposal.session_id)
+    ctx = tool_context(user_sub=user_sub, session_id=proposal.session_id,
+                       access_token=access_token)
     ctx.core_post, ctx.core_get = _core_transport(loop)
 
     def persist(snapshot: Dict[str, Any]) -> None:

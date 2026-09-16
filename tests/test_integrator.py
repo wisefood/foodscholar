@@ -722,3 +722,189 @@ def test_the_core_transport_sends_the_field_the_route_declares(monkeypatch):
     assert out["total_created"] == 3
 
     assert get("/api/v1/guidelines/extract/abc")["status"] == "queued"
+
+
+# --------------------------------------------- the agent acts as its caller --
+
+class TestTheAgentHasNoMoreRightsThanTheCaller:
+    """An assistant must not be a way to do what the person driving it may not.
+
+    The catalog is the authority on that, so the only faithful way to honour it
+    is to reach the catalog as them — and, crucially, to have no fallback when
+    we cannot.
+    """
+
+    def test_no_caller_token_means_no_catalog_at_all(self, monkeypatch):
+        """The failure that matters is the one that makes the agent *more*
+        capable, because nobody reports it."""
+        from integrator import service
+
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL", "https://api.example")
+        monkeypatch.setitem(service.config.settings, "GROQ_API_KEY", "gsk_test")
+        assert service._data_client(None) is None
+        assert service.tool_context(user_sub="curator-1").data_client is None
+
+    def test_the_client_is_built_with_the_callers_token(self, monkeypatch):
+        from integrator import service
+
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, base_url, credentials):
+                seen["base"] = base_url
+                seen["credentials"] = credentials
+
+        import wisefood.client as wc
+        monkeypatch.setattr(wc, "DataClient", FakeClient)
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL", "https://api.example")
+
+        service._data_client("caller-token-abc")
+        assert seen["credentials"].access_token == "caller-token-abc"
+        assert seen["credentials"].is_delegated is True
+        # Not the service account, under any circumstances.
+        assert seen["credentials"].client_id is None
+        assert seen["credentials"].client_secret is None
+
+    def test_a_run_without_delegation_writes_nothing_and_says_why(
+            self, store, proposal, monkeypatch):
+        from wisefood_mcp import ToolContext
+        from wisefood_mcp.stores import approve
+        from integrator.executor import Integration
+        from wisefood_mcp import build_registry
+
+        approve(store, proposal.id, actor="curator-1",
+                override_reason="national agency, licence being confirmed")
+        row = store.get(proposal.id)
+        ctx = ToolContext(proposal_store=store, writes_enabled=True, data_client=None)
+        outcome = Integration(proposal=row, registry=build_registry(), ctx=ctx,
+                              persist=lambda _s: None, poll_interval=0,
+                              sleep=lambda _s: None).run()
+        assert outcome["status"] == "failed"
+        assert "token" in outcome["error"]
+        assert outcome["wrote_anything"] is False
+
+
+# ------------------------------------------------------------ flood control --
+
+class TestNobodyCanFloodUs:
+    """The routes are already admin-and-expert only, so this is not about
+    strangers. It is about a client in a loop, or one person's credentials
+    being used to spend the platform's budget."""
+
+    def test_an_hour_of_questions_is_capped(self, monkeypatch):
+        from config import config
+        from integrator import service
+
+        user = f"curator-{uuid.uuid4().hex[:8]}"
+        session = service.create_session(user_sub=user, title="t")
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_TURNS_PER_HOUR", 2)
+
+        with service._session_factory() as db:
+            from models.db import IntegratorMessage
+            for seq in range(2):
+                db.add(IntegratorMessage(session_id=session["id"], seq=seq,
+                                         role="user", content="q"))
+            db.commit()
+
+        with pytest.raises(service.RateLimited) as exc:
+            service.chat(session_id=session["id"], user_sub=user, message="one more")
+        assert exc.value.retry_after > 0
+
+    def test_the_cap_is_per_person_not_shared(self, monkeypatch):
+        """One busy curator must not lock everyone else out."""
+        from config import config
+        from integrator import service
+        from models.db import IntegratorMessage
+
+        busy = f"curator-{uuid.uuid4().hex[:8]}"
+        other = f"curator-{uuid.uuid4().hex[:8]}"
+        busy_session = service.create_session(user_sub=busy, title="t")
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_TURNS_PER_HOUR", 2)
+        with service._session_factory() as db:
+            for seq in range(5):
+                db.add(IntegratorMessage(session_id=busy_session["id"], seq=seq,
+                                         role="user", content="q"))
+            db.commit()
+            assert service._turns_last_hour(db, busy) >= 5
+            assert service._turns_last_hour(db, other) == 0
+
+    def test_concurrent_runs_are_bounded_per_person_and_overall(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        from config import config
+        from integrator import service
+        from models.db import IntegrationRun
+
+        user = f"curator-{uuid.uuid4().hex[:8]}"
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_RUNS_PER_USER", 1)
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_RUNS_TOTAL", 999)
+        with service._session_factory() as db:
+            db.add(IntegrationRun(
+                id=uuid.uuid4().hex[:16], proposal_id=uuid.uuid4().hex[:12],
+                status="running", steps=[], result={}, started_by=user,
+                heartbeat_at=datetime.now(timezone.utc)))
+            db.commit()
+            with pytest.raises(service.RateLimited, match="already have"):
+                service._check_run_capacity(db, user)
+
+    def test_a_dead_pod_does_not_permanently_consume_capacity(self, monkeypatch):
+        """Otherwise the ceiling is a one-way ratchet and a node failure
+        eventually stops all integration."""
+        from datetime import datetime, timedelta, timezone
+
+        from config import config
+        from integrator import service
+        from models.db import IntegrationRun
+
+        user = f"curator-{uuid.uuid4().hex[:8]}"
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_RUNS_PER_USER", 1)
+        # Pinned, or this asserts about the per-user ceiling while the shared
+        # test database quietly trips the global one on rows other tests left.
+        monkeypatch.setitem(config.settings, "INTEGRATOR_MAX_RUNS_TOTAL", 999)
+        with service._session_factory() as db:
+            db.add(IntegrationRun(
+                id=uuid.uuid4().hex[:16], proposal_id=uuid.uuid4().hex[:12],
+                status="running", steps=[], result={}, started_by=user,
+                heartbeat_at=datetime.now(timezone.utc)
+                - timedelta(seconds=service.STALL_AFTER_SECONDS + 60)))
+            db.commit()
+            service._check_run_capacity(db, user)  # does not raise
+
+
+# ------------------------------------------------------- one curator's work --
+
+class TestTheAuditTrailIsNotTheRoomsToRead:
+    def test_an_expert_sees_their_own_tool_calls_only(self):
+        from integrator import service
+        from integrator.store import record_tool_call
+
+        mine = f"curator-{uuid.uuid4().hex[:8]}"
+        theirs = f"curator-{uuid.uuid4().hex[:8]}"
+        my_session = service.create_session(user_sub=mine, title="mine")
+        their_session = service.create_session(user_sub=theirs, title="theirs")
+        record_tool_call({"tool": "research", "ok": True, "actor": mine,
+                          "arguments": {"query": "what I was chasing"}},
+                         session_id=my_session["id"])
+        record_tool_call({"tool": "research", "ok": True, "actor": theirs,
+                          "arguments": {"query": "what they were chasing"}},
+                         session_id=their_session["id"])
+
+        seen = service.tool_calls(user_sub=mine, is_admin=False, limit=500)
+        queries = [(c["arguments"] or {}).get("query") for c in seen]
+        assert "what I was chasing" in queries
+        assert "what they were chasing" not in queries
+
+        everything = service.tool_calls(user_sub=mine, is_admin=True, limit=500)
+        all_queries = [(c["arguments"] or {}).get("query") for c in everything]
+        assert "what they were chasing" in all_queries
+
+    def test_an_unidentified_caller_sees_nothing_rather_than_everything(self):
+        from integrator import service
+        from integrator.store import record_tool_call
+
+        who = f"curator-{uuid.uuid4().hex[:8]}"
+        session = service.create_session(user_sub=who, title="s")
+        record_tool_call({"tool": "research", "ok": True, "actor": who,
+                          "arguments": {"query": "private"}},
+                         session_id=session["id"])
+        assert service.tool_calls(user_sub="nobody", is_admin=False, limit=500) == []
