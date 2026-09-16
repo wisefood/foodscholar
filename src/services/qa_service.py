@@ -365,7 +365,7 @@ class QAService:
         return response
 
     def get_tips_of_the_day(
-        self, member_id: Optional[str] = None
+        self, member_id: Optional[str] = None, language: str = "en"
     ) -> TipsOfTheDayResponse:
         """Return 2 tips + 2 did-you-know facts with strict Redis caching.
 
@@ -377,14 +377,19 @@ class QAService:
         """
         tips_count = TIPS_OF_THE_DAY_TIPS_COUNT
         did_you_know_count = TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT
+        language = (language or "en").strip().lower() or "en"
         member_context = self._tip_member_context(member_id)
         cache_data = {
             "type": "tips_of_the_day",
-            # v6: evidence urns switched from guide_urn to the guideline's own
-            # id (page-level deep links) — invalidates v5 payloads.
-            "version": 6,
+            # v7: items are generated in `language`, so a v6 entry holds
+            # English text under a key that no longer implies English.
+            "version": 7,
             "tips_count": tips_count,
             "did_you_know_count": did_you_know_count,
+            # Part of the key, not just the prompt: the cache is shared across
+            # every reader, and a 30-minute entry generated for one locale
+            # would otherwise be served to all the others.
+            "language": language,
         }
         if member_context:
             # Personalized entries are cached per topic/avoid fingerprint —
@@ -437,6 +442,7 @@ class QAService:
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
             member_context=member_context,
+            language=language,
         )
         generated_payload = self._normalize_tips_payload(
             generated_payload,
@@ -1985,6 +1991,7 @@ class QAService:
         tips_count: int = TIPS_OF_THE_DAY_TIPS_COUNT,
         did_you_know_count: int = TIPS_OF_THE_DAY_DID_YOU_KNOW_COUNT,
         member_context: Optional[Dict[str, List[str]]] = None,
+        language: str = "en",
     ) -> Dict[str, Any]:
         """Generate grounded tips/facts with validation and regeneration."""
         for attempt in range(1, MAX_TIP_REGEN_ATTEMPTS + 1):
@@ -1994,6 +2001,7 @@ class QAService:
                     did_you_know_count=did_you_know_count,
                     seed_offset=attempt,
                     member_context=member_context,
+                    language=language,
                 )
                 # During generation attempts, don't auto-fill missing items with
                 # fallbacks; allow regeneration to kick in.
@@ -2052,6 +2060,7 @@ class QAService:
         *,
         seed_offset: int = 0,
         member_context: Optional[Dict[str, List[str]]] = None,
+        language: str = "en",
     ) -> Dict[str, Any]:
         """Single generation pass for tips/facts."""
         total_count = tips_count + did_you_know_count
@@ -2078,6 +2087,7 @@ class QAService:
         candidates = self._generate_tip_candidates_from_guidelines(
             guidelines=source_guidelines,
             candidate_count=candidate_count,
+            language=language,
         )
         if member_topics and len(candidates) < total_count:
             # Lexical guideline matching runs dry on niche profile topics
@@ -2094,6 +2104,7 @@ class QAService:
                     self._generate_tip_candidates_from_articles(
                         articles=semantic_articles,
                         candidate_count=candidate_count - len(candidates),
+                        language=language,
                     )
                 )
         if not candidates:
@@ -2109,6 +2120,7 @@ class QAService:
             candidates = self._generate_tip_candidates_from_articles(
                 articles=source_articles,
                 candidate_count=candidate_count,
+                language=language,
             )
 
         if avoid_terms:
@@ -2286,14 +2298,19 @@ class QAService:
         }
 
     def _generate_tip_candidates_from_guidelines(
-        self, *, guidelines: List[Dict[str, Any]], candidate_count: int
+        self, *, guidelines: List[Dict[str, Any]], candidate_count: int,
+        language: str = "en"
     ) -> List[Dict[str, Any]]:
         """Generate tip/fact candidates grounded in dietary guideline rule_text."""
         if not guidelines:
             return []
 
         guideline_context = self._prepare_tip_guideline_context(guidelines)
-        prompt = QA_TIPS_FROM_GUIDELINES.compile(candidate_count=candidate_count, guideline_context=guideline_context)
+        prompt = QA_TIPS_FROM_GUIDELINES.compile(
+            candidate_count=candidate_count,
+            guideline_context=guideline_context,
+            language=language,
+        )
         items: List[Any] = []
         try:
             response = self.simple_question_llm.invoke(
@@ -2717,14 +2734,19 @@ class QAService:
         )
 
     def _generate_tip_candidates_from_articles(
-        self, *, articles: List[Dict[str, Any]], candidate_count: int
+        self, *, articles: List[Dict[str, Any]], candidate_count: int,
+        language: str = "en"
     ) -> List[Dict[str, Any]]:
         """Generate tip/fact candidates grounded in a randomized article pool."""
         if not articles:
             return []
 
         article_context = self._prepare_tip_article_context(articles)
-        prompt = QA_TIPS_FROM_ARTICLES.compile(candidate_count=candidate_count, article_context=article_context)
+        prompt = QA_TIPS_FROM_ARTICLES.compile(
+            candidate_count=candidate_count,
+            article_context=article_context,
+            language=language,
+        )
         response = self.simple_question_llm.invoke(
             prompt,
             config=build_trace_config(

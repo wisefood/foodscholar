@@ -753,6 +753,10 @@ Rules:
 
 _QA_TIPS_FROM_GUIDELINES_FALLBACK = """You create safe daily nutrition content for a general audience.
 
+LANGUAGE: Write every item's text in {{language}}. Do not leave any item, or any
+word within an item, in English when {{language}} is not English (proper nouns and
+established scientific Latin terms with no common {{language}} equivalent may remain).
+
 Using ONLY the dietary guideline rules below, generate exactly {{candidate_count}} items with a mix of:
 - practical nutrition tips
 - "Did you know?" nutrition facts
@@ -780,6 +784,10 @@ Dietary guideline rules:
 """
 
 _QA_TIPS_FROM_ARTICLES_FALLBACK = """You create safe daily nutrition content for a general audience.
+
+LANGUAGE: Write every item's text in {{language}}. Do not leave any item, or any
+word within an item, in English when {{language}} is not English (proper nouns and
+established scientific Latin terms with no common {{language}} equivalent may remain).
 
 Using ONLY the evidence in the article abstracts below, generate exactly {{candidate_count}} items with a mix of:
 - practical nutrition tips

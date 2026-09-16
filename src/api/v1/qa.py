@@ -393,10 +393,16 @@ async def get_tips_of_the_day(
             "and never mention their allergens/dislikes; otherwise generic."
         ),
     ),
+    language: str = Query(
+        default="en",
+        description="Language for the tips (ISO 639-1 code, e.g. 'en', 'hu', 'sl').",
+    ),
 ):
     """Get 2 did_you_know facts and 2 tips, cached for 30 minutes."""
     try:
-        return qa_service.get_tips_of_the_day(member_id=member_id)
+        return qa_service.get_tips_of_the_day(
+            member_id=member_id, language=language
+        )
     except Exception as e:
         logger.error("Error getting nutrition tips of the day: %s", e, exc_info=True)
         raise InternalError(
