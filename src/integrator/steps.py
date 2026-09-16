@@ -37,6 +37,7 @@ RUNNING: Dict[str, tuple] = {
     "create_guide": ("write", "Creating a guide"),
     "create_article": ("write", "Creating an article"),
     "create_textbook": ("write", "Creating a textbook"),
+    "create_fctable": ("write", "Registering the composition table"),
     "upload_artifact": ("write", "Attaching the file"),
     "enqueue_guideline_extraction": ("write", "Queuing the extraction"),
     "guideline_extraction_status": ("read", "Checking on the extraction"),
@@ -64,7 +65,8 @@ def running_title(tool: str, args: Dict[str, Any]) -> tuple:
         bits = [str(args.get(k)) for k in ("q", "country", "population_group", "language")
                 if args.get(k)]
         detail = " · ".join(bits)[:200] or None
-    elif tool in ("create_guide", "create_article", "create_textbook"):
+    elif tool in ("create_guide", "create_article", "create_textbook",
+                  "create_fctable"):
         detail = str((args.get("spec") or {}).get("title") or "")[:200] or None
     elif tool == "upload_artifact":
         detail = str(args.get("title") or args.get("parent_urn") or "")[:200] or None

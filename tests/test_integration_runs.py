@@ -729,3 +729,23 @@ def test_an_unreadable_table_fails_before_anything_is_created(registry, store, f
     assert outcome["status"] == "failed"
     assert client.fctables.created == [], "the profile runs before the write"
     assert outcome["wrote_anything"] is False
+
+
+def test_every_tool_says_what_it_is_doing_in_words(registry):
+    """The narration is the feature, so a tool missing from it is a bug.
+
+    `create_fctable` shipped without an entry and rendered as "Running
+    create_fctable" — the raw function name, which is exactly what a curator
+    is not supposed to have to read. Nothing catches that except this.
+    """
+    from integrator.steps import RUNNING, running_title
+
+    tools = [t["function"]["name"]
+             for t in registry.openai_schemas(include_writes=True)]
+    missing = sorted(set(tools) - set(RUNNING))
+    assert not missing, f"no words for: {missing}"
+
+    for tool in tools:
+        _kind, title, _detail = running_title(tool, {})
+        assert not title.startswith("Running "), f"{tool} fell back to its own name"
+        assert tool not in title, f"{tool} shows its function name to a curator"
