@@ -529,3 +529,203 @@ def test_the_spec_needs_no_crossref_record_to_work(store):
     assert spec["title"] == "A paper"
     assert spec["doi"] == "10.1/x"
     assert spec["url"] == "https://ncpha.bg/fbdg.pdf"
+
+
+# -------------------------------------------------------------- textbooks --
+
+class FakeBoundPassages:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def bulk_replace(self, **kw):
+        self.parent.replaced.append(kw)
+        return {"total": len(kw.get("passages") or [])}
+
+
+class FakePassagesProxy:
+    def __init__(self):
+        self.replaced = []
+
+    def by_textbook(self, urn):
+        self.replaced_urn = urn
+        return FakeBoundPassages(self)
+
+
+@pytest.fixture
+def textbook_pdf(fetched_file):
+    """A real PDF behind the pending handle, since the tool actually reads it."""
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    for section in ("Chapter 1 Energy", "Chapter 2 Protein"):
+        page = doc.new_page()
+        page.insert_text((60, 60), section, fontsize=22)
+        y = 100
+        for _ in range(12):
+            page.insert_text((60, y), "Dietary energy needs vary with age and "
+                                      "activity across populations studied.",
+                             fontsize=11)
+            y += 15
+    doc.save(str(fetched_file / f"{HANDLE}.pdf"))
+    doc.close()
+    return fetched_file
+
+
+def make_textbook(store, **kw):
+    return make_proposal(store, kind="textbook",
+                         title="Human Nutrition, 6th edition", **kw)
+
+
+def test_a_textbook_is_read_into_passages(registry, store, textbook_pdf):
+    proposal = make_textbook(store)
+    client = FakeDataClient(urn="urn:wf:textbook:1")
+    client.textbook_passages = FakePassagesProxy()
+    ctx, core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    assert outcome["result"]["urn"] == "urn:wf:textbook:1"
+    assert outcome["result"]["passages"] > 0
+    assert outcome["result"]["page_count"] == 2
+    # No queue and no core API: chunking needs no model, so it runs inline.
+    assert core.posts == []
+
+
+def test_the_passages_carry_their_provenance(registry, store, textbook_pdf):
+    proposal = make_textbook(store)
+    client = FakeDataClient(urn="urn:wf:textbook:1")
+    client.textbook_passages = FakePassagesProxy()
+    ctx, _core = make_context(store, data_client=client)
+    run_integration(proposal, registry, ctx)
+
+    call = client.textbook_passages.replaced[0]
+    assert call["artifact_id"] == "art-1"
+    assert call["extractor_name"] == "wisefood-mcp/passages"
+    assert call["extractor_run_id"] == proposal.id
+    assert call["page_count"] == 2
+    assert all(p["structure_path"] for p in call["passages"])
+
+
+def test_a_textbook_with_no_fetched_file_fails_before_creating_it(registry, store):
+    proposal = make_textbook(store, metadata={})
+    client = FakeDataClient(urn="urn:wf:textbook:1")
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "failed"
+    assert "fetch_url" in outcome["error"]
+    assert client.textbooks.created == []
+
+
+def test_a_scanned_textbook_fails_with_a_reason_a_person_can_act_on(
+        registry, store, fetched_file):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(str(fetched_file / f"{HANDLE}.pdf"))
+    doc.close()
+
+    proposal = make_textbook(store)
+    client = FakeDataClient(urn="urn:wf:textbook:1")
+    client.textbook_passages = FakePassagesProxy()
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "failed"
+    assert "OCR" in outcome["error"] or "scanned" in outcome["error"]
+    # The textbook record itself is real and stays; only its content is missing.
+    assert outcome["result"]["urn"] == "urn:wf:textbook:1"
+    assert outcome["wrote_anything"] is True
+
+
+def test_a_restrictive_licence_registers_the_textbook_without_its_text(
+        registry, store, textbook_pdf):
+    proposal = make_textbook(store, licence="proprietary")
+    client = FakeDataClient(urn="urn:wf:textbook:1")
+    client.textbook_passages = FakePassagesProxy()
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded"
+    assert client.textbooks.created, "the reference is still worth having"
+    assert client.artifacts.uploads == []
+    assert client.textbook_passages.replaced == [], "no copying the book in"
+
+
+# ------------------------------------------------- food composition tables --
+
+@pytest.fixture
+def table_file(fetched_file):
+    """A real spreadsheet behind the handle — the profiler actually reads it."""
+    pandas = pytest.importorskip("pandas")
+    pandas.DataFrame({
+        "Food code": [str(i) for i in range(50)],
+        "Food name": [f"Food {i}" for i in range(50)],
+        "Energy (kcal) per 100g": [100 + i for i in range(50)],
+        "Protein (g)": [1.0 * i for i in range(50)],
+        "Saturated fat (g)": [0.5 * i for i in range(50)],
+        "Vitamin C (mg)": [None] * 25 + [1.0] * 25,
+    }).to_csv(fetched_file / f"{HANDLE}.csv", index=False)
+    (fetched_file / f"{HANDLE}.pdf").unlink(missing_ok=True)
+    return fetched_file
+
+
+def test_a_composition_table_is_profiled_into_its_metadata(registry, store, table_file):
+    """`FCTable` is a metadata entity with no row store behind it, so what the
+    file yields is a description of itself."""
+    proposal = make_proposal(store, kind="fctable", title="National FCT 2023")
+    client = FakeDataClient(urn="urn:wf:fctable:1")
+    client.fctables = FakeProxy("urn:wf:fctable:1")
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    created = client.fctables.created[0]
+    assert created["number_of_entries"] == 50
+    assert "energy" in created["nutrient_coverage"]
+    assert "saturated fat" in created["nutrient_coverage"]
+    assert "vitamin C" in created["nutrient_coverage"]
+    assert created["completeness_percent"] < 100, "half the vitamin C is missing"
+    assert "kcal" in created["measurement_units"]
+
+
+def test_the_profile_is_measured_before_the_entity_is_written(registry, store, table_file):
+    """Otherwise the catalog gets a record everyone can see and then a
+    correction."""
+    proposal = make_proposal(store, kind="fctable", title="National FCT 2023")
+    client = FakeDataClient(urn="urn:wf:fctable:1")
+    client.fctables = FakeProxy("urn:wf:fctable:1")
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    # One create, carrying the numbers already.
+    assert len(client.fctables.created) == 1
+    assert client.fctables.created[0]["number_of_entries"] == 50
+    assert outcome["result"]["profile"]["number_of_entries"] == 50
+
+
+def test_a_table_with_no_file_is_still_registered(registry, store):
+    """A table we may only point at still deserves its entry."""
+    proposal = make_proposal(store, kind="fctable", title="National FCT 2023",
+                             metadata={})
+    client = FakeDataClient(urn="urn:wf:fctable:1")
+    client.fctables = FakeProxy("urn:wf:fctable:1")
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    assert client.fctables.created
+    assert "number_of_entries" not in client.fctables.created[0]
+
+
+def test_an_unreadable_table_fails_before_anything_is_created(registry, store, fetched_file):
+    (fetched_file / f"{HANDLE}.pdf").unlink(missing_ok=True)
+    (fetched_file / f"{HANDLE}.csv").write_text("\x00\x01 not a table at all")
+    proposal = make_proposal(store, kind="fctable", title="Broken")
+    client = FakeDataClient(urn="urn:wf:fctable:1")
+    client.fctables = FakeProxy("urn:wf:fctable:1")
+    ctx, _core = make_context(store, data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "failed"
+    assert client.fctables.created == [], "the profile runs before the write"
+    assert outcome["wrote_anything"] is False

@@ -41,6 +41,8 @@ RUNNING: Dict[str, tuple] = {
     "enqueue_guideline_extraction": ("write", "Queuing the extraction"),
     "guideline_extraction_status": ("read", "Checking on the extraction"),
     "import_guidelines": ("write", "Importing the guidelines"),
+    "extract_textbook_passages": ("write", "Reading the textbook into passages"),
+    "profile_fctable": ("read", "Reading the composition table"),
     "enqueue_article_enrichment": ("write", "Queuing the enrichment"),
     "article_enrichment_status": ("read", "Checking on the enrichment"),
 }
@@ -133,6 +135,25 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
         venue = data.get("venue")
         bits = [who, str(year) if year else "", venue or ""]
         return " · ".join(b for b in bits if b)[:300]
+
+    if tool == "profile_fctable":
+        entries = int(data.get("number_of_entries") or 0)
+        nutrients = data.get("nutrient_coverage") or []
+        complete = data.get("completeness_percent")
+        bits = [f"{entries:,} entries", _plural(len(nutrients), "nutrient")]
+        if complete is not None:
+            bits.append(f"{complete}% filled")
+        return " · ".join(bits)
+
+    if tool == "extract_textbook_passages":
+        pages = data.get("page_count")
+        headings = data.get("headings_found")
+        bits = [_plural(int(data.get("passages") or 0), "passage")]
+        if pages:
+            bits.append(f"{_plural(int(pages), 'page')}")
+        if headings:
+            bits.append(f"{_plural(int(headings), 'heading')} found")
+        return " · ".join(bits)
 
     if tool == "enqueue_article_enrichment":
         return f"Queued — {data.get('status') or 'waiting for a worker'}"

@@ -41,10 +41,19 @@ CREATE_TOOL = {
     "guide": "create_guide",
     "article": "create_article",
     "textbook": "create_textbook",
+    "fctable": "create_fctable",
 }
 
 #: Kinds whose artifact goes through the guideline extraction pipeline.
 EXTRACTS = ("guide",)
+
+#: Kinds whose artifact is chunked into retrievable passages instead.
+CHUNKS = ("textbook",)
+
+#: Kinds whose file is *described* rather than ingested. A food composition
+#: table is registered as a reference; the catalog has no row store to put one
+#: in, so what the file yields is metadata about itself.
+PROFILES = ("fctable",)
 
 
 class IntegrationError(RuntimeError):
@@ -124,6 +133,22 @@ def article_spec(proposal) -> Dict[str, Any]:
     if doi:
         spec.setdefault("doi", doi)
     return spec
+
+
+#: What a table profile contributes to an `FCTable`. The rest of what the
+#: profiler returns — the column names it judged from — is evidence for a
+#: curator, not catalog metadata.
+_PROFILE_TO_FCTABLE = (
+    "number_of_entries", "nutrient_coverage", "completeness_percent",
+    "completeness_description", "min_nutrients_per_item",
+    "max_nutrients_per_item", "measurement_units", "reference_portions",
+)
+
+
+def fctable_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """The measured fields, skipping anything the profiler could not tell."""
+    return {key: profile[key] for key in _PROFILE_TO_FCTABLE
+            if profile.get(key) not in (None, "", [], {})}
 
 
 def would_create_count(preview: Dict[str, Any]) -> int:
@@ -208,11 +233,15 @@ class Integration:
     def run(self) -> Dict[str, Any]:
         try:
             self._preflight()
+            if self.proposal.kind in PROFILES:
+                self._profile()
             urn = self._create_entity()
             artifact_uuid = self._attach_file(urn)
             if artifact_uuid and self.proposal.kind in EXTRACTS:
                 self._extract(urn, artifact_uuid)
                 self._import(urn, artifact_uuid)
+            elif artifact_uuid and self.proposal.kind in CHUNKS:
+                self._chunk(urn, artifact_uuid)
             elif self.proposal.kind == "article":
                 self._enrich(urn)
             self.stage = "done"
@@ -237,6 +266,14 @@ class Integration:
             return f"{created} guideline{'' if created == 1 else 's'} imported under {self.result.get('urn')}"
         if self.result.get("enrichment", {}).get("status") == "succeeded":
             return f"{self.result.get('urn')} created and enriched"
+        entries = (self.result.get("profile") or {}).get("number_of_entries")
+        if entries:
+            return (f"{entries:,} entries profiled and registered as "
+                    f"{self.result.get('urn')}")
+        passages = self.result.get("passages")
+        if passages:
+            return (f"{passages} passage{'' if passages == 1 else 's'} from "
+                    f"{self.result.get('page_count')} pages, under {self.result.get('urn')}")
         if self.result.get("artifact_id"):
             return f"{self.result.get('urn')} created, with its file attached"
         return f"{self.result.get('urn')} registered"
@@ -266,10 +303,10 @@ class Integration:
 
         handle = (self.proposal.metadata or {}).get("pending_artifact")
         wants_file = content_permitted(self.proposal)
-        if self.proposal.kind in EXTRACTS and wants_file and not handle:
+        if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file and not handle:
             raise IntegrationError(
-                "no fetched file to extract from — open the source PDF with "
-                "fetch_url first, so its handle is on the proposal")
+                "no fetched file to read — open the source PDF with fetch_url "
+                "first, so its handle is on the proposal")
         if not wants_file:
             self.steps.add(
                 "licence", "Registering a pointer only",
@@ -308,6 +345,8 @@ class Integration:
         tool = CREATE_TOOL[self.proposal.kind]
         spec = (article_spec if self.proposal.kind == "article" else guide_spec)(
             self.proposal)
+        if self.proposal.kind in PROFILES and getattr(self, "_profiled", None):
+            spec.update(fctable_fields(self._profiled))
         created = self._call(tool, {"proposal_id": self.proposal.id, "spec": spec},
                              stage="create")
         urn = (created or {}).get("urn")
@@ -394,6 +433,46 @@ class Integration:
                 raise IntegrationError(
                     "the extraction is taking longer than this run waits for. It is "
                     "still going; retry this run to pick it up when it finishes.")
+
+    def _profile(self) -> None:
+        """Describe the table before the entity is created, not after.
+
+        The profile *is* most of an FCT's metadata — entries, nutrient
+        coverage, completeness — so creating the entity first would mean
+        writing a record everyone can see and then correcting it.
+        """
+        handle = (self.proposal.metadata or {}).get("pending_artifact")
+        if not handle:
+            # Not fatal. A table we may only point at still deserves its entry,
+            # and a curator can fill the counts by hand as they do today.
+            self.steps.add("catalog", "No table file to read",
+                           outcome="registering what the proposal already knows")
+            return
+        profile = self._call("profile_fctable", {
+            "proposal_id": self.proposal.id, "pending_artifact": handle,
+        }, stage="profile") or {}
+        self.result["profile"] = {
+            k: profile.get(k) for k in
+            ("number_of_entries", "nutrient_coverage", "completeness_percent")
+        }
+        self._profiled = profile
+        self._save()
+
+    def _chunk(self, urn: str, artifact_uuid: str) -> None:
+        """Read the textbook into passages. Inline, because it is fast.
+
+        No model, so no queue: a guide's rules must be understood to be
+        extracted, whereas a passage is a span of the book with enough context
+        to be retrieved. Seconds rather than minutes, and the run simply waits.
+        """
+        result = self._call("extract_textbook_passages", {
+            "proposal_id": self.proposal.id, "textbook_urn": urn,
+            "artifact_uuid": artifact_uuid,
+        }, stage="chunk") or {}
+        self.result["passages"] = result.get("passages")
+        self.result["page_count"] = result.get("page_count")
+        self.result["headings_found"] = result.get("headings_found")
+        self._save()
 
     def _enrich(self, urn: str) -> None:
         """Queue the article's enrichment and wait on it.
