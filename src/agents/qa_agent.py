@@ -282,7 +282,11 @@ def prepare_source_context(
             target_populations = join_field_values(
                 article.get("target_populations")
             )
-            g_label = f"G{g_counter}"
+            # The label the model is told to cite with. Taken from the rule's
+            # catalogue sequence so the citation matches what the reader finds
+            # on the guide page; the running counter only covers rules indexed
+            # before sequence_no was recorded.
+            g_label = guideline_citation_label(article) or f"G{g_counter}"
             g_counter += 1
             summary = f"""Guideline {idx} [{g_label}]:
 - Source Type: guideline
@@ -467,10 +471,29 @@ def format_answer_context(
     return "\n".join(parts)
 
 
+def guideline_citation_label(source: Dict[str, Any]) -> Optional[str]:
+    """A guideline's label, taken from its number in the catalogue.
+
+    `sequence_no` is how the catalogue orders the rules inside a guide, so it
+    is the number a reader sees when they open the guide and go looking for
+    what was cited. Numbering by position in the answer instead — G1, G2, G3
+    in the order the model happened to mention them — gives the same rule a
+    different label in every answer and matches nothing on the page it links
+    to.
+
+    Falls back to the position-based label only when the rule carries no
+    sequence, which is the case for guides indexed before it was recorded.
+    """
+    raw = source.get("sequence_no")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return f"G{int(raw)}"
+
+
 def _inline_citation_label(source: Dict[str, Any], g_label: Optional[str]) -> str:
     """The label a well-behaved model would have written for this source."""
     if is_guideline_source(source):
-        return g_label or "Guideline"
+        return guideline_citation_label(source) or g_label or "Guideline"
     authors = source.get("authors") or []
     if isinstance(authors, str):
         authors = [authors]
@@ -496,10 +519,17 @@ def repair_citation_links(
     Observed live: models sometimes cite as ``【urn:article:slug】`` — no
     label, no URL — which renders as raw text and loses every citation
     affordance. Every citable source is known here, so a bracketed source id
-    becomes ``[Author et al. (Year)](/articles/urn)`` (or ``[G1](...)`` for
-    guidelines, numbered in the same order as the prompt context). Proper
-    links never match: inside a URL the id is preceded by ``/``, not a
-    bracket, and a bracketed id already followed by ``(`` is left alone.
+    becomes ``[Author et al. (Year)](/articles/urn)`` (or ``[G12](...)`` for
+    guidelines, numbered by their sequence in the catalogue — see
+    `guideline_citation_label`; the running counter is only a fallback for
+    rules indexed without one). Proper links never match: inside a URL the id
+    is preceded by ``/``, not a bracket, and a bracketed id already followed
+    by ``(`` is left alone.
+
+    A citation is also separated from whatever precedes it. Models emit
+    ``...endpoints[Chooi et al. (2019)](...)`` often enough that readers
+    reported it as "endpointsChooi et al." — the link is correct, it is simply
+    welded to the previous word.
     """
     if not text or not sources:
         return text or ""
@@ -523,7 +553,30 @@ def repair_citation_links(
                 r"[【\[]\s*" + re.escape(source_id) + r"\s*[】\]]?(?!\()"
             )
             text = pattern.sub(f"[{label}]({base}{source_id})", text)
-    return text
+    return separate_citations_from_text(text)
+
+
+#: A citation link opening immediately after a word character or a closing
+#: bracket — "endpoints[Chooi et al.](...)" — with no space between them.
+_WELDED_CITATION = re.compile(r"(?<=[\w\)\]])(?=\[[^\]]{1,80}\]\()")
+
+
+def separate_citations_from_text(text: str) -> str:
+    """Put a space between a citation and the word it is welded to.
+
+    Reported as in-text citations running into the preceding text, e.g.
+    ``endpointsChooi et al.``. The link itself is well formed; only the
+    whitespace is missing, and readers see the label fused to the last word of
+    the sentence.
+
+    Deliberately narrow. It fires only where a ``[label](`` sequence begins
+    directly after a word character or a closing bracket, so markdown that is
+    meant to be adjacent — a footnote after a parenthesis, ``](`` inside an
+    existing link — is left alone, and it never touches the label or the URL.
+    """
+    if not text:
+        return text or ""
+    return _WELDED_CITATION.sub(" ", text)
 
 
 def create_source_citation(

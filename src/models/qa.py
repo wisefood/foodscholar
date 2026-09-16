@@ -523,6 +523,15 @@ class RetrievedSource(BaseModel):
         default=None,
         description="PDF page a guideline rule came from, when known",
     )
+    sequence_no: Optional[int] = Field(
+        default=None,
+        description=(
+            "The rule's own number within its guide, as the catalogue orders "
+            "them. Carried so a citation can be labelled by the number the "
+            "reader will find in the catalogue rather than by its position in "
+            "one answer"
+        ),
+    )
     citation_count: Optional[int] = Field(
         default=None,
         description=(

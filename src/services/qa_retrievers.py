@@ -251,6 +251,12 @@ def normalize_guideline_hit(
     guideline["relevance_score"] = guideline.get("_score", 0.0)
     guideline["publication_year"] = guideline_publication_year(guideline)
 
+    raw_seq = guideline.get("sequence_no")
+    sequence_no = (
+        int(raw_seq)
+        if isinstance(raw_seq, (int, float)) and not isinstance(raw_seq, bool)
+        else None
+    )
     raw_page = guideline.get("page_no")
     page_no = (
         int(raw_page)
@@ -275,6 +281,7 @@ def normalize_guideline_hit(
         similarity_score=score_value(guideline.get("_score")),
         guide_urn=text_value(guideline.get("guide_urn"), default=None),
         page_no=page_no,
+        sequence_no=sequence_no,
     )
     return guideline, retrieved
 

@@ -185,7 +185,14 @@ IMPORTANT: Return ONLY the JSON object."""
         from backend.prompts import QA_TIPS_FROM_GUIDELINES
         candidate_count = 3
         guideline_context = "RULES_HERE"
+        # Tips are generated in the reader's language; the directive is part of
+        # the prompt, so the pinned copy carries it too.
+        language = "Hungarian"
         legacy = f"""You create safe daily nutrition content for a general audience.
+
+LANGUAGE: Write every item's text in {language}. Do not leave any item, or any
+word within an item, in English when {language} is not English (proper nouns and
+established scientific Latin terms with no common {language} equivalent may remain).
 
 Using ONLY the dietary guideline rules below, generate exactly {candidate_count} items with a mix of:
 - practical nutrition tips
@@ -215,7 +222,8 @@ Dietary guideline rules:
         self.assertEqual(
             QA_TIPS_FROM_GUIDELINES.compile(
                 candidate_count=candidate_count,
-                guideline_context=guideline_context),
+                guideline_context=guideline_context,
+                language=language),
             legacy)
 
     def test_qa_tip_rewrite_matches_legacy(self):
