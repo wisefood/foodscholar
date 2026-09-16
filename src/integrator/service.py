@@ -455,6 +455,11 @@ def _core_transport(loop):
 
     job_service = GuidelineJobService()
 
+    def _enrichment_service():
+        from services.enrichment_jobs import EnrichmentJobService
+
+        return EnrichmentJobService()
+
     def _await(coro, timeout: float = 300.0):
         if loop is None:
             return asyncio.run(coro)
@@ -465,6 +470,14 @@ def _core_transport(loop):
 
     def post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         parts = [p for p in path.split("/") if p]
+        if "/enrich/articles/" in path:
+            # The urn contains slashes, so it is whatever follows the segment
+            # rather than the last component.
+            urn = path.split("/enrich/articles/", 1)[1]
+            service = _enrichment_service()
+            service.enqueue(urn, force=bool(body.get("force")),
+                            requested_by=body.get("requested_by"))
+            return _dump(service.get_status(urn))
         # /api/v1/guidelines/<action>/<artifact_uuid>
         action, artifact_uuid = parts[-2], parts[-1]
         if action == "extract":
@@ -481,6 +494,9 @@ def _core_transport(loop):
 
     def get(path: str) -> Dict[str, Any]:
         parts = [p for p in path.split("/") if p]
+        if "/enrich/articles/" in path:
+            urn = path.split("/enrich/articles/", 1)[1]
+            return _dump(_enrichment_service().get_status(urn))
         action, artifact_uuid = parts[-2], parts[-1]
         if action == "extract":
             return _dump(_await(job_service.get_job_response(artifact_uuid)))

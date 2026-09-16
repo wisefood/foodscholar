@@ -29,6 +29,7 @@ RUNNING: Dict[str, tuple] = {
     "research": ("search", "Searching the web"),
     "fetch_url": ("read", "Opening the page"),
     "licence_evidence": ("licence", "Checking the licence"),
+    "doi_metadata": ("read", "Looking up the DOI"),
     "search_catalog": ("catalog", "Searching the catalog"),
     "catalog_coverage": ("catalog", "Checking what we already hold"),
     "get_entity": ("catalog", "Reading a catalog entry"),
@@ -40,6 +41,8 @@ RUNNING: Dict[str, tuple] = {
     "enqueue_guideline_extraction": ("write", "Queuing the extraction"),
     "guideline_extraction_status": ("read", "Checking on the extraction"),
     "import_guidelines": ("write", "Importing the guidelines"),
+    "enqueue_article_enrichment": ("write", "Queuing the enrichment"),
+    "article_enrichment_status": ("read", "Checking on the enrichment"),
 }
 
 
@@ -51,8 +54,10 @@ def running_title(tool: str, args: Dict[str, Any]) -> tuple:
         detail = str(args.get("query") or "")[:200] or None
     elif tool in ("fetch_url",):
         detail = str(args.get("url") or "")[:200] or None
-    elif tool == "licence_evidence":
+    elif tool in ("licence_evidence", "doi_metadata"):
         detail = str(args.get("url") or args.get("doi") or "")[:200] or None
+    elif tool in ("enqueue_article_enrichment", "article_enrichment_status"):
+        detail = str(args.get("article_urn") or "")[:200] or None
     elif tool in ("search_catalog", "catalog_coverage"):
         bits = [str(args.get(k)) for k in ("q", "country", "population_group", "language")
                 if args.get(k)]
@@ -116,6 +121,26 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
 
     if tool == "list_organizations":
         return _plural(int(data.get("count") or 0), "organisation")
+
+    if tool == "doi_metadata":
+        if not data.get("found"):
+            return "Crossref has no record of that DOI"
+        authors = data.get("authors") or []
+        who = authors[0] if authors else "unknown author"
+        if len(authors) > 1:
+            who += f" and {_plural(len(authors) - 1, 'other')}"
+        year = data.get("publication_year")
+        venue = data.get("venue")
+        bits = [who, str(year) if year else "", venue or ""]
+        return " · ".join(b for b in bits if b)[:300]
+
+    if tool == "enqueue_article_enrichment":
+        return f"Queued — {data.get('status') or 'waiting for a worker'}"
+
+    if tool == "article_enrichment_status":
+        wrote = data.get("wrote") or []
+        tail = f" ({', '.join(wrote)})" if wrote else ""
+        return f"{data.get('status') or 'unknown'}{tail}"[:300]
 
     if tool == "upload_artifact":
         return f"Attached as artifact {data.get('artifact_id')}"

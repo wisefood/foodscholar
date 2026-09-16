@@ -79,6 +79,53 @@ def guide_spec(proposal) -> Dict[str, Any]:
     return spec
 
 
+#: Crossref field -> catalog article field. Only the ones that mean the same
+#: thing; anything needing judgement (topics, population group, study type) is
+#: the enrichment's job, not a rename.
+_CROSSREF_TO_ARTICLE = {
+    "title": "title", "authors": "authors", "venue": "venue",
+    "publication_year": "publication_year", "abstract": "abstract",
+    "language": "language", "doi": "doi", "url": "url",
+    "citation_count": "citation_count", "reference_count": "reference_count",
+}
+
+
+def article_spec(proposal) -> Dict[str, Any]:
+    """The catalog fields for an article, Crossref first.
+
+    Deliberately the opposite precedence from a free-text source: what the
+    publisher deposited beats what an assistant wrote, because the one thing
+    that must not happen to a scientific catalog is a citation with invented
+    authors that reads perfectly well. An assistant's spec fills what Crossref
+    has no field for, and only that.
+    """
+    metadata = proposal.metadata or {}
+    spec = dict(metadata.get("spec") or {})
+    record = metadata.get("doi_metadata") or {}
+
+    if record.get("found"):
+        for source, target in _CROSSREF_TO_ARTICLE.items():
+            value = record.get(source)
+            if value not in (None, "", [], {}):
+                spec[target] = value
+        if record.get("subjects") and not spec.get("keywords"):
+            spec["keywords"] = list(record["subjects"])
+
+    spec.setdefault("title", proposal.title)
+    if proposal.source_url:
+        spec.setdefault("url", proposal.source_url)
+    if proposal.language:
+        spec.setdefault("language", proposal.language)
+    if proposal.population_group:
+        spec.setdefault("population_group", proposal.population_group)
+    if proposal.rationale and not spec.get("description"):
+        spec["description"] = proposal.rationale
+    doi = metadata.get("doi") or record.get("doi")
+    if doi:
+        spec.setdefault("doi", doi)
+    return spec
+
+
 def would_create_count(preview: Dict[str, Any]) -> int:
     """How many guidelines a dry run says it would create.
 
@@ -166,6 +213,8 @@ class Integration:
             if artifact_uuid and self.proposal.kind in EXTRACTS:
                 self._extract(urn, artifact_uuid)
                 self._import(urn, artifact_uuid)
+            elif self.proposal.kind == "article":
+                self._enrich(urn)
             self.stage = "done"
             self.steps.add("done", "Integration complete",
                            outcome=self._closing_line())
@@ -186,6 +235,8 @@ class Integration:
         created = self.result.get("guidelines_created")
         if created is not None:
             return f"{created} guideline{'' if created == 1 else 's'} imported under {self.result.get('urn')}"
+        if self.result.get("enrichment", {}).get("status") == "succeeded":
+            return f"{self.result.get('urn')} created and enriched"
         if self.result.get("artifact_id"):
             return f"{self.result.get('urn')} created, with its file attached"
         return f"{self.result.get('urn')} registered"
@@ -210,6 +261,9 @@ class Integration:
                 f"nothing is wired to integrate a {self.proposal.kind!r} yet; "
                 f"guides, articles and textbooks are")
 
+        if self.proposal.kind == "article":
+            self._refuse_a_duplicate_doi()
+
         handle = (self.proposal.metadata or {}).get("pending_artifact")
         wants_file = content_permitted(self.proposal)
         if self.proposal.kind in EXTRACTS and wants_file and not handle:
@@ -223,13 +277,37 @@ class Integration:
                 outcome=("this licence does not permit copying the content in, "
                          "so the catalog gets the reference and not the document"))
 
+    def _refuse_a_duplicate_doi(self) -> None:
+        """A DOI names one paper, so importing it twice is never right.
+
+        Best effort, and it says so: the search is the catalog's own and is
+        fuzzy, so this catches the duplicate it finds and does not promise
+        there is no other. When it does fire it is certain — an exact DOI
+        match is the same work, whatever the titles look like.
+        """
+        metadata = self.proposal.metadata or {}
+        doi = (metadata.get("doi")
+               or (metadata.get("doi_metadata") or {}).get("doi"))
+        if not doi:
+            return
+        found = self._call("search_catalog",
+                           {"kind": "article", "q": doi, "limit": 10},
+                           stage="preflight", required=False) or {}
+        for item in found.get("items") or []:
+            if str(item.get("doi") or "").strip().lower() == str(doi).strip().lower():
+                raise IntegrationError(
+                    f"the catalog already holds {doi} as {item.get('urn') or 'an article'}; "
+                    f"nothing was created. Reject this proposal, or open that entry "
+                    f"if it needs updating.")
+
     def _create_entity(self) -> str:
         if self.result.get("urn"):
             self.steps.add("catalog", "Entity already created",
                            outcome=f"reusing {self.result['urn']} from an earlier attempt")
             return self.result["urn"]
         tool = CREATE_TOOL[self.proposal.kind]
-        spec = guide_spec(self.proposal)
+        spec = (article_spec if self.proposal.kind == "article" else guide_spec)(
+            self.proposal)
         created = self._call(tool, {"proposal_id": self.proposal.id, "spec": spec},
                              stage="create")
         urn = (created or {}).get("urn")
@@ -316,6 +394,56 @@ class Integration:
                 raise IntegrationError(
                     "the extraction is taking longer than this run waits for. It is "
                     "still going; retry this run to pick it up when it finishes.")
+
+    def _enrich(self, urn: str) -> None:
+        """Queue the article's enrichment and wait on it.
+
+        Unlike a guide's extraction, this is not what makes the entry worth
+        having — the article is a usable catalog record the moment it exists.
+        It is still waited on and still fails loudly, because an article that
+        was never enriched is one the search will not surface well, and a
+        silent half-integration is worse than a red one somebody can retry.
+        """
+        self._call("enqueue_article_enrichment", {
+            "proposal_id": self.proposal.id, "article_urn": urn,
+        }, stage="enrich")
+
+        self.stage = "enriching"
+        step = self.steps.start("read", "Enriching the article",
+                                detail="keywords, study type, glossary and Q&A")
+        deadline = time.monotonic() + self.poll_timeout
+        while True:
+            self.sleep(self.poll_interval)
+            state = self._call("article_enrichment_status", {
+                "proposal_id": self.proposal.id, "article_urn": urn,
+            }, stage="enriching", required=False) or {}
+            status = state.get("status")
+            self.result["enrichment"] = {"status": status,
+                                         "wrote": state.get("wrote")}
+            self._save()
+
+            if status == "succeeded":
+                wrote = state.get("wrote") or []
+                self.steps.finish(step, outcome=(
+                    f"enriched — {', '.join(wrote)}" if wrote else "enriched"))
+                return
+            if status == "failed" or state.get("permanently_failed"):
+                self.steps.finish(step, ok=False,
+                                  outcome=state.get("error") or "enrichment failed")
+                raise IntegrationError(
+                    f"enrichment failed: {state.get('error') or 'no reason given'}. "
+                    f"The article is in the catalog and can be enriched again.")
+            if status == "not_found":
+                self.steps.finish(step, ok=False, outcome="the job disappeared")
+                raise IntegrationError(
+                    "the enrichment job is no longer known to the queue; retrying "
+                    "this run will re-queue it. The article is already there.")
+            if time.monotonic() > deadline:
+                self.steps.finish(step, ok=False, outcome=(
+                    f"still running after {int(self.poll_timeout / 60)} minutes"))
+                raise IntegrationError(
+                    "the enrichment is taking longer than this run waits for. The "
+                    "article is in the catalog; retry to pick the enrichment up.")
 
     def _import(self, urn: str, artifact_uuid: str) -> None:
         """Preview first, always, then import — unless this run is a preview.

@@ -28,10 +28,15 @@ class FakeProxy:
     def __init__(self, urn):
         self.urn = urn
         self.created = []
+        #: What a catalog search would return for this kind.
+        self.hits = []
 
     def create(self, **fields):
         self.created.append(fields)
         return {"urn": self.urn, **fields}
+
+    def search(self, q, limit=10):
+        return list(self.hits)[:limit]
 
 
 class FakeArtifacts:
@@ -371,3 +376,156 @@ def test_a_spec_the_assistant_wrote_wins(store):
     assert spec["region"] == "BG"
     assert spec["publication_date"] == "2021"
     assert spec["language"] == "Bulgarian", "and the floor still fills the rest"
+
+
+# --------------------------------------------------------------- articles --
+
+class FakeEnrichCore(FakeCore):
+    """Adds the enrichment endpoints to the scripted core."""
+
+    def __init__(self, statuses=None, **kw):
+        super().__init__(**kw)
+        self.enrichment = list(statuses or [{"status": "succeeded",
+                                             "result": {"keywords": 1, "qa": 1}}])
+
+    def post(self, path, body):
+        self.posts.append((path, dict(body)))
+        if "/enrich/articles/" in path:
+            return {"status": "queued"}
+        return super().post(path, body)
+
+    def get(self, path):
+        if "/enrich/articles/" in path:
+            return (self.enrichment.pop(0) if len(self.enrichment) > 1
+                    else self.enrichment[0])
+        return super().get(path)
+
+
+CROSSREF = {
+    "found": True, "doi": "10.1136/bmj.n1234",
+    "title": "Ultra-processed food and cardiovascular risk",
+    "authors": ["Jane Smith", "Arto Virtanen"],
+    "venue": "BMJ", "publisher": "BMJ Publishing Group",
+    "publication_year": 2021, "abstract": "Background: we looked at things.",
+    "language": "en", "url": "https://doi.org/10.1136/bmj.n1234",
+    "subjects": ["Nutrition", "Cardiology"],
+    "citation_count": 87, "reference_count": 45,
+}
+
+
+def make_article(store, **kw):
+    metadata = {"doi": CROSSREF["doi"], "doi_metadata": CROSSREF}
+    metadata.update(kw.pop("metadata", {}))
+    return make_proposal(store, kind="article", title="whatever the model typed",
+                         metadata=metadata, **kw)
+
+
+def test_an_article_is_created_and_enriched(registry, store):
+    proposal = make_article(store)
+    client = FakeDataClient(urn="urn:wf:article:1")
+    ctx, core = make_context(store, core=FakeEnrichCore(), data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    assert outcome["result"]["urn"] == "urn:wf:article:1"
+    assert outcome["result"]["enrichment"]["status"] == "succeeded"
+    assert any("/enrich/articles/" in p for p, _b in core.posts)
+    # No extraction: an article has no PDF pipeline behind it.
+    assert not any("/guidelines/" in p for p, _b in core.posts)
+
+
+def test_crossref_beats_whatever_the_assistant_typed(registry, store):
+    """The one thing that must not happen to a scientific catalog is a
+    citation with invented authors that reads perfectly well."""
+    proposal = make_article(store, metadata={"spec": {
+        "title": "Ultraprocessed foods and heart disease",   # subtly wrong
+        "authors": ["J. Smith", "A. Virtanen", "R. Invented"],
+        "publication_year": 2020,
+    }})
+    client = FakeDataClient(urn="urn:wf:article:1")
+    ctx, _core = make_context(store, core=FakeEnrichCore(), data_client=client)
+    run_integration(proposal, registry, ctx)
+
+    created = client.articles.created[0]
+    assert created["title"] == CROSSREF["title"]
+    assert created["authors"] == CROSSREF["authors"]
+    assert created["publication_year"] == 2021
+    assert created["venue"] == "BMJ"
+    assert created["doi"] == CROSSREF["doi"]
+
+
+def test_the_assistants_spec_still_fills_what_crossref_has_no_field_for(registry, store):
+    proposal = make_article(store, population_group="adults", metadata={"spec": {
+        "topics": ["cardiovascular health"], "reader_group": "practitioner",
+    }})
+    client = FakeDataClient(urn="urn:wf:article:1")
+    ctx, _core = make_context(store, core=FakeEnrichCore(), data_client=client)
+    run_integration(proposal, registry, ctx)
+
+    created = client.articles.created[0]
+    assert created["topics"] == ["cardiovascular health"]
+    assert created["reader_group"] == "practitioner"
+    assert created["population_group"] == "adults"
+    # Crossref subjects become keywords when the assistant offered none.
+    assert created["keywords"] == ["Nutrition", "Cardiology"]
+
+
+def test_a_doi_we_already_hold_is_refused_before_anything_is_created(registry, store):
+    """A DOI names one paper, so importing it twice is never right."""
+    proposal = make_article(store)
+    client = FakeDataClient(urn="urn:wf:article:NEW")
+    client.articles.hits = [{"urn": "urn:wf:article:OLD", "doi": CROSSREF["doi"]}]
+    ctx, _core = make_context(store, core=FakeEnrichCore(), data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "failed"
+    assert "already holds" in outcome["error"]
+    assert "urn:wf:article:OLD" in outcome["error"]
+    assert client.articles.created == []
+
+
+def test_a_different_doi_in_the_results_does_not_block(registry, store):
+    """The search is fuzzy, so only an exact DOI match may refuse."""
+    proposal = make_article(store)
+    client = FakeDataClient(urn="urn:wf:article:1")
+    client.articles.hits = [{"urn": "urn:wf:article:OTHER", "doi": "10.9999/other"}]
+    ctx, _core = make_context(store, core=FakeEnrichCore(), data_client=client)
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    assert client.articles.created
+
+
+def test_a_failed_enrichment_says_the_article_is_still_there(registry, store):
+    proposal = make_article(store)
+    ctx, _core = make_context(store, core=FakeEnrichCore(
+        statuses=[{"status": "failed", "error": "the abstract was empty"}]))
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    assert outcome["status"] == "failed"
+    assert "empty" in outcome["error"]
+    assert "in the catalog" in outcome["error"]
+    assert outcome["result"]["urn"]
+    assert outcome["wrote_anything"] is True
+
+
+def test_the_article_timeline_reads_as_what_happened(registry, store):
+    proposal = make_article(store)
+    ctx, _core = make_context(store, core=FakeEnrichCore())
+    outcome, _saved = run_integration(proposal, registry, ctx)
+
+    outcomes = " | ".join(s.get("outcome") or "" for s in outcome["steps"])
+    assert "Created urn:wf:guide:1" in outcomes or "Created urn:" in outcomes
+    assert "enriched" in outcomes
+
+
+def test_the_spec_needs_no_crossref_record_to_work(store):
+    """A proposal filed before anyone looked the DOI up still integrates."""
+    from integrator.executor import article_spec
+
+    proposal = make_proposal(store, kind="article", title="A paper",
+                             metadata={"doi": "10.1/x"})
+    spec = article_spec(proposal)
+    assert spec["title"] == "A paper"
+    assert spec["doi"] == "10.1/x"
+    assert spec["url"] == "https://ncpha.bg/fbdg.pdf"

@@ -44,6 +44,7 @@ What you cannot do: approve anything, or put anything into the catalog yourself.
 How to work:
 
 - Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say.
+- For an article, always run `doi_metadata` first and propose from what it returns. Never type a title, author list or year out of a search result: a citation that reads perfectly and is wrong is the single worst thing you can put in this catalog, and Crossref has the record the publisher deposited. If a DOI is not registered there, say so rather than filling the gap yourself.
 - Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three.
 - Establish the licence with `licence_evidence` and quote what you found. Never assert a licence you have no evidence for; say it is undetermined instead, and say what that means — a curator can still approve it, but only by writing down why.
 - Create a proposal for each candidate worth a curator's attention, with a rank, a short rationale, and the integration steps you intend.
@@ -230,6 +231,7 @@ def _describe_intent(calls) -> str:
         "research": "search the web",
         "fetch_url": "read the page",
         "licence_evidence": "check the licence",
+        "doi_metadata": "look the DOI up",
         "search_catalog": "search the catalog",
         "catalog_coverage": "check what we already hold",
         "get_entity": "read a catalog entry",

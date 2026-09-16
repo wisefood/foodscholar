@@ -14,12 +14,13 @@ httpx==0.27.0
 json5==0.9.25
 sentence-transformers==5.2.3
 transformers==4.49.0
-# 0.0.29 carries delegated credentials, which the integrator needs in order to
+# 0.0.30 carries doi_metadata and the article enrichment tools; 0.0.29 added the
+# delegated credentials the integrator needs in order to
 # reach the catalog as the curator driving it rather than as a service account.
 # Deliberately NOT the [mcp] extra: that pulls the MCP SDK, which needs
 # starlette>=1.0 and would fight FastAPI here. Only the standalone
 # `wisefood-mcp` server process needs that extra.
-wisefood>=0.0.29
+wisefood>=0.0.30
 # The integrator's agent loop drives tool-calling through the raw Groq SDK —
 # langchain-groq pulls it in, but a module that imports it should say so.
 groq>=0.30
