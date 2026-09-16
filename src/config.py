@@ -201,11 +201,21 @@ class Config:
         self.settings["INTEGRATOR_MAX_TOKENS"] = int(
             os.getenv("INTEGRATOR_MAX_TOKENS", 120_000)
         )
-        # Phase 1 ships with writes off: the tools exist and the approval wall
-        # is live, but nothing reaches the catalog until the guide pipeline is
-        # wired behind it in Phase 2.
+        # The switch that lets an approved proposal actually reach the catalog.
+        # Off by default, and deliberately not defaulted on now that Phase 2
+        # works: a deployment should turn writes on when somebody is there to
+        # watch the first one, not because it pulled a new image.
         self.settings["INTEGRATOR_WRITES_ENABLED"] = (
             os.getenv("INTEGRATOR_WRITES_ENABLED", "false").lower() == "true"
+        )
+        # How an integration run waits on its extraction. The timeout is not a
+        # kill — the job carries on in its own worker — it is how long this run
+        # watches before handing the wait back to a person.
+        self.settings["INTEGRATOR_POLL_INTERVAL"] = float(
+            os.getenv("INTEGRATOR_POLL_INTERVAL", 20)
+        )
+        self.settings["INTEGRATOR_EXTRACTION_TIMEOUT"] = float(
+            os.getenv("INTEGRATOR_EXTRACTION_TIMEOUT", 3600)
         )
         # The ranking rubric's weights, tunable without a deploy. Licence
         # dominates because a source we may only point at is worth less than

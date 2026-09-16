@@ -561,3 +561,164 @@ class TestTracingNeverCostsAnAnswer:
         big = {"text": "x" * 50_000}
         clipped = _clip(big)
         assert clipped["truncated"] is True and len(clipped["head"]) <= 4000
+
+
+# ------------------------------------------------- Phase 2: runs, in anger --
+
+def test_a_run_row_survives_the_process_that_made_it(store, proposal, monkeypatch):
+    """A run is readable by anyone, which is what makes the console possible."""
+    from datetime import datetime, timezone
+
+    from models.db import IntegrationRun
+    from integrator import service
+
+    with service._session_factory() as db:
+        db.add(IntegrationRun(
+            id=uuid.uuid4().hex[:16], proposal_id=proposal.id, status="running",
+            stage="extracting", steps=[{"id": "step-1", "title": "Reading"}],
+            result={"urn": "urn:wf:guide:1"}, wrote_anything=True,
+            heartbeat_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+    runs = service.list_runs(proposal_id=proposal.id)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "running"
+    assert runs[0]["result"]["urn"] == "urn:wf:guide:1"
+    assert service.get_run(runs[0]["id"])["stage"] == "extracting"
+
+
+def test_a_run_whose_pod_died_reads_stalled(store, proposal):
+    """Not written back — the pod may yet return — but said out loud."""
+    from datetime import datetime, timedelta, timezone
+
+    from models.db import IntegrationRun
+    from integrator import service
+
+    run_id = uuid.uuid4().hex[:16]
+    with service._session_factory() as db:
+        db.add(IntegrationRun(
+            id=run_id, proposal_id=proposal.id, status="running", stage="extracting",
+            steps=[], result={},
+            heartbeat_at=datetime.now(timezone.utc)
+            - timedelta(seconds=service.STALL_AFTER_SECONDS + 60),
+        ))
+        db.commit()
+
+    assert service.get_run(run_id)["status"] == "stalled"
+    # And the column itself is untouched, so a worker that comes back finds
+    # the run it was working on.
+    with service._session_factory() as db:
+        assert db.get(IntegrationRun, run_id).status == "running"
+
+
+def test_an_unapproved_proposal_cannot_be_integrated(store, proposal, monkeypatch):
+    from config import config
+    from integrator import service
+
+    monkeypatch.setitem(config.settings, "INTEGRATOR_WRITES_ENABLED", True)
+    with pytest.raises(PermissionError, match="not been approved"):
+        service.start_integration(proposal_id=proposal.id, user_sub="curator-1")
+
+
+def test_integration_refuses_while_writes_are_off(store, proposal, monkeypatch):
+    """The deployment switch, checked before a thread is ever started."""
+    from config import config
+    from wisefood_mcp.stores import approve
+    from integrator import service
+
+    # The fixture has no licence, so the wall requires a reason — which is
+    # the behaviour under test elsewhere, and a precondition here.
+    approve(store, proposal.id, actor="curator-1",
+            override_reason="national agency, licence being confirmed by email")
+    monkeypatch.setitem(config.settings, "INTEGRATOR_WRITES_ENABLED", False)
+    with pytest.raises(PermissionError, match="switched off"):
+        service.start_integration(proposal_id=proposal.id, user_sub="curator-1")
+
+
+def test_a_second_press_does_not_start_a_second_run(store, proposal, monkeypatch):
+    from datetime import datetime, timezone
+
+    from config import config
+    from models.db import IntegrationRun
+    from wisefood_mcp.stores import approve
+    from integrator import service
+
+    # The fixture has no licence, so the wall requires a reason — which is
+    # the behaviour under test elsewhere, and a precondition here.
+    approve(store, proposal.id, actor="curator-1",
+            override_reason="national agency, licence being confirmed by email")
+    monkeypatch.setitem(config.settings, "INTEGRATOR_WRITES_ENABLED", True)
+    with service._session_factory() as db:
+        db.add(IntegrationRun(
+            id=uuid.uuid4().hex[:16], proposal_id=proposal.id, status="running",
+            steps=[], result={}, heartbeat_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
+
+    with pytest.raises(RuntimeError, match="already running"):
+        service.start_integration(proposal_id=proposal.id, user_sub="curator-1")
+
+
+def test_a_stalled_run_does_not_block_a_retry(store, proposal, monkeypatch):
+    """The point of computing `stalled`: otherwise a dead pod locks a proposal
+    out of ever being integrated again."""
+    from datetime import datetime, timedelta, timezone
+
+    from config import config
+    from models.db import IntegrationRun
+    from wisefood_mcp.stores import approve
+    from integrator import service
+
+    # The fixture has no licence, so the wall requires a reason — which is
+    # the behaviour under test elsewhere, and a precondition here.
+    approve(store, proposal.id, actor="curator-1",
+            override_reason="national agency, licence being confirmed by email")
+    monkeypatch.setitem(config.settings, "INTEGRATOR_WRITES_ENABLED", True)
+    with service._session_factory() as db:
+        db.add(IntegrationRun(
+            id=uuid.uuid4().hex[:16], proposal_id=proposal.id, status="running",
+            steps=[], result={},
+            heartbeat_at=datetime.now(timezone.utc)
+            - timedelta(seconds=service.STALL_AFTER_SECONDS + 60),
+        ))
+        db.commit()
+        assert service._active_run(db, proposal.id) is None
+
+
+def test_the_core_transport_sends_the_field_the_route_declares(monkeypatch):
+    """The 422 that Phase 1 would have hit.
+
+    `GuidelineImportRequest` requires `guide_id`; the tool used to post
+    `guide_urn`, which validates as a missing field and imports nothing.
+    """
+
+
+    from integrator import service
+
+    seen = {}
+
+    class FakeJobService:
+        def enqueue_job(self, **kw):
+            seen["enqueue"] = kw
+
+        async def get_job_response(self, artifact_uuid):
+            return {"status": "queued", "artifact_uuid": artifact_uuid}
+
+        async def import_latest_result_to_guide(self, **kw):
+            seen["import"] = kw
+            return {"total_created": 3, "dry_run": kw["dry_run"]}
+
+    monkeypatch.setattr("services.guideline_jobs.GuidelineJobService", FakeJobService)
+    post, get = service._core_transport(None)
+
+    post("/api/v1/guidelines/extract/abc", {"guide_id": "urn:wf:guide:1"})
+    assert seen["enqueue"] == {"artifact_uuid": "abc", "guide_id": "urn:wf:guide:1"}
+
+    out = post("/api/v1/guidelines/import/abc",
+               {"guide_id": "urn:wf:guide:1", "dry_run": False})
+    assert seen["import"]["guide_id"] == "urn:wf:guide:1"
+    assert seen["import"]["dry_run"] is False
+    assert out["total_created"] == 3
+
+    assert get("/api/v1/guidelines/extract/abc")["status"] == "queued"

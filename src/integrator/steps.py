@@ -38,6 +38,7 @@ RUNNING: Dict[str, tuple] = {
     "create_textbook": ("write", "Creating a textbook"),
     "upload_artifact": ("write", "Attaching the file"),
     "enqueue_guideline_extraction": ("write", "Queuing the extraction"),
+    "guideline_extraction_status": ("read", "Checking on the extraction"),
     "import_guidelines": ("write", "Importing the guidelines"),
 }
 
@@ -56,6 +57,12 @@ def running_title(tool: str, args: Dict[str, Any]) -> tuple:
         bits = [str(args.get(k)) for k in ("q", "country", "population_group", "language")
                 if args.get(k)]
         detail = " · ".join(bits)[:200] or None
+    elif tool in ("create_guide", "create_article", "create_textbook"):
+        detail = str((args.get("spec") or {}).get("title") or "")[:200] or None
+    elif tool == "upload_artifact":
+        detail = str(args.get("title") or args.get("parent_urn") or "")[:200] or None
+    elif tool == "import_guidelines":
+        detail = "preview" if args.get("dry_run") else "for real"
     return kind, title, detail
 
 
@@ -109,6 +116,26 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
 
     if tool == "list_organizations":
         return _plural(int(data.get("count") or 0), "organisation")
+
+    if tool == "upload_artifact":
+        return f"Attached as artifact {data.get('artifact_id')}"
+
+    if tool == "enqueue_guideline_extraction":
+        return f"Queued — {data.get('status') or 'waiting for a worker'}"
+
+    if tool == "guideline_extraction_status":
+        pages, total = data.get("current_page"), data.get("total_pages")
+        where = f" at page {pages} of {total}" if pages and total else ""
+        return f"{data.get('status') or 'unknown'}{where}"
+
+    if tool == "import_guidelines":
+        skipped = int(data.get("total_skipped") or 0)
+        tail = f", {skipped} already there" if skipped else ""
+        if data.get("dry_run"):
+            from integrator.executor import would_create_count
+            return f"would create {_plural(would_create_count(data), 'guideline')}{tail}"
+        created = int(data.get("total_created") or 0)
+        return f"Created {_plural(created, 'guideline')}{tail}"
 
     if data.get("urn"):
         return f"Created {data['urn']}"

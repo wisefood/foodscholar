@@ -362,3 +362,210 @@ def seed_backlog(items: List[Dict[str, Any]]) -> Dict[str, int]:
             added += 1
         db.commit()
     return {"added": added, "skipped": skipped}
+
+
+# ------------------------------------------------------------------- runs --
+
+#: A run whose heartbeat is older than this is not working, whatever its
+#: status column says — the pod carrying it went away mid-extraction.
+STALL_AFTER_SECONDS = 300
+
+
+def _core_transport(loop):
+    """POST and GET against FoodScholar's own guideline routes, in process.
+
+    A loopback HTTP call would need a token minted for ourselves and would
+    deadlock a single-worker deployment on its own request. Calling the
+    service directly avoids both — but two of the three entry points are
+    coroutines, and the async engine belongs to the event loop that built it.
+    Touching it from the run's worker thread is how you get `Future attached
+    to a different loop` an hour into an extraction.
+
+    So the coroutines are handed back to the loop that owns them and the
+    thread waits for the answer. `loop` is None only in tests, where there is
+    no application loop and nothing pooled to confuse.
+    """
+    import asyncio
+
+    from services.guideline_jobs import GuidelineJobService
+
+    job_service = GuidelineJobService()
+
+    def _await(coro, timeout: float = 300.0):
+        if loop is None:
+            return asyncio.run(coro)
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+
+    def _dump(model) -> Dict[str, Any]:
+        return model.model_dump(mode="json") if hasattr(model, "model_dump") else dict(model)
+
+    def post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        parts = [p for p in path.split("/") if p]
+        # /api/v1/guidelines/<action>/<artifact_uuid>
+        action, artifact_uuid = parts[-2], parts[-1]
+        if action == "extract":
+            job_service.enqueue_job(artifact_uuid=artifact_uuid,
+                                    guide_id=body.get("guide_id"))
+            return _dump(_await(job_service.get_job_response(artifact_uuid)))
+        if action == "import":
+            return _dump(_await(job_service.import_latest_result_to_guide(
+                artifact_uuid=artifact_uuid,
+                guide_id=body["guide_id"],
+                dry_run=bool(body.get("dry_run", True)),
+            ), timeout=900.0))
+        raise ValueError(f"no in-process route for POST {path}")
+
+    def get(path: str) -> Dict[str, Any]:
+        parts = [p for p in path.split("/") if p]
+        action, artifact_uuid = parts[-2], parts[-1]
+        if action == "extract":
+            return _dump(_await(job_service.get_job_response(artifact_uuid)))
+        raise ValueError(f"no in-process route for GET {path}")
+
+    return post, get
+
+
+def _run_dict(row, *, now=None) -> Dict[str, Any]:
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    status = row.status
+    if status == "running" and row.heartbeat_at is not None:
+        beat = row.heartbeat_at
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=timezone.utc)
+        if (now - beat).total_seconds() > STALL_AFTER_SECONDS:
+            # Not written back: the pod may yet return and carry on. This is
+            # what a reader is told, and it is the truth either way.
+            status = "stalled"
+    return {
+        "id": row.id, "proposal_id": row.proposal_id, "session_id": row.session_id,
+        "status": status, "stage": row.stage, "steps": row.steps or [],
+        "error": row.error, "result": row.result or {},
+        "wrote_anything": bool(row.wrote_anything), "dry_run": bool(row.dry_run),
+        "started_by": row.started_by,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "heartbeat_at": row.heartbeat_at.isoformat() if row.heartbeat_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+    }
+
+
+def get_run(run_id: str) -> Optional[Dict[str, Any]]:
+    from models.db import IntegrationRun
+
+    with _session_factory() as db:
+        row = db.get(IntegrationRun, run_id)
+        return _run_dict(row) if row else None
+
+
+def list_runs(*, proposal_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    from models.db import IntegrationRun
+
+    with _session_factory() as db:
+        q = db.query(IntegrationRun)
+        if proposal_id:
+            q = q.filter(IntegrationRun.proposal_id == proposal_id)
+        rows = (q.order_by(IntegrationRun.created_at.desc())
+                 .limit(max(1, min(int(limit), 100))).all())
+        return [_run_dict(r) for r in rows]
+
+
+def _active_run(db, proposal_id: str):
+    """A run that is genuinely still going, ignoring ones whose pod died."""
+    from datetime import datetime, timezone
+
+    from models.db import IntegrationRun
+
+    rows = (db.query(IntegrationRun)
+              .filter(IntegrationRun.proposal_id == proposal_id,
+                      IntegrationRun.status.in_(("queued", "running")))
+              .all())
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        if _run_dict(row, now=now)["status"] != "stalled":
+            return row
+    return None
+
+
+def start_integration(*, proposal_id: str, user_sub: str,
+                      dry_run: bool = False) -> Dict[str, Any]:
+    """Begin integrating an approved proposal. Returns the run immediately.
+
+    The work happens on a thread because it waits on an extraction that takes
+    minutes; the caller gets a run id and polls. Everything the thread does is
+    written to the run row as it goes, so a reader who arrives late — or after
+    a restart — sees the same account as one who watched.
+    """
+    import asyncio
+    import threading
+    from datetime import datetime, timezone
+
+    from models.db import IntegrationRun
+
+    from integrator.executor import Integration, new_run_id
+
+    proposal = _STORE.get(proposal_id)
+    if proposal is None:
+        raise LookupError("no such proposal")
+    if proposal.status != "approved":
+        raise PermissionError("this proposal has not been approved")
+    if not config.settings.get("INTEGRATOR_WRITES_ENABLED", False):
+        raise PermissionError(
+            "catalog writes are switched off in this deployment")
+
+    with _session_factory() as db:
+        if _active_run(db, proposal_id) is not None:
+            raise RuntimeError("an integration is already running for this proposal")
+        row = IntegrationRun(
+            id=new_run_id(), proposal_id=proposal_id, session_id=proposal.session_id,
+            status="queued", stage="queued", steps=[], result={},
+            dry_run=bool(dry_run), started_by=user_sub,
+            heartbeat_at=datetime.now(timezone.utc),
+        )
+        db.add(row)
+        db.commit()
+        run_id = row.id
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    ctx = tool_context(user_sub=user_sub, session_id=proposal.session_id)
+    ctx.core_post, ctx.core_get = _core_transport(loop)
+
+    def persist(snapshot: Dict[str, Any]) -> None:
+        with _session_factory() as db:
+            live = db.get(IntegrationRun, run_id)
+            if live is None:
+                return
+            live.status = snapshot["status"]
+            live.stage = snapshot.get("stage")
+            live.steps = snapshot.get("steps") or []
+            live.result = snapshot.get("result") or {}
+            live.error = snapshot.get("error")
+            live.wrote_anything = bool(snapshot.get("wrote_anything"))
+            live.heartbeat_at = datetime.now(timezone.utc)
+            if snapshot.get("finished"):
+                live.finished_at = datetime.now(timezone.utc)
+            db.commit()
+
+    def work() -> None:
+        outcome = Integration(
+            proposal=proposal, registry=_REGISTRY, ctx=ctx, persist=persist,
+            poll_interval=float(config.settings.get("INTEGRATOR_POLL_INTERVAL", 20)),
+            poll_timeout=float(config.settings.get("INTEGRATOR_EXTRACTION_TIMEOUT", 3600)),
+            dry_run=bool(dry_run),
+        ).run()
+        # The proposal's own status follows its last run, so a curator reading
+        # the queue sees what happened without opening each one.
+        try:
+            _STORE.update(proposal_id,
+                          status="integrated" if outcome["status"] == "succeeded"
+                          else "failed",
+                          result={**(proposal.result or {}), **outcome["result"]})
+        except Exception:  # noqa: BLE001
+            logger.warning("integrator: proposal status not updated", exc_info=True)
+
+    threading.Thread(target=work, name=f"integration-{run_id}", daemon=True).start()
+    return get_run(run_id)

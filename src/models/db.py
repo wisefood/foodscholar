@@ -403,3 +403,49 @@ class IntegratorBacklogItem(Base):
         DateTime(timezone=True), nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class IntegrationRun(Base):
+    """One attempt at integrating an approved proposal.
+
+    Separate from the proposal because a run is an *attempt*, and attempts
+    fail: a PDF that will not download, an extraction the model gives up on,
+    an import that finds nothing to import. Folding the state onto the
+    proposal would mean a retry erases the evidence of why the first try
+    failed, which is exactly the evidence somebody needs.
+
+    `steps` holds the same shape the chat timeline uses, so the console
+    renders a run with the component it already has. `heartbeat_at` is what
+    tells a reader the difference between a run that is working and a run
+    whose pod died mid-extraction — the two look identical from `status`
+    alone, and one of them needs a person.
+    """
+
+    __tablename__ = "integration_runs"
+    __table_args__ = {"schema": SCHEMA}
+
+    id = Column(String(32), primary_key=True)
+    proposal_id = Column(String(32), nullable=False, index=True)
+    session_id = Column(String(64), nullable=True, index=True)
+
+    #: queued | running | succeeded | failed | stalled
+    status = Column(String(16), nullable=False, default="queued", index=True)
+    #: Which pipeline stage it is on, for a progress line that means something.
+    stage = Column(String(40), nullable=True)
+    steps = Column(JSONB, nullable=False, default=list)
+    error = Column(Text, nullable=True)
+    #: urn, artifact_uuid, extraction job, import counts — accumulated as the
+    #: run goes, so a failure still shows everything that did land.
+    result = Column(JSONB, nullable=False, default=dict)
+    #: True once anything has been created in the catalog. A failed run that
+    #: got this far needs cleaning up by hand, and should say so.
+    wrote_anything = Column(Boolean, nullable=False, default=False)
+
+    dry_run = Column(Boolean, nullable=False, default=False)
+    started_by = Column(String(100), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)

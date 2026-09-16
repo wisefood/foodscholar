@@ -23,7 +23,7 @@ def _service():
     """The integrator service, or a readable 503.
 
     Its tool layer lives in `wisefood_mcp`, which ships with wisefood-client
-    0.0.27 and later. An image built against an older pin would otherwise
+    0.0.28 and later. An image built against an older pin would otherwise
     raise ImportError from inside a route, which reads as a bug in the
     integrator rather than as a missing dependency.
     """
@@ -35,7 +35,7 @@ def _service():
         raise APIException(
             status_code=503,
             detail=(
-                "The Source Integrator needs wisefood-client 0.0.27 or later "
+                "The Source Integrator needs wisefood-client 0.0.28 or later "
                 f"(wisefood_mcp is not importable: {exc})."
             ),
         ) from exc
@@ -80,6 +80,14 @@ class RejectRequest(BaseModel):
 class RerankRequest(BaseModel):
     user_sub: str
     order: List[str]
+
+
+class IntegrateRequest(BaseModel):
+    user_sub: str
+    #: Run every step up to the import and stop there, reporting what would be
+    #: created. The entity and its artifact are still created — a preview of
+    #: an extraction cannot happen without something to extract from.
+    dry_run: bool = False
 
 
 @router.post("/sessions")
@@ -185,3 +193,47 @@ async def audit(session_id: Optional[str] = None,
     service = _service()
     return {"tool_calls": service.tool_calls(session_id=session_id,
                                              proposal_id=proposal_id, limit=limit)}
+
+
+@router.post("/proposals/{proposal_id}/integrate")
+@render()
+async def integrate(proposal_id: str, body: IntegrateRequest):
+    """Run an approved proposal into the catalog. Returns a run to poll.
+
+    Approval and integration are separate on purpose. Approving says a person
+    vouched for the source; integrating is when the catalog changes, and a
+    curator may well want to approve a batch in one sitting and run them when
+    somebody is around to watch.
+    """
+    from exceptions import APIException
+
+    try:
+        return _service().start_integration(
+            proposal_id=proposal_id, user_sub=body.user_sub, dry_run=body.dry_run)
+    except LookupError as exc:
+        raise APIException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise APIException(status_code=403, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # Already running. A second press should not start a second run.
+        raise APIException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}")
+@render()
+async def run(run_id: str):
+    """One integration run, with its timeline. Poll this while it works."""
+    from exceptions import APIException
+
+    found = _service().get_run(run_id)
+    if found is None:
+        raise APIException(status_code=404, detail="no such run")
+    return found
+
+
+@router.get("/runs")
+@render()
+async def runs(proposal_id: Optional[str] = None,
+               limit: int = Query(default=20, le=100)):
+    """Every attempt at a proposal, newest first — the failed ones included."""
+    return {"runs": _service().list_runs(proposal_id=proposal_id, limit=limit)}
