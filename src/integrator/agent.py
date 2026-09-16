@@ -89,7 +89,7 @@ class IntegratorAgent:
 
     def __init__(self, *, registry, tool_context, groq_client,
                  model: Optional[str] = None, budget: Optional[Budget] = None,
-                 allow_writes: bool = False):
+                 allow_writes: bool = False, trace=None):
         self.registry = registry
         self.ctx = tool_context
         self.groq = groq_client
@@ -103,6 +103,9 @@ class IntegratorAgent:
         # model cannot see is a tool it cannot try, which keeps the transcript
         # about research instead of about refusals.
         self.tools = self.registry.openai_schemas(include_writes=allow_writes)
+        # Inert when tracing is off or unavailable, so the loop below never
+        # has to ask whether it is being watched.
+        self.trace = trace
 
     # ------------------------------------------------------------- one turn --
     def run(self, history: List[Dict[str, Any]], user_message: str) -> Dict[str, Any]:
@@ -187,6 +190,9 @@ class IntegratorAgent:
 
                 outcome = self.registry.call(name, raw_args, self.ctx)
                 ok = bool(outcome.get("ok"))
+                if self.trace is not None:
+                    self.trace.tool(name, parsed_args, ok, outcome.get("result"),
+                                    step.get("elapsed_ms"))
                 payload = outcome.get("result") if ok else outcome.get("error")
                 steps.finish(step, ok=ok, outcome=finished_detail(
                     name, parsed_args or {}, ok, outcome.get("result"),
@@ -203,6 +209,9 @@ class IntegratorAgent:
                 produced.append(tool_turn)
 
     def _result(self, produced, text, stop_reason, steps) -> Dict[str, Any]:
+        if self.trace is not None:
+            self.trace.finish(reply=text or "", stop_reason=stop_reason,
+                              steps=self.budget.steps, tokens=self.budget.tokens)
         return {
             "messages": produced,
             "reply": text,

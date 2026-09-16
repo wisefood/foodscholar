@@ -161,13 +161,19 @@ def chat(*, session_id: str, user_sub: str, message: str) -> Dict[str, Any]:
                                  content=message))
         db.commit()
 
-    agent = IntegratorAgent(
-        registry=_REGISTRY,
-        tool_context=tool_context(user_sub=user_sub, session_id=session_id),
-        groq_client=_groq_client(),
-        allow_writes=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),
-    )
-    outcome = agent.run(past, message)
+    from integrator.tracing import trace_run
+
+    model = config.settings.get("INTEGRATOR_MODEL", "openai/gpt-oss-120b")
+    with trace_run(session_id=session_id, user_sub=user_sub,
+                   question=message, model=model) as trace:
+        agent = IntegratorAgent(
+            registry=_REGISTRY,
+            tool_context=tool_context(user_sub=user_sub, session_id=session_id),
+            groq_client=_groq_client(),
+            allow_writes=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),
+            trace=trace,
+        )
+        outcome = agent.run(past, message)
 
     with _session_factory() as db:
         session = db.get(IntegratorSession, session_id)
@@ -214,12 +220,44 @@ def get_proposal(proposal_id: str) -> Optional[Dict[str, Any]]:
 
 
 def create_proposal(*, user_sub: str, session_id: Optional[str], kind: str,
-                    title: str, **fields: Any) -> Dict[str, Any]:
+                    title: str, existing_similar: Optional[int] = None,
+                    **fields: Any) -> Dict[str, Any]:
+    """File a candidate, and score it by the rubric.
+
+    The score is computed here rather than asked of the model. A number a
+    model produced for reasons it did not record cannot be argued with; this
+    one is arithmetic over facts the tools established, and every component
+    of it is on the proposal for a curator to disagree with.
+    """
     proposal = Proposal(
         id=new_proposal_id(), kind=kind, title=title, session_id=session_id,
         created_by=user_sub, status="proposed", **fields,
     )
-    return _STORE.create(proposal).to_dict()
+    created = _STORE.create(proposal)
+    return rescore(created.id, existing_similar=existing_similar)
+
+
+def rescore(proposal_id: str, *, existing_similar: Optional[int] = None) -> Dict[str, Any]:
+    """Recompute the rank. Called on create, and whenever the licence changes.
+
+    The licence is the heaviest component, so a proposal scored before its
+    licence was established is scored on a placeholder — leaving that stale
+    would mean the queue is ordered by what we did not yet know.
+    """
+    from integrator import ranking
+
+    row = _STORE.get(proposal_id)
+    if row is None:
+        raise LookupError("no such proposal")
+    result = ranking.score(row.to_dict(), existing_similar=existing_similar,
+                           settings=config.settings)
+    metadata = dict(row.metadata or {})
+    metadata["ranking"] = {"breakdown": result["breakdown"],
+                           "weights": result["weights"]}
+    return _STORE.update(
+        proposal_id, proposed_rank=result["score"],
+        rationale=row.rationale or result["rationale"], metadata=metadata,
+    ).to_dict()
 
 
 def approve(*, proposal_id: str, user_sub: str,

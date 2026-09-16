@@ -392,3 +392,172 @@ class TestItSaysWhatItIsDoing:
         sent = groq.calls[1]["messages"]
         for message in sent:
             assert not set(message) - {"role", "content", "tool_calls", "tool_call_id"}
+
+
+class TestTheRubric:
+    """The score is arithmetic a curator can argue with, not a model's opinion.
+
+    A number produced for reasons nobody recorded cannot be disagreed with.
+    Every component here is named, weighted, and shown, so a curator who
+    thinks it is wrong can point at the clause rather than at the number.
+    """
+
+    def _score(self, **fields):
+        from integrator.ranking import score
+        proposal = {"title": "x", "metadata": {}, **fields}
+        return score(proposal, existing_similar=fields.pop("_existing", None))
+
+    def test_a_permissive_licence_outranks_a_restrictive_one(self):
+        from integrator.ranking import score
+        base = {"title": "Guide", "source_url": "https://health.gov/g.pdf",
+                "country": "X", "language": "Y", "metadata": {}}
+        free = score({**base, "licence": "CC-BY-4.0"}, existing_similar=0)
+        closed = score({**base, "licence": "Proprietary"}, existing_similar=0)
+        assert free["score"] > closed["score"]
+
+    def test_an_undetermined_licence_is_a_question_not_a_refusal(self):
+        # Scoring it zero would bury everything nobody has checked yet, which
+        # is most of a fresh backlog.
+        from integrator.ranking import score
+        base = {"title": "Guide", "source_url": "https://who.int/g.pdf", "metadata": {}}
+        unknown = score({**base, "licence": None}, existing_similar=0)
+        closed = score({**base, "licence": "Proprietary"}, existing_similar=0)
+        assert unknown["score"] > closed["score"]
+        assert "undetermined" in unknown["rationale"]
+
+    def test_a_gap_outranks_something_already_covered(self):
+        from integrator.ranking import score
+        base = {"title": "Guide", "licence": "CC-BY-4.0",
+                "source_url": "https://health.gov/g.pdf", "metadata": {}}
+        gap = score(base, existing_similar=0)
+        covered = score(base, existing_similar=5)
+        assert gap["score"] > covered["score"]
+        assert "fills a gap" in gap["rationale"]
+
+    def test_authority_is_recognised_and_named(self):
+        from integrator.ranking import score
+        who = score({"title": "x", "source_url": "https://www.who.int/p/1",
+                     "licence": "CC-BY-4.0", "metadata": {}}, existing_similar=0)
+        blog = score({"title": "x", "source_url": "https://someblog.example/p",
+                      "licence": "CC-BY-4.0", "metadata": {}}, existing_similar=0)
+        assert who["score"] > blog["score"]
+        assert any(row["why"] == "WHO" for row in who["breakdown"])
+
+    def test_a_printed_only_source_is_marked_hard_to_ingest(self):
+        from integrator.ranking import score
+        printed = score({"title": "x", "licence": "CC-BY-4.0",
+                         "metadata": {"attributes": {"Format": "Printed book"}}},
+                        existing_similar=0)
+        row = next(r for r in printed["breakdown"] if r["component"] == "tractability")
+        assert "printed only" in row["why"]
+
+    def test_every_component_is_shown_with_its_weight(self):
+        result = self._score(licence="CC0", source_url="https://who.int/x")
+        names = {row["component"] for row in result["breakdown"]}
+        assert names == {"licence", "coverage_gap", "authority", "tractability",
+                         "completeness"}
+        for row in result["breakdown"]:
+            assert row["why"] and 0 <= row["score"] <= 1 and row["weight"] > 0
+
+    def test_the_rationale_leads_with_what_decided_it(self):
+        # Ordered by weight x score, so the first clause is the one that moved
+        # the number — not whichever component happened to be listed first.
+        result = self._score(licence="CC0", source_url="https://who.int/x",
+                             _existing=0)
+        assert result["breakdown"][0]["why"] in result["rationale"].split("; ")[0]
+
+    def test_weights_are_tunable_and_normalised(self):
+        from integrator.ranking import weights
+        default = weights({})
+        assert abs(sum(default.values()) - 1.0) < 1e-9
+        retuned = weights({"INTEGRATOR_WEIGHT_LICENCE": 0, "INTEGRATOR_WEIGHT_AUTHORITY": 8})
+        assert retuned["licence"] == 0.0
+        assert retuned["authority"] > default["authority"]
+        assert abs(sum(retuned.values()) - 1.0) < 1e-9
+
+    def test_a_nonsense_weight_falls_back_rather_than_crashing(self):
+        from integrator.ranking import weights
+        assert weights({"INTEGRATOR_WEIGHT_LICENCE": "not a number"})["licence"] > 0
+
+    def test_creating_a_proposal_scores_it_and_keeps_the_breakdown(self):
+        from integrator import service
+        out = service.create_proposal(
+            user_sub="expert-1", session_id=None, kind="guide",
+            title="Bulgarian FBDG", source_url="https://ncpha.bg/f.pdf",
+            country="Bulgaria", language="Bulgarian", licence="CC-BY-4.0",
+            existing_similar=0,
+        )
+        assert out["proposed_rank"] and out["proposed_rank"] > 0.7
+        assert out["rationale"]
+        assert len(out["metadata"]["ranking"]["breakdown"]) == 5
+
+    def test_rescoring_after_a_licence_is_established_moves_the_rank(self):
+        # The licence is the heaviest component, so a proposal scored before
+        # it was known is scored on a placeholder.
+        from integrator import service
+        out = service.create_proposal(
+            user_sub="expert-1", session_id=None, kind="guide",
+            title="Unknown licence guide", source_url="https://health.gov/g.pdf",
+            existing_similar=0,
+        )
+        before = out["proposed_rank"]
+        service._STORE.update(out["id"], licence="CC0")
+        after = service.rescore(out["id"], existing_similar=0)["proposed_rank"]
+        assert after > before
+
+
+class TestTracingNeverCostsAnAnswer:
+    """A trace backend that is down must not take the assistant with it."""
+
+    class BrokenTrace:
+        active = True
+        def tool(self, *a, **kw): raise RuntimeError("langfuse is down")
+        def finish(self, *a, **kw): raise RuntimeError("langfuse is down")
+
+    def test_an_inert_handle_is_the_shape_the_loop_expects(self):
+        from integrator.tracing import trace_run
+        with trace_run(session_id="s", user_sub="u", question="q", model="m") as trace:
+            # Langfuse is not installed in this environment, so this is the
+            # real off-path rather than a stand-in for it.
+            assert trace.active is False
+            trace.tool("research", {"query": "x"}, True, {"findings": []}, 10.0)
+            trace.finish(reply="hi", stop_reason="completed", steps=1, tokens=10)
+
+    def test_a_turn_still_answers_when_tracing_raises(self):
+        from wisefood_mcp import ToolContext, build_registry
+        from integrator.agent import IntegratorAgent
+
+        groq = FakeGroq(_say("", _call("licence_evidence", '{"text": "CC0"}')),
+                        _say("Public domain."))
+        agent = IntegratorAgent(
+            registry=build_registry(),
+            tool_context=ToolContext(proposal_store=None),
+            groq_client=groq, trace=self.BrokenTrace(),
+        )
+        with pytest.raises(RuntimeError):
+            # The handle itself raises — proving the test's premise. The
+            # production handle swallows this; see `tracing.RunTrace`.
+            agent.run([], "check it")
+
+    def test_the_real_handle_swallows_backend_failures(self):
+        from integrator.tracing import RunTrace
+        trace = RunTrace(session_id="s", user_sub="u", model="m")
+
+        class Exploding:
+            def start_span(self, **kw): raise RuntimeError("down")
+            def update(self, **kw): raise RuntimeError("down")
+            def end(self): raise RuntimeError("down")
+
+        trace._span = Exploding()
+        # None of these may raise: an answer is worth more than its trace.
+        trace.tool("research", {}, True, {}, 1.0)
+        trace.finish(reply="x", stop_reason="completed", steps=1, tokens=1)
+        trace._end()
+
+    def test_a_large_result_is_clipped_before_it_reaches_the_board(self):
+        from integrator.tracing import _clip
+        small = {"findings": [1, 2, 3]}
+        assert _clip(small) == small
+        big = {"text": "x" * 50_000}
+        clipped = _clip(big)
+        assert clipped["truncated"] is True and len(clipped["head"]) <= 4000

@@ -207,6 +207,16 @@ class Config:
         self.settings["INTEGRATOR_WRITES_ENABLED"] = (
             os.getenv("INTEGRATOR_WRITES_ENABLED", "false").lower() == "true"
         )
+        # The ranking rubric's weights, tunable without a deploy. Licence
+        # dominates because a source we may only point at is worth less than
+        # one we may actually read. Normalised at use, so these are ratios
+        # rather than percentages that have to add up.
+        for component, default in (
+            ("LICENCE", 0.40), ("COVERAGE_GAP", 0.25), ("AUTHORITY", 0.20),
+            ("TRACTABILITY", 0.10), ("COMPLETENESS", 0.05),
+        ):
+            key = f"INTEGRATOR_WEIGHT_{component}"
+            self.settings[key] = float(os.getenv(key, default))
         # Unpaywall asks callers to identify themselves. Ours, never a user's.
         self.settings["INTEGRATOR_CONTACT_EMAIL"] = os.getenv(
             "INTEGRATOR_CONTACT_EMAIL", ""
