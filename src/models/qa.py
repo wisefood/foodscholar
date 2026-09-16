@@ -523,6 +523,21 @@ class RetrievedSource(BaseModel):
         default=None,
         description="PDF page a guideline rule came from, when known",
     )
+    evidence_label: Optional[str] = Field(
+        default=None,
+        description=(
+            "Plain-language description of the study's design, e.g. 'animal "
+            "study' or 'systematic review'. Present so non-human evidence can "
+            "be labelled where it is shown rather than read as a human result"
+        ),
+    )
+    is_human_evidence: Optional[bool] = Field(
+        default=None,
+        description=(
+            "True for human work, False for preclinical, null when the source "
+            "does not record it — which is most of the corpus"
+        ),
+    )
     sequence_no: Optional[int] = Field(
         default=None,
         description=(

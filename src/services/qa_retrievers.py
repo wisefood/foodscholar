@@ -10,6 +10,7 @@ from backend.elastic import ELASTIC_CLIENT
 from config import config
 from models.qa import QAClarifierSafetyPlan, QAUserContext, RetrievedSource
 from services.article_policy import article_filter_query
+from services.evidence_grade import grade_source
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ def normalize_article_hit(
                 return int(value.strip())
         return None
 
+    _graded = grade_source(result)
     retrieved = RetrievedSource(
         source_type="article",
         urn=text_value(result.get("urn") or result.get("_id")),
@@ -218,6 +220,9 @@ def normalize_article_hit(
         study_type=text_value(
             result.get("study_type") or result.get("ai_category"), default=None
         ),
+        # Derived once, here, so ranking and the reader see the same judgement.
+        evidence_label=_graded.label or None,
+        is_human_evidence=_graded.is_human,
     )
     return result, retrieved
 

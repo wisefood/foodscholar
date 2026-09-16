@@ -19,6 +19,7 @@ from models.search import (
 from utilities.citation_validator import create_citation_from_article
 from agents.qa_agent import COMPLEXITY_INSTRUCTIONS
 from datetime import datetime
+from services.evidence_grade import grade_source, prefer_human
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,16 @@ class SynthesisAgent:
             f"Synthesizing {len(articles)} articles for query: '{query}'"
         )
 
+        # Human evidence first, preclinical last.
+        #
+        # Round 2 found mouse studies surfacing as key findings for questions
+        # people asked about themselves. Retrieval relevance alone put them
+        # there: a mouse paper can be the closest match for "fibre and
+        # cholesterol" while being the wrong answer for the person asking.
+        # Reordering here rather than filtering keeps a question that only has
+        # preclinical evidence answerable — it just stops that evidence leading.
+        articles = prefer_human(articles)
+
         # Prepare article summaries for the LLM
         article_summaries = self._prepare_article_summaries(articles)
 
@@ -111,6 +122,17 @@ class SynthesisAgent:
 - Year: {year}
 - Journal: {article.get('venue') or article.get('journal', 'N/A')}
 - Abstract: {article.get('abstract', 'No abstract available')[:500]}"""
+            # The model cannot label evidence it was never told the shape of.
+            # Stated explicitly so a preclinical source is described as one in
+            # the finding rather than read as a human result.
+            graded = grade_source(article)
+            if graded.label:
+                summary += f"\n- Evidence type: {graded.label}"
+            if graded.is_preclinical:
+                summary += (
+                    "\n- NOTE: not human evidence. If used, say so in the "
+                    "finding and do not phrase it as a human recommendation."
+                )
             summaries.append(summary)
 
         return "\n\n".join(summaries)
