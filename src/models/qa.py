@@ -523,6 +523,22 @@ class RetrievedSource(BaseModel):
         default=None,
         description="PDF page a guideline rule came from, when known",
     )
+    open_access: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the full text is free to read. Round 2: general readers "
+            "could only see abstracts and could not verify the evidence, with "
+            "no way to tell in advance which sources they could open"
+        ),
+    )
+    doi: Optional[str] = Field(
+        default=None,
+        description=(
+            "The article's DOI. The stored `url` always points at Semantic "
+            "Scholar rather than the publisher, so this is the only identifier "
+            "that resolves to the paper itself"
+        ),
+    )
     evidence_label: Optional[str] = Field(
         default=None,
         description=(

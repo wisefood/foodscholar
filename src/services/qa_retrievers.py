@@ -198,6 +198,8 @@ def normalize_article_hit(
         return None
 
     _graded = grade_source(result)
+    _raw_oa = result.get("open_access")
+    _open_access = bool(_raw_oa) if isinstance(_raw_oa, bool) else None
     retrieved = RetrievedSource(
         source_type="article",
         urn=text_value(result.get("urn") or result.get("_id")),
@@ -223,6 +225,11 @@ def normalize_article_hit(
         # Derived once, here, so ranking and the reader see the same judgement.
         evidence_label=_graded.label or None,
         is_human_evidence=_graded.is_human,
+        # `license` is NOT used as the open-access signal: the index holds
+        # CCBY on articles flagged open_access=false, so the two disagree and
+        # the explicit flag is the one to trust.
+        open_access=_open_access,
+        doi=text_value(result.get("doi"), default=None),
     )
     return result, retrieved
 
