@@ -202,10 +202,10 @@ class Config:
         # A run that can search the web needs a ceiling, or one question can
         # spend an afternoon and a month's quota.
         self.settings["INTEGRATOR_MAX_STEPS"] = int(
-            os.getenv("INTEGRATOR_MAX_STEPS", 12)
+            os.getenv("INTEGRATOR_MAX_STEPS", 40)
         )
         self.settings["INTEGRATOR_MAX_TOKENS"] = int(
-            os.getenv("INTEGRATOR_MAX_TOKENS", 120_000)
+            os.getenv("INTEGRATOR_MAX_TOKENS", 400_000)
         )
         # The switch that lets an approved proposal actually reach the catalog.
         # Off by default, and deliberately not defaulted on now that Phase 2

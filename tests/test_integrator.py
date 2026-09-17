@@ -908,3 +908,71 @@ class TestTheAuditTrailIsNotTheRoomsToRead:
                           "arguments": {"query": "private"}},
                          session_id=session["id"])
         assert service.tool_calls(user_sub="nobody", is_admin=False, limit=500) == []
+
+
+def test_a_repeated_tool_call_is_answered_from_the_first_one(monkeypatch):
+    """The first real run spent eight of fourteen steps fetching one identical
+    PDF until the budget ran out. A model doing that is not making progress,
+    and the network should not be asked again to prove it."""
+    import json
+
+    from wisefood_mcp import ToolContext
+
+    from integrator.agent import Budget, IntegratorAgent
+
+    calls = []
+
+    class Registry:
+        def openai_schemas(self, include_writes=False):
+            return [{"type": "function", "function": {"name": "fetch_url"}}]
+
+        def call(self, name, args, ctx):
+            calls.append(json.loads(args) if isinstance(args, str) else args)
+            return {"ok": True, "result": {"fetched": True, "kind": "pdf",
+                                           "pending_artifact": "a" * 20}}
+
+    def fetch(**_kw):
+        return {"function": {"name": "fetch_url",
+                             "arguments": json.dumps({"url": "https://x/f.pdf"})},
+                "id": "c1", "type": "function"}
+
+    responses = [
+        {"choices": [{"message": {"content": "", "tool_calls": [fetch()]}}],
+         "usage": {"total_tokens": 10}},
+        {"choices": [{"message": {"content": "", "tool_calls": [fetch()]}}],
+         "usage": {"total_tokens": 10}},
+        {"choices": [{"message": {"content": "Done."}}], "usage": {"total_tokens": 10}},
+    ]
+    agent = IntegratorAgent(
+        registry=Registry(), tool_context=ToolContext(proposal_store=None),
+        groq_client=FakeGroq(*responses), budget=Budget(max_steps=10))
+    outcome = agent.run([], "find the Bulgarian guide")
+
+    assert len(calls) == 1, "the second identical fetch must not reach the tool"
+    # And the model is told, so it stops rather than trying a third time.
+    tool_turns = [m for m in outcome["messages"] if m["role"] == "tool"]
+    assert "repeated_call" in tool_turns[1]["content"]
+    assert "move on" in tool_turns[1]["content"]
+    timeline = [s.get("outcome") for s in outcome["timeline"]]
+    assert any("Already run this turn" in (o or "") for o in timeline)
+
+
+def test_the_catalog_client_points_at_the_catalog_not_the_gateway(monkeypatch):
+    """The gateway does not serve /guides or /articles, so aiming there made
+    every catalog tool return {"detail": "Not Found"} — the assistant could
+    never see what the platform already held."""
+    from integrator import service
+
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, base_url, credentials):
+            seen["base"] = base_url
+
+    import wisefood.client as wc
+    monkeypatch.setattr(wc, "DataClient", FakeClient)
+    monkeypatch.setitem(service.config.settings, "DATA_API_URL", "http://data-catalog:8000")
+    monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL", "http://wisefood-api:8000")
+
+    service._data_client("tok")
+    assert seen["base"] == "http://data-catalog:8000"

@@ -70,7 +70,12 @@ def _data_client(access_token: Optional[str] = None):
         logger.info("integrator: wisefood client not installed")
         return None
 
-    base = config.settings.get("WISEFOOD_API_URL")
+    # DATA_API_URL, not WISEFOOD_API_URL. The first is the data catalog, which
+    # serves /guides, /articles and the rest; the second is the gateway, which
+    # does not — pointing at it returned {"detail": "Not Found"} for every
+    # catalog tool, so the assistant could never see what the platform already
+    # held. `backend/platform.py` has always used DATA_API_URL; this did not.
+    base = config.settings.get("DATA_API_URL")
     if not base or not access_token:
         if not access_token:
             logger.info("integrator: no caller token, catalog tools disabled")

@@ -126,6 +126,12 @@ class IntegratorAgent:
         ]
         produced: List[Dict[str, Any]] = []
         stop_reason = "completed"
+        # What has already been run this turn, keyed by call. A model that
+        # fetches the same PDF seven times is not making progress, and the
+        # first real run did exactly that: eight of fourteen steps went on one
+        # identical URL until the budget ran out. Repeating a call returns what
+        # it returned before, says so, and costs no network.
+        seen: Dict[str, Any] = {}
         # What the curator sees while this runs and afterwards. Started here
         # rather than inside the tool loop so a turn that calls no tools still
         # says that it thought about the question.
@@ -190,15 +196,32 @@ class IntegratorAgent:
                 step = steps.start(kind, title, detail=detail,
                                    data={"tool": name})
 
-                outcome = self.registry.call(name, raw_args, self.ctx)
+                key = f"{name}:{json.dumps(parsed_args, sort_keys=True, default=str)}"
+                repeat = key in seen
+                if repeat:
+                    outcome = seen[key]
+                    if isinstance(outcome.get("result"), dict):
+                        outcome = {**outcome, "result": {
+                            **outcome["result"],
+                            "repeated_call": (
+                                "You already ran this exact call in this turn and "
+                                "this is what it returned. Nothing has changed. Use "
+                                "it and move on — repeating it again will not "
+                                "produce anything new."),
+                        }}
+                else:
+                    outcome = self.registry.call(name, raw_args, self.ctx)
+                    seen[key] = outcome
                 ok = bool(outcome.get("ok"))
                 if self.trace is not None:
                     self.trace.tool(name, parsed_args, ok, outcome.get("result"),
                                     step.get("elapsed_ms"))
                 payload = outcome.get("result") if ok else outcome.get("error")
-                steps.finish(step, ok=ok, outcome=finished_detail(
-                    name, parsed_args or {}, ok, outcome.get("result"),
-                    outcome.get("error")))
+                steps.finish(step, ok=ok, outcome=(
+                    "Already run this turn — reusing the answer"
+                    if repeat else finished_detail(
+                        name, parsed_args or {}, ok, outcome.get("result"),
+                        outcome.get("error"))))
 
                 tool_turn = {
                     "role": "tool",
