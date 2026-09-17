@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 
 KINDS = ("guide", "article", "textbook", "fctable", "rcollection")
 
+#: What each kind is for. A bare list of names told the model "artifact is
+#: not a kind of source" and left it to guess which one a ministry's PDF is;
+#: naming them costs a line and answers that.
+KIND_MEANINGS = {
+    "guide": "a dietary guideline document — a national FBDG, a ministry "
+             "circular, a brochure or poster carrying official advice",
+    "article": "a scientific paper, usually with a DOI",
+    "textbook": "a book read into retrievable passages",
+    "fctable": "a food composition table",
+    "rcollection": "a website of recipes, harvested rather than downloaded",
+}
+
 
 def propose_source(
     ctx: ToolContext,
@@ -63,8 +75,11 @@ def propose_source(
     from integrator.service import create_proposal
 
     if kind not in KINDS:
-        raise ToolError(f"{kind!r} is not a kind of source",
-                        allowed=list(KINDS))
+        raise ToolError(
+            f"{kind!r} is not a kind of source. A downloadable document is "
+            f"the kind of thing it contains, not 'artifact' — a national "
+            f"guideline PDF is a guide.",
+            allowed=KIND_MEANINGS, code="unknown_kind")
     if not (title or "").strip():
         raise ToolError("a proposal needs a title")
 
@@ -149,7 +164,8 @@ def suggest_source(
     offered, because a curator goes looking for it.
     """
     if kind not in KINDS:
-        raise ToolError(f"{kind!r} is not a kind of source", allowed=list(KINDS))
+        raise ToolError(f"{kind!r} is not a kind of source",
+                        allowed=KIND_MEANINGS, code="unknown_kind")
     if not (title or "").strip():
         raise ToolError("a suggestion needs a title")
 

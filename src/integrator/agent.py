@@ -40,6 +40,11 @@ TOOL_RESULT_CHARS = 8_000
 #: `compact_history`.
 KEEP_FULL_RESULTS = 3
 
+#: How many times one failing call may be tried before its failure is taken
+#: as the answer. Two, because the failure worth retrying is a dropped
+#: connection and the one that is not will not improve on the third go.
+MAX_ATTEMPTS = 2
+
 SYSTEM_PROMPT = """\
 You help a WiseFood curator find and integrate new sources into the platform's data catalog: national dietary guides, scientific articles, textbooks, food composition tables and recipe collections.
 
@@ -58,6 +63,7 @@ How to work:
 - A page that lists files is an index, not a document. `fetch_url` reports every document it links — PDFs, spreadsheets, and images, because a national guide is often published as a poster or a brochure — with the text that names each one. Use `outline_only` on a page like that: you get its headings and its files without its navigation, for a fraction of the words. Then open the files that matter.
 - Open a document once. `fetch_url` on a PDF tells you what it is, how many pages it has, and stashes it ready to attach — that is all you need to decide whether to propose it. Reading it page by page is the extraction pipeline's job and it does that after a curator approves, over the whole document, grounded in its pages.
 - When a curator gives you a journal — a link or a name — use `journal_articles` to list what it has published. A publisher's own journal page is usually closed to us, so do not keep trying `fetch_url` on it. It marks what the catalog already holds and reads the licence the publisher registered, so propose the open ones that are new and say how many you skipped as already held.
+- Never open recipes one at a time. A collection is imported in bulk by the recipe harvester when a curator approves it — one call, however many hundred recipes there are. Your job is to profile the site and say what is there, not to read it.
 - A recipe collection is a website, not a document, so there is nothing to open and read. Use `recipe_source` on the site: it finds where the site lists its pages, samples them, and reports how many carry machine-readable recipe markup. That share is the thing worth telling a curator — a site with thousands of pages and no markup has nothing we can import. Propose it with `harvest_location` as the source_url, and check the site's terms with `licence_evidence`, because a recipe corpus is content and copying it in needs a licence that permits that.
 - When a source states dietary rules but does not already list them — advice in prose, a web page, a summary chapter — use `infer_guidelines` on the text you fetched. It returns rules with the verbatim quote each came from, and drops any it cannot quote. Say plainly that those rules were *inferred from the text* rather than extracted from a structured document, and never present them as the source's own list. For a guide that ships as a PDF of numbered recommendations, do not use this: propose it and let the extraction pipeline read it, which is grounded in pages rather than in your reading.
 - For an article, pass the DOI to `propose_source` and move on. The integration run reads the publisher's record from Crossref when a curator approves, and refuses to create anything if that DOI has no record — so the citation is guaranteed at the point it matters and you do not have to establish it for every candidate you merely considered. Give the title as you found it; the record corrects it. Never present a citation you typed as if you had checked it.
@@ -153,6 +159,9 @@ class IntegratorAgent:
         # identical URL until the budget ran out. Repeating a call returns what
         # it returned before, says so, and costs no network.
         seen: Dict[str, Any] = {}
+        #: Failures per call, so a transient one can be retried and a
+        #: permanent one still stops.
+        attempts: Dict[str, int] = {}
         # What the curator sees while this runs and afterwards. Started here
         # rather than inside the tool loop so a turn that calls no tools still
         # says that it thought about the question.
@@ -227,7 +236,19 @@ class IntegratorAgent:
                         }}
                 else:
                     outcome = self.registry.call(name, raw_args, self.ctx)
-                    seen[key] = outcome
+                    # Only a result worth reusing is remembered. Caching a
+                    # failure turned one dropped connection into a permanent
+                    # refusal: a government PDF died mid-transfer, and every
+                    # retry after it came back "already run this turn" with
+                    # the same error, so the turn could never recover from a
+                    # blip. A call that keeps failing still stops, at
+                    # MAX_ATTEMPTS, so this cannot become a loop.
+                    if outcome.get("ok"):
+                        seen[key] = outcome
+                    else:
+                        attempts[key] = attempts.get(key, 0) + 1
+                        if attempts[key] >= MAX_ATTEMPTS:
+                            seen[key] = outcome
                 ok = bool(outcome.get("ok"))
                 if self.trace is not None:
                     self.trace.tool(name, parsed_args, ok, outcome.get("result"),

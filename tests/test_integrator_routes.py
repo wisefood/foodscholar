@@ -795,3 +795,64 @@ class TestWhatATurnFiledIsRecordedNotNarrated:
                                 groq_client=Groq(), budget=Budget(max_steps=5))
         out = agent.run_streamed([], "anything", lambda *_a: None)
         assert self._filed(out) == []
+
+
+class TestATransientFailureCanBeTriedAgain:
+    """A 28 MB PDF died mid-transfer, and every retry after it came back
+    "already run this turn" with the same error — the repeat guard was
+    remembering failures, so one dropped connection became permanent for the
+    rest of the turn."""
+
+    def _agent(self, outcomes):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        calls = []
+        queue = list(outcomes)
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "fetch_url"}}]
+
+            def call(self, name, args, ctx):
+                calls.append(args)
+                return queue.pop(0) if queue else {"ok": True, "result": {}}
+
+        class Groq:
+            def __init__(self):
+                one = [_delta(tool_calls=[{
+                    "index": 0, "id": "c", "type": "function",
+                    "function": {"name": "fetch_url",
+                                 "arguments": json.dumps({"url": "https://g/KIDS.pdf"})}}]),
+                    _usage(1)]
+                self.replies = [list(one) for _ in range(4)] + [
+                    [_delta(content="done"), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=8))
+        return agent.run_streamed([], "read it", lambda *_a: None), calls
+
+    def test_a_failure_does_not_become_the_permanent_answer(self):
+        fail = {"ok": False, "error": {"message": "peer closed connection"}}
+        good = {"ok": True, "result": {"pending_artifact": "p1"}}
+        _out, calls = self._agent([fail, good])
+        assert len(calls) >= 2, "the second attempt actually ran"
+
+    def test_a_call_that_keeps_failing_still_stops(self):
+        """Retrying is not looping: the third identical failure is the answer."""
+        from integrator.agent import MAX_ATTEMPTS
+
+        fail = {"ok": False, "error": {"message": "gone"}}
+        _out, calls = self._agent([fail] * 6)
+        assert len(calls) <= MAX_ATTEMPTS
+
+    def test_a_success_is_still_only_run_once(self):
+        good = {"ok": True, "result": {"pending_artifact": "p1"}}
+        _out, calls = self._agent([good] * 6)
+        assert len(calls) == 1

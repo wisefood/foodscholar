@@ -20,6 +20,7 @@ from __future__ import annotations
 
 
 import re
+from pathlib import Path
 import pytest
 
 
@@ -44,13 +45,30 @@ class FakeProxy:
 
 
 class FakeArtifacts:
+    """Upload and download, because the textbook path does both.
+
+    It only had `upload` before, and the textbook tests passed anyway — the
+    run never reached the chunker, because without a pending handle on the
+    proposal nothing was ever uploaded to chunk. Now that the run fetches the
+    document itself the path is real, and the fake has to be too.
+    """
+
     def __init__(self, artifact_id="art-1"):
         self.artifact_id = artifact_id
         self.uploads = []
+        self.downloads = []
+        #: What a download writes. A PDF header is enough for the readers
+        #: that only check what kind of file they were handed.
+        self.content = b"%PDF-1.4\n" + b"0" * 2000
 
     def upload(self, path, **kw):
         self.uploads.append({"path": path, **kw})
         return {"id": self.artifact_id}
+
+    def download_to(self, artifact_uuid, target):
+        self.downloads.append(artifact_uuid)
+        Path(target).write_bytes(self.content)
+        return target
 
 
 class FakeDataClient:
@@ -372,9 +390,14 @@ def test_the_spec_falls_back_to_what_the_proposal_knows(store):
     proposal = make_proposal(store, rationale="Fills the Bulgaria gap")
     spec = guide_spec(proposal)
     assert spec["title"] == "Bulgarian FBDG for adults"
-    assert spec["region"] == "Bulgaria"
-    assert spec["language"] == "Bulgarian"
+    # Codes, not names: the catalog takes ISO 3166-1 alpha-2 and ISO 639-1,
+    # and refused "Bulgaria" with `String should have at most 2 characters`.
+    assert spec["region"] == "BG"
+    assert spec["language"] == "bg"
     assert spec["description"] == "Fills the Bulgaria gap"
+    # Both required by the schema, and a guide's real content only exists
+    # after the extraction that runs later.
+    assert "extraction" in spec["content"].lower()
 
 
 def test_a_spec_the_assistant_wrote_wins(store):
@@ -388,7 +411,7 @@ def test_a_spec_the_assistant_wrote_wins(store):
     assert spec["title"] == "Хранене и здраве"
     assert spec["region"] == "BG"
     assert spec["publication_date"] == "2021"
-    assert spec["language"] == "Bulgarian", "and the floor still fills the rest"
+    assert spec["language"] == "bg", "and the floor still fills the rest, as a code"
 
 
 # --------------------------------------------------------------- articles --
@@ -1067,3 +1090,39 @@ class TestTheRunOpensTheDocumentItself:
         ex._fetch_the_document()
         assert any(tool == "fetch_url" for tool, _ in seen)
         assert ex.proposal.metadata["pending_artifact"] == "pend-1"
+
+
+def test_the_staged_document_is_dropped_when_the_run_ends(registry, store, fetched_file):
+    """Nothing deleted these, so every PDF ever fetched stayed in the pod's
+    temporary directory. One Greek national guide is 28 MB, and ephemeral
+    storage filling up is how a pod gets evicted."""
+    from wisefood_mcp.tools.research import pending_artifact_path
+
+    proposal = make_proposal(store)
+    ctx, _core = make_context(store, data_client=FakeDataClient())
+    staged = pending_artifact_path(HANDLE)
+    assert staged.exists()
+
+    outcome, _saved = run_integration(proposal, registry, ctx)
+    assert outcome["status"] == "succeeded", outcome.get("error")
+    assert not staged.exists(), "the catalog has it; the pod does not need it"
+
+
+def test_a_failed_run_keeps_the_document_for_the_retry(registry, store, fetched_file):
+    """A retry that still has the file does not download twenty-eight
+    megabytes again from the server that was dropping the connection in the
+    first place. The sweep collects it if no retry ever comes."""
+    from wisefood_mcp.tools.research import pending_artifact_path
+
+    proposal = make_proposal(store)
+    client = FakeDataClient()
+
+    def refuse(**_fields):
+        raise RuntimeError("the catalog said no")
+
+    client.guides.create = refuse
+    ctx, _core = make_context(store, data_client=client)
+
+    outcome, _saved = run_integration(proposal, registry, ctx)
+    assert outcome["status"] == "failed"
+    assert pending_artifact_path(HANDLE).exists()

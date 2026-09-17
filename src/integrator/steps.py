@@ -155,11 +155,15 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
     if tool == "recipe_source":
         if not data.get("harvestable"):
             return (data.get("reason")
-                    or f"no machine-readable recipes in {data.get('sampled') or 0} sampled pages")
-        share = int(round(float(data.get("markup_share") or 0) * 100))
+                    or f"no recipes found in {data.get('sampled') or 0} sampled pages")
+        share = int(round(float(data.get("recipe_share") or 0) * 100))
         estimate = data.get("estimated_recipes")
-        return (f"{share}% of sampled pages carry recipe markup"
-                + (f" — about {estimate:,} recipes" if estimate else ""))
+        # How they are published matters as much as how many: a curator
+        # reading this decides whether the import gets ingredients as data or
+        # pages that still have to be read.
+        forms = ", ".join(sorted(data.get("published_as") or {})) or "recipes"
+        return (f"{share}% of sampled pages are recipes ({forms})"
+                + (f" — about {estimate:,} in all" if estimate else ""))
 
     if tool == "import_recipe_source":
         where = data.get("location") or "the source"

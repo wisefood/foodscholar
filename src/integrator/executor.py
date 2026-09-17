@@ -30,8 +30,9 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 
+from wisefood_mcp.codes import country_code, language_code
 from wisefood_mcp.stores import content_permitted
-from wisefood_mcp.tools.research import pending_artifact_path
+from wisefood_mcp.tools.research import discard_pending, pending_artifact_path
 
 from integrator.steps import StepTracker, finished_detail, running_title
 
@@ -80,12 +81,37 @@ def guide_spec(proposal) -> Dict[str, Any]:
     spec.setdefault("title", proposal.title)
     if proposal.source_url:
         spec.setdefault("url", proposal.source_url)
-    if proposal.country:
-        spec.setdefault("region", proposal.country)
-    if proposal.language:
-        spec.setdefault("language", proposal.language)
-    if proposal.rationale:
-        spec.setdefault("description", proposal.rationale)
+    # Codes, not names. A proposal says "Greece" and "Greek" because that is
+    # what a curator reads; the catalog takes ISO 3166-1 alpha-2 and ISO
+    # 639-1 and refused both outright.
+    region = country_code(spec.get("region") or proposal.country)
+    if region:
+        spec["region"] = region
+    else:
+        spec.pop("region", None)
+    language = language_code(spec.get("language") or proposal.language)
+    if language:
+        spec["language"] = language
+    else:
+        spec.pop("language", None)
+
+    # `description` and `content` are both required and neither is optional
+    # in practice: a guide's real content arrives from the extraction that
+    # runs after this, so what goes in now says exactly that rather than
+    # inventing a summary of a document nobody has read yet.
+    spec.setdefault("description", proposal.rationale
+                    or f"{proposal.title} — registered from its published source.")
+    # `content` is required by the schema, and what belongs in it depends on
+    # whether we may copy the document at all. Under a licence that permits
+    # it, the real text arrives from the extraction that runs after this, so
+    # the placeholder says exactly that. Under one that does not, the catalog
+    # gets the reference and no text — and the field has to stay empty, or
+    # the write tool reads a populated `content` as content being copied and
+    # refuses the very pointer it is supposed to register.
+    spec.setdefault("content", (
+        "Awaiting extraction. The guidelines in this document are read from "
+        "its pages by the extraction pipeline once this entry exists."
+    ) if content_permitted(proposal) else "")
     return spec
 
 
@@ -232,6 +258,24 @@ class Integration:
 
     # ------------------------------------------------------------ the pipeline --
     def run(self) -> Dict[str, Any]:
+        outcome = self._run()
+        # The staged document is a buffer for this run and nothing after it:
+        # the catalog holds the artifact in object storage, which is where it
+        # belongs. Nothing used to delete these, so every PDF ever fetched
+        # stayed in the pod's temporary directory — one Greek national guide
+        # is 28 MB, and ephemeral storage filling up is how a pod gets
+        # evicted.
+        #
+        # Only on success. A failed run is usually retried, and a retry that
+        # still has the file does not download twenty-eight megabytes again
+        # from a server that was dropping the connection in the first place.
+        # The sweep collects it if no retry ever comes.
+        handle = (self.proposal.metadata or {}).get("pending_artifact")
+        if handle and outcome.get("status") == "succeeded":
+            discard_pending(handle)
+        return outcome
+
+    def _run(self) -> Dict[str, Any]:
         try:
             self._preflight()
             # A recipe collection is harvested, not created and filled: there
@@ -324,6 +368,16 @@ class Integration:
         wants_file = content_permitted(self.proposal)
         if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file:
             self._fetch_the_document()
+        # The catalog requires a licence on a guide, and `approve` guarantees
+        # that a proposal without one carries a written reason instead — so
+        # this only fires if a proposal reached here some other way.
+        if self.proposal.kind == "guide" and not (
+                self.proposal.licence or self.proposal.licence_override_reason):
+            raise IntegrationError(
+                "a guide cannot be created without a licence — the catalog "
+                "requires one. Set it on the proposal, or approve it again "
+                "with a reason recorded. Nothing was created.")
+
         if not wants_file:
             self.steps.add(
                 "licence", "Registering a pointer only",
