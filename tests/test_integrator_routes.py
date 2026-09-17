@@ -404,3 +404,42 @@ class TestProposingIsReachable:
         assert finished_detail("propose_source", {}, True,
                                {"filed": "X is now in the panel"}, None) \
             == "X is now in the panel"
+
+
+def test_a_provider_that_rejects_stream_options_still_streams():
+    """Not every provider — or proxy in front of one — takes the option. A
+    turn that dies on an unknown parameter is worse than a turn whose tokens
+    are estimated."""
+    from wisefood_mcp import ToolContext
+
+    from integrator.agent import Budget, IntegratorAgent
+
+    class Registry:
+        def openai_schemas(self, include_writes=False):
+            return []
+
+        def call(self, name, args, ctx):
+            return {"ok": True, "result": {}}
+
+    class Groq:
+        def __init__(self):
+            self.attempts = []
+            self.chat = type("C", (), {"completions": self})()
+
+        def create(self, **kw):
+            self.attempts.append(kw)
+            if "stream_options" in kw:
+                raise ValueError("unrecognized request argument: stream_options")
+            return iter([_delta(content="Answer.")])
+
+    groq = Groq()
+    agent = IntegratorAgent(registry=Registry(),
+                            tool_context=ToolContext(proposal_store=None),
+                            groq_client=groq, budget=Budget(max_steps=5))
+    outcome = agent.run_streamed([], "hello", lambda *_a: None)
+
+    assert outcome["reply"] == "Answer."
+    assert len(groq.attempts) == 2, "it retried without the option"
+    # No usage frame came back, so the budget charges an estimate. A step that
+    # costs nothing is a step the budget cannot stop.
+    assert outcome["tokens"] > 0

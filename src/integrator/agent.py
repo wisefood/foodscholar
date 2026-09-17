@@ -277,9 +277,21 @@ class IntegratorAgent:
         calls: Dict[int, Dict[str, Any]] = {}
         usage: Dict[str, Any] = {}
         # Ask for usage on the final frame: without it a streamed turn reports
-        # no tokens at all, and the budget stops being a budget.
-        stream = self.groq.chat.completions.create(
-            **kwargs, stream=True, stream_options={"include_usage": True})
+        # no tokens at all, and the budget stops being a budget. Not every
+        # provider or proxy in front of one accepts the option, and a turn
+        # that dies on an unknown parameter is worse than a turn whose tokens
+        # are estimated — so it is asked for, not required.
+        try:
+            stream = self.groq.chat.completions.create(
+                **kwargs, stream=True, stream_options={"include_usage": True})
+        except TypeError:
+            stream = self.groq.chat.completions.create(**kwargs, stream=True)
+        except Exception as exc:  # noqa: BLE001
+            if "stream_options" not in str(exc):
+                raise
+            logger.info("integrator: provider rejected stream_options; "
+                        "streaming without usage")
+            stream = self.groq.chat.completions.create(**kwargs, stream=True)
         for chunk in stream:
             frame = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
             if frame.get("usage"):
@@ -293,6 +305,13 @@ class IntegratorAgent:
                 content.append(piece)
                 self._say("text", {"delta": piece})
             _merge_tool_call_deltas(calls, delta.get("tool_calls") or [])
+
+        if not usage:
+            # No usage frame came back. Charge a rough estimate rather than
+            # zero: a step that costs nothing is a step the budget cannot
+            # stop, which is the runaway this whole class exists to prevent.
+            spent = sum(len(str(m.get("content") or "")) for m in messages)
+            usage = {"total_tokens": (spent + len("".join(content))) // 4}
 
         message: Dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if calls:
