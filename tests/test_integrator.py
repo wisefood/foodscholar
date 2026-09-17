@@ -976,3 +976,47 @@ def test_the_catalog_client_points_at_the_catalog_not_the_gateway(monkeypatch):
 
     service._data_client("tok")
     assert seen["base"] == "http://data-catalog:8000"
+
+
+
+# ---------------------------------------------------------------- proposing --
+
+class TestFilingAProposal:
+    """The agent can actually file what it finds.
+
+    It could not before: `propose_source` did not exist, so a conversation
+    ended with a table of recommendations in prose and a review panel with
+    nothing in it. `create_proposal` was in the service with no caller.
+    """
+
+    def _ctx(self, session_id=None):
+        from wisefood_mcp import ToolContext
+        return ToolContext(proposal_store=None, actor="expert-1",
+                           extra={"session_id": session_id})
+
+    def test_a_filed_source_turns_up_in_the_panel(self):
+        from integrator import service
+        from integrator.propose import propose_source
+
+        session = service.create_session(user_sub="expert-1")
+        out = propose_source(
+            self._ctx(session["id"]), kind="guide",
+            title="Bulgarian FBDG for adults",
+            source_url="https://ncpha.bg/fbdg.pdf", country="Bulgaria",
+            rationale="fills a gap: no Bulgarian guide is held",
+        )
+        assert out["status"] == "proposed"
+        listed = service.list_proposals(session_id=session["id"])
+        assert [p["title"] for p in listed] == ["Bulgarian FBDG for adults"]
+        # Scored here, not by the model.
+        assert listed[0]["proposed_rank"] is not None
+        assert listed[0]["metadata"]["ranking"]["breakdown"]
+
+    def test_what_comes_back_is_short(self):
+        """The result is re-sent on every remaining step of the turn, so it
+        carries what the model needs and not its own submission."""
+        from integrator.propose import propose_source
+
+        out = propose_source(self._ctx(), kind="article", title="A paper")
+        assert set(out) == {"proposal_id", "status", "rank", "filed", "note"}
+        assert len(str(out)) < 400

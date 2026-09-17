@@ -21,7 +21,7 @@ transformers==4.49.0
 # Deliberately NOT the [mcp] extra: that pulls the MCP SDK, which needs
 # starlette>=1.0 and would fight FastAPI here. Only the standalone
 # `wisefood-mcp` server process needs that extra.
-wisefood>=0.0.32
+wisefood>=0.0.33
 # The integrator's agent loop drives tool-calling through the raw Groq SDK —
 # langchain-groq pulls it in, but a module that imports it should say so.
 groq>=0.30

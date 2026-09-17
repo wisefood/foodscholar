@@ -17,6 +17,8 @@ from models.db import (
     IntegratorBacklogItem, IntegratorMessage, IntegratorSession, IntegratorToolCall,
 )
 from wisefood_mcp import ToolContext, build_registry
+
+from integrator import propose as _propose
 from wisefood_mcp.stores import Proposal, approve as approve_proposal, new_proposal_id
 
 from integrator.agent import IntegratorAgent, new_session_id, replay
@@ -25,6 +27,9 @@ from integrator.store import PostgresProposalStore, record_tool_call
 logger = logging.getLogger(__name__)
 
 _REGISTRY = build_registry()
+# Filing a proposal is this service's own tool: it scores what it files, and
+# the rubric is here. See integrator/propose.py.
+_propose.register(_REGISTRY)
 _STORE = PostgresProposalStore()
 
 
@@ -101,6 +106,9 @@ def tool_context(*, user_sub: str, session_id: Optional[str] = None,
         actor=user_sub,
         contact_email=config.settings.get("INTEGRATOR_CONTACT_EMAIL"),
         recorder=lambda record: record_tool_call(record, session_id=session_id),
+        # `propose_source` files against the conversation it came from, so a
+        # curator can see which question produced which candidates.
+        extra={"session_id": session_id},
     )
 
 

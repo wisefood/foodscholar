@@ -27,6 +27,7 @@ def _plural(n: int, one: str, many: Optional[str] = None) -> str:
 #: few: a curator scanning a timeline wants to see shapes, not a taxonomy.
 RUNNING: Dict[str, tuple] = {
     "research": ("search", "Searching the web"),
+    "propose_source": ("propose", "Filing a proposal"),
     "fetch_url": ("read", "Opening the page"),
     "licence_evidence": ("licence", "Checking the licence"),
     "doi_metadata": ("read", "Looking up the DOI"),
@@ -120,6 +121,11 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
         if count == 0:
             return "Nothing in the catalog matches — this would fill a gap"
         return f"{_plural(int(count or 0), 'match', 'matches')} already in the catalog"
+
+    if tool == "propose_source":
+        # Says where it went, because the panel is on the same screen and the
+        # curator's next move is to look at it.
+        return data.get("filed") or "Filed for review"
 
     if tool == "get_entity":
         return f"Read {data.get('title') or data.get('urn') or 'the entry'}"

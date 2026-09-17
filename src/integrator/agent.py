@@ -29,6 +29,16 @@ from integrator.steps import StepTracker, finished_detail, running_title
 
 logger = logging.getLogger(__name__)
 
+#: How much of one tool result the model is shown. A fetched PDF runs to tens
+#: of thousands of characters and the useful part is near the front; what is
+#: past this is almost always boilerplate that gets paid for on every
+#: subsequent step of the turn.
+TOOL_RESULT_CHARS = 8_000
+
+#: How many recent tool results stay in full. Older ones are compacted — see
+#: `compact_history`.
+KEEP_FULL_RESULTS = 3
+
 SYSTEM_PROMPT = """\
 You help a WiseFood curator find and integrate new sources into the platform's data catalog: national dietary guides, scientific articles, textbooks, food composition tables and recipe collections.
 
@@ -46,9 +56,10 @@ How to work:
 - Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say.
 - When a source states dietary rules but does not already list them — advice in prose, a web page, a summary chapter — use `infer_guidelines` on the text you fetched. It returns rules with the verbatim quote each came from, and drops any it cannot quote. Say plainly that those rules were *inferred from the text* rather than extracted from a structured document, and never present them as the source's own list. For a guide that ships as a PDF of numbered recommendations, do not use this: propose it and let the extraction pipeline read it, which is grounded in pages rather than in your reading.
 - For an article, always run `doi_metadata` first and propose from what it returns. Never type a title, author list or year out of a search result: a citation that reads perfectly and is wrong is the single worst thing you can put in this catalog, and Crossref has the record the publisher deposited. If a DOI is not registered there, say so rather than filling the gap yourself.
-- Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three.
+- Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three. Its counts include drafts: an entry somebody has already brought in but not yet published is not a gap, so read `by_status` and say when what you found is already there as a draft. Give the country and language in whatever form you have — a name or an ISO code, both are resolved — and if it says it cannot resolve one, fix the name rather than reading the empty result as an absence.
 - Establish the licence with `licence_evidence` and quote what you found. Never assert a licence you have no evidence for; say it is undetermined instead, and say what that means — a curator can still approve it, but only by writing down why.
-- Create a proposal for each candidate worth a curator's attention, with a rank, a short rationale, and the integration steps you intend.
+- File each candidate worth a curator's attention with `propose_source`, one call per source. This is the only way anything you find reaches a person: a source you describe in your answer but do not file does not exist as far as the console is concerned, and the curator's panel stays empty. Do it as you go, before you write your summary — not after, and never instead. Give it the licence and evidence exactly as `licence_evidence` returned them, a short rationale, and the integration steps you intend.
+- Then say what you filed, with the titles. Do not tell the curator to create proposals; you have already created them and they are waiting in the panel.
 
 Be transparent about your own work. Say what you searched for, which pages you actually read, and which of your conclusions rest on evidence you found versus on inference. When you are unsure, say what would settle it.
 
@@ -153,18 +164,9 @@ class IntegratorAgent:
                                  "steps": steps.snapshot()})
                 return self._result(produced, note, stop_reason, steps)
 
-            completion = self.groq.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=self.tools or None,
-                tool_choice="auto" if self.tools else None,
-                temperature=0.2,
-                max_tokens=2000,
-            )
-            data = completion.model_dump() if hasattr(completion, "model_dump") else completion
-            self.budget.spend((data.get("usage") or {}).get("total_tokens", 0))
+            message, usage = self._complete(messages)
+            self.budget.spend((usage or {}).get("total_tokens", 0))
 
-            message = data["choices"][0]["message"]
             calls = message.get("tool_calls") or []
             if thinking is not None:
                 steps.finish(thinking, outcome=(
@@ -232,11 +234,70 @@ class IntegratorAgent:
                     "role": "tool",
                     "tool_call_id": call.get("id"),
                     "tool_name": name,
-                    "content": json.dumps(payload, default=str)[:24_000],
+                    "content": json.dumps(payload, default=str)[:TOOL_RESULT_CHARS],
                 }
                 messages.append({k: v for k, v in tool_turn.items()
                                  if k not in ("tool_name", "steps")})
                 produced.append(tool_turn)
+
+    # ---------------------------------------------------------- completion --
+    def _complete(self, messages) -> tuple:
+        """One model call, returning (message, usage).
+
+        Streamed when a listener is attached, so the answer types out as the
+        model writes it rather than landing whole after a silence — on a turn
+        that has already spent a minute searching, the last thing a curator
+        should get is another wait with nothing moving. Unstreamed otherwise:
+        a background run has nobody to show deltas to, and the single response
+        is less to go wrong.
+
+        Either way the return shape is the same, so the loop above cannot
+        tell which happened. That matters because the loop is what decides
+        which tools run, and it should not grow a second path.
+        """
+        streaming = getattr(self, "_emit", None) is not None
+        kwargs = dict(
+            model=self.model,
+            # Compacted here rather than in the loop: the loop's list is the
+            # transcript that gets persisted, and what is persisted should be
+            # what actually happened, not what we could afford to re-send.
+            messages=compact_history(messages),
+            tools=self.tools or None,
+            tool_choice="auto" if self.tools else None,
+            temperature=0.2,
+            max_tokens=2000,
+        )
+        if not streaming:
+            completion = self.groq.chat.completions.create(**kwargs)
+            data = (completion.model_dump() if hasattr(completion, "model_dump")
+                    else completion)
+            return data["choices"][0]["message"], data.get("usage") or {}
+
+        content: List[str] = []
+        calls: Dict[int, Dict[str, Any]] = {}
+        usage: Dict[str, Any] = {}
+        # Ask for usage on the final frame: without it a streamed turn reports
+        # no tokens at all, and the budget stops being a budget.
+        stream = self.groq.chat.completions.create(
+            **kwargs, stream=True, stream_options={"include_usage": True})
+        for chunk in stream:
+            frame = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+            if frame.get("usage"):
+                usage = frame["usage"]
+            choices = frame.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                content.append(piece)
+                self._say("text", {"delta": piece})
+            _merge_tool_call_deltas(calls, delta.get("tool_calls") or [])
+
+        message: Dict[str, Any] = {"role": "assistant", "content": "".join(content)}
+        if calls:
+            message["tool_calls"] = [calls[i] for i in sorted(calls)]
+        return message, usage
 
     # ------------------------------------------------------ streamed turn --
     def run_streamed(self, history: List[Dict[str, Any]], user_message: str,
@@ -285,6 +346,87 @@ class IntegratorAgent:
             "tokens": self.budget.tokens,
             "model": self.model,
         }
+
+
+def compact_history(messages: List[Dict[str, Any]],
+                    keep_full: int = KEEP_FULL_RESULTS) -> List[Dict[str, Any]]:
+    """Shrink the tool results the model no longer needs in full.
+
+    A conversation is re-sent in its entirety on every step, so a tool result
+    is not paid for once — it is paid for on every step after it, and again on
+    every later turn that replays it. One fetched PDF across an eight-step
+    turn is the same eight thousand characters billed eight times, which is
+    how a single question reaches a hundred thousand tokens without doing
+    anything a curator would call expensive.
+
+    What the model actually needs in full is the last few results — the ones
+    it is reasoning about right now. Older ones it needs to *remember*: that
+    it fetched this URL, and roughly what came back, so it does not fetch it
+    again. That fits in a couple of hundred characters.
+
+    The messages themselves are kept, never dropped. A tool result whose
+    matching call has gone is a 400 from the provider, and a conversation
+    that worked yesterday failing after a restart is a worse bug than a
+    large bill.
+    """
+    indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(indices) <= keep_full:
+        return messages
+
+    stale = set(indices[:-keep_full]) if keep_full else set(indices)
+    out: List[Dict[str, Any]] = []
+    for i, message in enumerate(messages):
+        if i in stale:
+            out.append({**message, "content": _digest(message.get("content") or "")})
+        else:
+            out.append(message)
+    return out
+
+
+def _digest(content: str) -> str:
+    """The head of a result, and an honest note that the rest is gone.
+
+    Said in words the model can act on: it is told the content was trimmed
+    and that re-running the call will not bring it back, because the obvious
+    failure here is a model that notices something is missing and spends a
+    step fetching it again.
+    """
+    if len(content) <= 400:
+        return content
+    return (content[:400]
+            + f" …[{len(content) - 400:,} more characters trimmed to save "
+              "context. This is the full result you already saw earlier in "
+              "this turn; running the call again returns the same thing and "
+              "will not restore the detail.]")
+
+
+def _merge_tool_call_deltas(calls: Dict[int, Dict[str, Any]], deltas) -> None:
+    """Fold streamed tool-call fragments into `calls`, keyed by index.
+
+    A streamed tool call arrives in pieces: the id and name once, then the
+    arguments a few characters at a time across many frames, and several
+    calls interleaved. The index is the only thing that identifies which
+    call a fragment belongs to — ids are absent from every frame but the
+    first — so it is what this keys on. Concatenating in arrival order is
+    correct because a stream is ordered; the failure this avoids is
+    *overwriting*, which silently truncates the arguments to their last
+    fragment and hands the loop a call it cannot parse.
+    """
+    for delta in deltas:
+        index = delta.get("index", 0)
+        call = calls.setdefault(index, {
+            "id": "", "type": "function",
+            "function": {"name": "", "arguments": ""},
+        })
+        if delta.get("id"):
+            call["id"] = delta["id"]
+        if delta.get("type"):
+            call["type"] = delta["type"]
+        fn = delta.get("function") or {}
+        if fn.get("name"):
+            call["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            call["function"]["arguments"] += fn["arguments"]
 
 
 def _describe_intent(calls) -> str:
