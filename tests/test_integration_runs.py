@@ -19,6 +19,7 @@ from __future__ import annotations
 
 
 
+import re
 import pytest
 
 
@@ -32,8 +33,11 @@ class FakeProxy:
         self.hits = []
 
     def create(self, **fields):
+        # The catalog takes a urn *slug* and returns the full urn, prepending
+        # the kind itself. `**fields` first so the slug the tool sent does
+        # not overwrite what the catalog answers with.
         self.created.append(fields)
-        return {"urn": self.urn, **fields}
+        return {**fields, "urn": self.urn}
 
     def search(self, q, limit=10):
         return list(self.hits)[:limit]
@@ -193,17 +197,26 @@ def test_the_timeline_says_what_it_did(registry, store):
     assert "Created 5 guidelines" in outcomes
 
 
-def test_provenance_travels_with_the_entity(registry, store):
+def test_a_guide_carries_no_extras_because_its_schema_forbids_them(registry, store):
+    """This test used to assert the opposite, and the catalog had never
+    accepted it: `GuideCreationSchema` is extra="forbid" with no extras
+    field, so the first real integration stopped on
+    `body.extras: Extra inputs are not permitted`.
+
+    The provenance is not lost, only not on the entity — the proposal records
+    who approved it and when, and the run's calls are in the audit trail.
+    """
     proposal = make_proposal(store)
     client = FakeDataClient()
     ctx, _core = make_context(store, data_client=client)
     run_integration(proposal, registry, ctx)
 
-    integration = client.guides.created[0]["extras"]["integration"]
-    assert integration["proposal_id"] == proposal.id
-    assert integration["approved_by"] == "curator-1"
-    assert integration["source_url"] == "https://ncpha.bg/fbdg.pdf"
-    assert integration["licence"] == "CC-BY-4.0"
+    created = client.guides.created[0]
+    assert "extras" not in created
+    assert created["license"] == "CC-BY-4.0"
+    assert created["url"] == "https://ncpha.bg/fbdg.pdf"
+    # And the urn every create schema requires, which was never sent.
+    assert re.match(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$", created["urn"]), created["urn"]
 
 
 # ------------------------------------------------------------- refusals --
@@ -985,3 +998,72 @@ class TestHarvestingARecipeCollection:
             {"finished": True, "status": "done", "found": 2, "written": 2}])
         ex.run()
         assert seen[0][1]["region"] == "IE"
+
+
+class TestTheRunOpensTheDocumentItself:
+    """The preflight demanded a `pending_artifact` handle that the
+    conversation was supposed to have left on the proposal. Nothing ever left
+    one — `fetch_url` returns the handle to the model and no tool writes it
+    down — so every guide and textbook whose licence permitted its content
+    stopped at preflight, telling the curator to do something they cannot do.
+    """
+
+    def _run(self, *, source_url="https://health.example/guide.pdf", fetched=None,
+             metadata=None):
+        from wisefood_mcp import ToolContext
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        from integrator.executor import Integration
+
+        seen = []
+
+        class Registry:
+            def call(self, tool, args, ctx):
+                import json as _json
+                parsed = _json.loads(args) if isinstance(args, str) else args
+                seen.append((tool, parsed))
+                if tool == "fetch_url":
+                    return {"ok": True, "result": fetched if fetched is not None
+                            else {"pending_artifact": "pend-1", "page_count": 41}}
+                return {"ok": True, "result": {}}
+
+        proposal = Proposal(
+            id=new_proposal_id(), kind="guide", title="A guide", status="approved",
+            licence="CC-BY-4.0", source_url=source_url, metadata=metadata or {})
+        ex = Integration(proposal=proposal, registry=Registry(),
+                         ctx=ToolContext(proposal_store=None, data_client=object()),
+                         persist=lambda _s: None, poll_interval=0,
+                         sleep=lambda _s: None)
+        return ex, seen
+
+    def test_the_document_is_fetched_during_the_run(self):
+        ex, seen = self._run()
+        ex._fetch_the_document()
+        assert ("fetch_url", {"url": "https://health.example/guide.pdf"}) in seen
+        assert ex.proposal.metadata["pending_artifact"] == "pend-1"
+
+    def test_a_page_that_is_not_a_document_stops_the_run_with_a_reason(self):
+        from integrator.executor import IntegrationError
+
+        ex, _seen = self._run(fetched={"fetched": False, "reason": "the site refused"})
+        with pytest.raises(IntegrationError) as caught:
+            ex._fetch_the_document()
+        assert "the site refused" in str(caught.value)
+        assert "nothing was created" in str(caught.value)
+
+    def test_a_proposal_with_no_source_url_is_refused(self):
+        from integrator.executor import IntegrationError
+
+        ex, _seen = self._run(source_url=None)
+        with pytest.raises(IntegrationError) as caught:
+            ex._fetch_the_document()
+        assert "no source URL" in str(caught.value)
+
+    def test_a_stale_handle_is_fetched_again(self):
+        """A pending handle names a file in the pod's temp directory. A
+        proposal approved the next morning, or after a restart, carries a
+        handle pointing at nothing."""
+        ex, seen = self._run(metadata={"pending_artifact": "gone-with-the-pod"})
+        ex._fetch_the_document()
+        assert any(tool == "fetch_url" for tool, _ in seen)
+        assert ex.proposal.metadata["pending_artifact"] == "pend-1"

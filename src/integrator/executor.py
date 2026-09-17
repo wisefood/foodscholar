@@ -31,6 +31,7 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 
 from wisefood_mcp.stores import content_permitted
+from wisefood_mcp.tools.research import pending_artifact_path
 
 from integrator.steps import StepTracker, finished_detail, running_title
 
@@ -320,18 +321,56 @@ class Integration:
             self._resolve_the_citation()
             self._refuse_a_duplicate_doi()
 
-        handle = (self.proposal.metadata or {}).get("pending_artifact")
         wants_file = content_permitted(self.proposal)
-        if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file and not handle:
-            raise IntegrationError(
-                "no fetched file to read — open the source PDF with fetch_url "
-                "first, so its handle is on the proposal")
+        if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file:
+            self._fetch_the_document()
         if not wants_file:
             self.steps.add(
                 "licence", "Registering a pointer only",
                 detail=self.proposal.licence,
                 outcome=("this licence does not permit copying the content in, "
                          "so the catalog gets the reference and not the document"))
+
+    def _fetch_the_document(self) -> None:
+        """Open the source document here, in the run that needs it.
+
+        This used to require a handle that the conversation was supposed to
+        have left on the proposal, and nothing ever left one — `fetch_url`
+        returns a handle to the model and no tool writes it down, so every
+        guide and textbook whose licence permitted the content stopped at
+        preflight telling the curator to do something they cannot do.
+
+        Fetching here also fixes what storing it would not. A pending handle
+        names a file in the pod's temp directory: a proposal approved the
+        next morning, or after a restart, would carry a handle pointing at
+        nothing. The document has to be fetched when it is about to be used.
+        """
+        handle = (self.proposal.metadata or {}).get("pending_artifact")
+        if handle:
+            try:
+                if pending_artifact_path(handle).exists():
+                    return
+            except Exception:  # noqa: BLE001 — a handle we cannot read is one
+                pass          # we cannot use, and fetching again is the answer
+        if not self.proposal.source_url:
+            raise IntegrationError(
+                "this proposal has no source URL, so there is no document to "
+                "read. Add one, or reject it.")
+
+        fetched = self._call("fetch_url", {"url": self.proposal.source_url},
+                             stage="preflight") or {}
+        handle = fetched.get("pending_artifact")
+        if not handle:
+            raise IntegrationError(
+                f"could not read {self.proposal.source_url} as a document: "
+                f"{fetched.get('reason') or 'it did not come back as a PDF'}. "
+                f"Check the link points straight at the file — nothing was "
+                f"created.")
+        self.proposal.metadata = {**(self.proposal.metadata or {}),
+                                  "pending_artifact": handle}
+        self.steps.add("read", "Source document fetched",
+                       detail=self.proposal.source_url,
+                       outcome=f"{fetched.get('page_count') or '?'} pages, ready to attach")
 
     def _resolve_the_citation(self) -> None:
         """Read the publisher's own record, here, before anything is created.

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from wisefood_mcp.licences import CATALOG_LICENCES, normalise_licence
 from wisefood_mcp.registry import ToolContext, ToolError
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,17 @@ def propose_source(
     # The licence is the heaviest term in the rank and the thing a curator
     # decides on, so a claimed licence with nothing behind it is worse than
     # an honest gap: it scores well and reads as established.
+    # Into the catalog's vocabulary here, where it is first written down. A
+    # page says "CC BY-NC-SA 4.0" and the enum has "CCBYNCSA"; storing what
+    # the page said meant an approved integration stopped at the very end on
+    # a validation error, with the curator's time already spent.
+    claimed, licence = licence, normalise_licence(licence)
+    if claimed and not licence:
+        raise ToolError(
+            f"{claimed!r} is not a licence this catalog records — give one of "
+            f"its own identifiers, or leave it null and say it is undetermined",
+            allowed=sorted(CATALOG_LICENCES), code="unknown_licence")
+
     evidence = licence_evidence or []
     if licence and not evidence:
         raise ToolError(
@@ -145,7 +157,8 @@ def suggest_source(
         "kind": kind, "title": title.strip(), "source_url": source_url,
         "doi": doi, "rationale": rationale, "country": country,
         "language": language, "population_group": population_group,
-        "licence": licence, "licence_evidence": licence_evidence or [],
+        "licence": normalise_licence(licence),
+        "licence_evidence": licence_evidence or [],
         "plan": plan or [],
     }
     return {
