@@ -37,7 +37,7 @@ def _service():
     """The integrator service, or a readable 503.
 
     Its tool layer lives in `wisefood_mcp`, which ships with wisefood-client
-    0.0.31 and later. An image built against an older pin would otherwise
+    0.0.32 and later. An image built against an older pin would otherwise
     raise ImportError from inside a route, which reads as a bug in the
     integrator rather than as a missing dependency.
     """
@@ -49,7 +49,7 @@ def _service():
         raise APIException(
             status_code=503,
             detail=(
-                "The Source Integrator needs wisefood-client 0.0.31 or later "
+                "The Source Integrator needs wisefood-client 0.0.32 or later "
                 f"(wisefood_mcp is not importable: {exc})."
             ),
         ) from exc

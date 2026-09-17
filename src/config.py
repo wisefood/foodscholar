@@ -190,6 +190,12 @@ class Config:
         # The research model, which is the one place a provider executes
         # anything for us: Compound has built-in web search and decides on its
         # own when to use it.
+        # Reading rules out of a source. A plain tool-calling model, not a
+        # Compound one: Compound's value is its web search, and this reads text
+        # it has already been handed.
+        self.settings["INTEGRATOR_INFERENCE_MODEL"] = os.getenv(
+            "INTEGRATOR_INFERENCE_MODEL", "openai/gpt-oss-120b"
+        )
         self.settings["INTEGRATOR_RESEARCH_MODEL"] = os.getenv(
             "INTEGRATOR_RESEARCH_MODEL", "groq/compound"
         )
