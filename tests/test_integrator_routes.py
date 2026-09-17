@@ -700,3 +700,98 @@ class TestSuggestingRatherThanFiling:
             "suggest_source", {}, True,
             {"suggestion": {"title": "Namama brochure"}}, None
         ) == "Namama brochure — yours to take or leave"
+
+
+class TestWhatATurnFiledIsRecordedNotNarrated:
+    """The assistant reported eight filings for five calls, then produced ids
+    for the difference when challenged, then invented a rule about titles and
+    licences to explain it. The database knew all along; nothing showed it."""
+
+    def _agent(self, filings, registry_result=None):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "propose_source"}}]
+
+            def call(self, name, args, ctx):
+                # The loop hands the registry the model's raw argument string.
+                parsed = json.loads(args) if isinstance(args, str) else args
+                return registry_result or {
+                    "ok": True,
+                    "result": {"proposal_id": f"id-{parsed.get('title', '?')}",
+                               "status": "proposed"}}
+
+        class Groq:
+            def __init__(self):
+                calls = [_delta(tool_calls=[{
+                    "index": i, "id": f"c{i}", "type": "function",
+                    "function": {"name": "propose_source",
+                                 "arguments": json.dumps(
+                                     {"kind": "article", "title": t})}}])
+                    for i, t in enumerate(filings)]
+                self.replies = [[*calls, _usage(1)],
+                                [_delta(content="I filed eight."), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=20))
+        return agent.run_streamed([], "search more", lambda *_a: None)
+
+    def _filed(self, outcome):
+        return [s["data"]["filed"] for s in outcome["timeline"]
+                if s.get("data", {}).get("filed")]
+
+    def test_the_record_counts_calls_not_claims(self):
+        """Five calls, a reply claiming eight: the record says five."""
+        out = self._agent(["A", "B", "C", "D", "E"])
+        assert out["reply"] == "I filed eight."
+        filed = self._filed(out)
+        assert len(filed) == 5
+        assert [f["title"] for f in filed] == ["A", "B", "C", "D", "E"]
+
+    def test_each_entry_carries_the_id_the_tool_returned(self):
+        """Not one the model wrote: an id it invented sends a curator looking
+        for a proposal that does not exist."""
+        out = self._agent(["Planetary Health Diet"])
+        assert self._filed(out)[0]["proposal_id"] == "id-Planetary Health Diet"
+
+    def test_a_failed_call_files_nothing(self):
+        out = self._agent(["A"], registry_result={
+            "ok": False, "error": {"message": "a licence needs evidence"}})
+        assert self._filed(out) == []
+
+    def test_a_call_that_returns_no_id_files_nothing(self):
+        out = self._agent(["A"], registry_result={"ok": True, "result": {}})
+        assert self._filed(out) == []
+
+    def test_a_turn_that_filed_nothing_has_no_record(self):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return []
+
+            def call(self, name, args, ctx):
+                return {"ok": True, "result": {}}
+
+        class Groq:
+            def __init__(self):
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter([_delta(content="I filed five."), _usage(1)])
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=5))
+        out = agent.run_streamed([], "anything", lambda *_a: None)
+        assert self._filed(out) == []

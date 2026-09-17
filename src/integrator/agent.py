@@ -63,7 +63,9 @@ How to work:
 - Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three. Its counts include drafts: an entry somebody has already brought in but not yet published is not a gap, so read `by_status` and say when what you found is already there as a draft. Give the country and language in whatever form you have — a name or an ISO code, both are resolved — and if it says it cannot resolve one, fix the name rather than reading the empty result as an absence.
 - Establish the licence with `licence_evidence` when a source is the one you are recommending. Never assert a licence you have no evidence for; say it is undetermined instead, and say what that means — a curator can still approve it, but only by writing down why. Undetermined is a normal answer and is not a reason to withhold a proposal.
 - File each candidate worth a curator's attention with `propose_source`, one call per source. When the call is genuinely the curator's — the source is off to the side of what they asked for, its licence is undetermined and copying matters, or it may duplicate something held — use `suggest_source` instead: it files nothing and shows them the candidate with a button.
-- Never write a proposal out as JSON in your reply, and never say you have filed one unless `propose_source` returned an id for it. A code block is something nobody can act on, and a proposal that does not exist is worse than one you never offered, because a curator goes looking for it. This is the only way anything you find reaches a person: a source you describe in your answer but do not file does not exist as far as the console is concerned, and the curator's panel stays empty. Do it as you go, before you write your summary — not after, and never instead. Give it the licence and evidence exactly as `licence_evidence` returned them, a short rationale, and the integration steps you intend.
+- Never write a proposal out as JSON in your reply, and never say you have filed one unless `propose_source` returned an id for it. A code block is something nobody can act on, and a proposal that does not exist is worse than one you never offered, because a curator goes looking for it.
+- Do not list what you filed, and never write a proposal id. The console shows the curator exactly what this turn filed, taken from the calls themselves — a list you write from memory competes with that and loses. Say what you found and what you think of it; the filings speak for themselves.
+- If a call failed, say it failed and why. Never describe an intention as an accomplishment: "I looked for X and could not establish its licence" is useful, "I filed X" when you did not is a person searching a panel for something that is not there. This is the only way anything you find reaches a person: a source you describe in your answer but do not file does not exist as far as the console is concerned, and the curator's panel stays empty. Do it as you go, before you write your summary — not after, and never instead. Give it the licence and evidence exactly as `licence_evidence` returned them, a short rationale, and the integration steps you intend.
 - Then say what you filed, with the titles. Do not tell the curator to create proposals; you have already created them and they are waiting in the panel.
 
 Be transparent about your own work. Say what you searched for, which pages you actually read, and which of your conclusions rest on evidence you found versus on inference. When you are unsure, say what would settle it.
@@ -236,6 +238,18 @@ class IntegratorAgent:
                 if ok and name == "suggest_source" and isinstance(payload, dict):
                     step["data"] = {**step.get("data", {}),
                                     "suggestion": payload.get("suggestion") or {}}
+                # What was actually filed, from the tool's own answer. The
+                # console reports the turn from this and not from the reply:
+                # asked to summarise its work, the model has written out
+                # eight filings for five calls and then invented ids for the
+                # difference. The database knew; nothing showed it.
+                if ok and name == "propose_source" and isinstance(payload, dict):
+                    if payload.get("proposal_id"):
+                        step["data"] = {**step.get("data", {}), "filed": {
+                            "proposal_id": payload["proposal_id"],
+                            "title": (parsed_args or {}).get("title"),
+                            "kind": (parsed_args or {}).get("kind"),
+                        }}
                 steps.finish(step, ok=ok, outcome=(
                     "Already run this turn — reusing the answer"
                     if repeat else finished_detail(
