@@ -22,6 +22,11 @@ transformers==4.49.0
 # starlette>=1.0 and would fight FastAPI here. Only the standalone
 # `wisefood-mcp` server process needs that extra.
 wisefood>=0.0.33
+# The catalog tools resolve a country or language to the ISO code the
+# catalog actually stores. It arrives with the [mcp] extra, which this image
+# deliberately does not install (see above), so it is named here directly —
+# without it every country given by name is refused.
+pycountry>=23
 # The integrator's agent loop drives tool-calling through the raw Groq SDK —
 # langchain-groq pulls it in, but a module that imports it should say so.
 groq>=0.30
