@@ -474,3 +474,59 @@ class TestAnAuditRecordSurvivesAwkwardBytes:
 
         value = {"quote": "Creative Commons — Attribution 4.0", "n": 1.5}
         assert _storable(value) == value
+
+
+class TestWhatCountsAsTheSameCall:
+    """Comparing arguments literally is too literal.
+
+    One real run opened the same WHO PDF six times, each call asking for a
+    different page, and searched the web five times for the same thing in
+    five wordings. Every one was a fresh key and a fresh bill.
+    """
+
+    def test_the_same_document_is_the_same_call_whatever_page_is_asked_for(self):
+        from integrator.agent import call_key
+
+        keys = {
+            call_key("fetch_url", {"url": "https://who.int/a.pdf", "page": 1,
+                                   "max_chars": 2000}),
+            call_key("fetch_url", {"url": "https://who.int/a.pdf", "page": 40,
+                                   "max_chars": 5000}),
+            call_key("fetch_url", {"url": "https://who.int/a.pdf/"}),
+        }
+        assert len(keys) == 1
+
+    def test_a_search_reworded_is_the_same_search(self):
+        from integrator.agent import call_key
+
+        keys = {
+            call_key("research", {"query": "Bulgaria national dietary guidelines PDF"}),
+            call_key("research", {"query": "Bulgaria dietary guidelines 2020"}),
+            call_key("research", {"query": "bulgaria  DIETARY guidelines!"}),
+        }
+        assert len(keys) == 1
+
+    def test_a_genuinely_different_search_is_not_collapsed(self):
+        """The guard must not silence a real second question — asking about
+        children after asking about adults is new work."""
+        from integrator.agent import call_key
+
+        assert call_key("research", {"query": "Bulgaria dietary guidelines"}) \
+            != call_key("research", {"query": "Bulgaria dietary guidelines children"})
+        assert call_key("research", {"query": "Greece food composition table"}) \
+            != call_key("research", {"query": "Bulgaria dietary guidelines"})
+
+    def test_a_doi_is_matched_regardless_of_case(self):
+        from integrator.agent import call_key
+
+        assert call_key("doi_metadata", {"doi": "10.1186/S12937-026-01386-8"}) \
+            == call_key("doi_metadata", {"doi": "10.1186/s12937-026-01386-8"})
+
+    def test_anything_else_still_compares_its_arguments(self):
+        from integrator.agent import call_key
+
+        assert call_key("search_catalog", {"kind": "guide", "q": "a"}) \
+            != call_key("search_catalog", {"kind": "guide", "q": "b"})
+        # Argument order is not a difference.
+        assert call_key("search_catalog", {"kind": "guide", "q": "a"}) \
+            == call_key("search_catalog", {"q": "a", "kind": "guide"})

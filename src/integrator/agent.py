@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -53,7 +54,9 @@ What you cannot do: approve anything, or put anything into the catalog yourself.
 
 How to work:
 
-- Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say.
+- Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say. If a search does not turn something up, rewording it rarely will: say what you could not find and move on.
+- Open a document once. `fetch_url` on a PDF tells you what it is, how many pages it has, and stashes it ready to attach — that is all you need to decide whether to propose it. Reading it page by page is the extraction pipeline's job and it does that after a curator approves, over the whole document, grounded in its pages.
+- When a curator gives you a journal — a link or a name — use `journal_articles` to list what it has published. A publisher's own journal page is usually closed to us, so do not keep trying `fetch_url` on it.
 - When a source states dietary rules but does not already list them — advice in prose, a web page, a summary chapter — use `infer_guidelines` on the text you fetched. It returns rules with the verbatim quote each came from, and drops any it cannot quote. Say plainly that those rules were *inferred from the text* rather than extracted from a structured document, and never present them as the source's own list. For a guide that ships as a PDF of numbered recommendations, do not use this: propose it and let the extraction pipeline read it, which is grounded in pages rather than in your reading.
 - For an article, always run `doi_metadata` first and propose from what it returns. Never type a title, author list or year out of a search result: a citation that reads perfectly and is wrong is the single worst thing you can put in this catalog, and Crossref has the record the publisher deposited. If a DOI is not registered there, say so rather than filling the gap yourself.
 - Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three. Its counts include drafts: an entry somebody has already brought in but not yet published is not a gap, so read `by_status` and say when what you found is already there as a draft. Give the country and language in whatever form you have — a name or an ISO code, both are resolved — and if it says it cannot resolve one, fix the name rather than reading the empty result as an absence.
@@ -202,7 +205,7 @@ class IntegratorAgent:
                                    data={"tool": name})
                 self._say("step", step)
 
-                key = f"{name}:{json.dumps(parsed_args, sort_keys=True, default=str)}"
+                key = call_key(name, parsed_args)
                 repeat = key in seen
                 if repeat:
                     outcome = seen[key]
@@ -210,10 +213,10 @@ class IntegratorAgent:
                         outcome = {**outcome, "result": {
                             **outcome["result"],
                             "repeated_call": (
-                                "You already ran this exact call in this turn and "
-                                "this is what it returned. Nothing has changed. Use "
-                                "it and move on — repeating it again will not "
-                                "produce anything new."),
+                                "You already ran this in this turn and this is what "
+                                "it returned. Nothing has changed. Use it and move "
+                                "on — asking again, or asking the same thing in "
+                                "different words, will not produce anything new."),
                         }}
                 else:
                     outcome = self.registry.call(name, raw_args, self.ctx)
@@ -417,6 +420,38 @@ def _digest(content: str) -> str:
               "context. This is the full result you already saw earlier in "
               "this turn; running the call again returns the same thing and "
               "will not restore the detail.]")
+
+
+def call_key(name: str, args: Dict[str, Any]) -> str:
+    """What counts as "the same call already made this turn".
+
+    Comparing arguments literally is too literal, and a real run showed all
+    three ways it fails. The same PDF was opened six times because each call
+    asked for a different page. The web was searched five times for the same
+    thing in five wordings — "Bulgaria national dietary guidelines PDF", then
+    "Bulgaria dietary guidelines 2020", then "Bulgaria food based dietary
+    guidelines children" — each a fresh key, each a fresh bill.
+
+    So two calls are the same when they are after the same thing:
+
+    * a document is identified by its URL. Which page, and how much text, are
+      details of one reading of it. Paging through a PDF is the extraction
+      pipeline's job and it does it after approval, not the assistant's.
+    * a search is identified by its words, regardless of order, case,
+      punctuation or the filler that gets shuffled between attempts.
+    """
+    if name in ("fetch_url", "licence_evidence") and args.get("url"):
+        return f"{name}:{str(args['url']).strip().rstrip('/')}"
+    if name == "doi_metadata" and args.get("doi"):
+        return f"{name}:{str(args['doi']).strip().lower()}"
+    if name == "research" and args.get("query"):
+        words = re.findall(r"\w+", str(args["query"]).lower())
+        # Words that carry no distinction between one attempt and the next.
+        filler = {"pdf", "the", "a", "an", "of", "for", "in", "and", "or",
+                  "national", "official", "latest", "new", "download"}
+        stem = sorted(w for w in words if w not in filler and not w.isdigit())
+        return f"research:{' '.join(stem)}"
+    return f"{name}:{json.dumps(args, sort_keys=True, default=str)}"
 
 
 def _merge_tool_call_deltas(calls: Dict[int, Dict[str, Any]], deltas) -> None:

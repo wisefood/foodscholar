@@ -31,6 +31,7 @@ RUNNING: Dict[str, tuple] = {
     "fetch_url": ("read", "Opening the page"),
     "licence_evidence": ("licence", "Checking the licence"),
     "doi_metadata": ("read", "Looking up the DOI"),
+    "journal_articles": ("search", "Listing what the journal has published"),
     "infer_guidelines": ("read", "Reading the rules out of the source"),
     "search_catalog": ("catalog", "Searching the catalog"),
     "catalog_coverage": ("catalog", "Checking what we already hold"),
@@ -142,6 +143,12 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
                  if data.get("already_aggregated") else "assembled from prose")
         tail = f", {dropped} dropped for unverifiable quotes" if dropped else ""
         return f"{_plural(found, 'rule')} — {shape}{tail}"
+
+    if tool == "journal_articles":
+        if not data.get("found"):
+            return "More than one journal could be meant — needs an ISSN"
+        n = int(data.get("count") or 0)
+        return f"{_plural(n, 'article')} from {data.get('journal') or 'the journal'}"
 
     if tool == "doi_metadata":
         if not data.get("found"):

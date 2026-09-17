@@ -211,6 +211,14 @@ class Config:
         # Off by default, and deliberately not defaulted on now that Phase 2
         # works: a deployment should turn writes on when somebody is there to
         # watch the first one, not because it pulled a new image.
+        # robots.txt addresses crawlers. The integrator is an expert pasting
+        # one URL and waiting for an answer about that one document, under a
+        # per-user rate limit — so it is off unless a deployment asks. It has
+        # no bearing on the destination guard, which refuses a private
+        # address whatever this says.
+        self.settings["INTEGRATOR_RESPECT_ROBOTS"] = (
+            os.getenv("INTEGRATOR_RESPECT_ROBOTS", "false").lower() == "true"
+        )
         self.settings["INTEGRATOR_WRITES_ENABLED"] = (
             os.getenv("INTEGRATOR_WRITES_ENABLED", "false").lower() == "true"
         )
