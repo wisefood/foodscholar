@@ -299,6 +299,7 @@ class Integration:
                 f"guides, articles and textbooks are")
 
         if self.proposal.kind == "article":
+            self._resolve_the_citation()
             self._refuse_a_duplicate_doi()
 
         handle = (self.proposal.metadata or {}).get("pending_artifact")
@@ -313,6 +314,49 @@ class Integration:
                 detail=self.proposal.licence,
                 outcome=("this licence does not permit copying the content in, "
                          "so the catalog gets the reference and not the document"))
+
+    def _resolve_the_citation(self) -> None:
+        """Read the publisher's own record, here, before anything is created.
+
+        This used to be the assistant's job at propose time, and the spec
+        below preferred the record it was supposed to have stashed. Nothing
+        ever stashed one — so the branch never fired and articles were
+        created from whatever the assistant typed, which is precisely the
+        failure the precedence was written to prevent.
+
+        Doing it in the run fixes that and costs the conversation nothing. A
+        citation is checked once, at the only moment it matters, instead of
+        being checked for every candidate the assistant merely considered.
+        The guarantee gets stronger for it: it no longer depends on the
+        assistant having been diligent.
+        """
+        metadata = self.proposal.metadata or {}
+        if (metadata.get("doi_metadata") or {}).get("found"):
+            return
+        doi = metadata.get("doi") or (metadata.get("spec") or {}).get("doi")
+        if not doi:
+            # An article with no DOI is proposed on its URL alone. Legitimate
+            # for a report or a preprint; there is simply no record to read.
+            self.steps.add("read", "No DOI to look up",
+                           outcome="the entry is built from the proposal and its source")
+            return
+
+        record = self._call("doi_metadata", {"doi": doi},
+                            stage="preflight", required=False) or {}
+        if not record.get("found"):
+            raise IntegrationError(
+                f"Crossref has no record of {doi}, so there is no authoritative "
+                f"citation to create this article from. Check the DOI on the "
+                f"proposal — nothing was created.")
+
+        # In memory for this run, which is all `article_spec` below needs.
+        # A retry reads it again — one cheap call, and a fresher record than
+        # one cached from a previous attempt.
+        self.proposal.metadata = {**metadata, "doi_metadata": record}
+        self.steps.add("read", "Citation confirmed with Crossref",
+                       detail=doi,
+                       outcome=f"{record.get('title') or 'the record'} — "
+                               f"{record.get('publisher') or 'publisher unknown'}")
 
     def _refuse_a_duplicate_doi(self) -> None:
         """A DOI names one paper, so importing it twice is never right.

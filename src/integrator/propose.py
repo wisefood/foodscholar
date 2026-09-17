@@ -27,6 +27,7 @@ def propose_source(
     kind: str,
     title: str,
     source_url: Optional[str] = None,
+    doi: Optional[str] = None,
     rationale: Optional[str] = None,
     country: Optional[str] = None,
     language: Optional[str] = None,
@@ -43,9 +44,20 @@ def propose_source(
     source worth their attention — describing a proposal in your answer does
     not create one.
 
-    Pass the licence exactly as `licence_evidence` established it, including
-    its evidence, and leave it null when it could not be established. The
-    rank is computed here from what the tools found, not taken from you.
+    File it as soon as it looks credible. A proposal is a suggestion, not an
+    entry: a curator reads it, and the integration run does the authoritative
+    work when they approve. For an article, pass the `doi` and the run reads
+    the publisher's record from Crossref itself — so you do not need to look
+    a citation up before proposing it, and you should not type one out of a
+    search result either. Give the title as you found it and let the record
+    correct it.
+
+    Pass the licence only if `licence_evidence` established one, with its
+    evidence. Leave it null otherwise: undetermined is an ordinary outcome
+    and the curator is asked for a reason at approval. The rank is computed
+    here from what is known, not taken from you.
+
+    :param doi: for an article — the run resolves the citation from it
     """
     from integrator.service import create_proposal
 
@@ -66,12 +78,14 @@ def propose_source(
             "null and say it is undetermined",
             licence=licence)
 
+    metadata = {"doi": doi.strip()} if doi and doi.strip() else {}
     created = create_proposal(
         user_sub=ctx.actor or "",
         session_id=(ctx.extra or {}).get("session_id"),
         kind=kind,
         title=title.strip(),
         source_url=source_url,
+        metadata=metadata,
         rationale=rationale,
         country=country,
         language=language,
@@ -90,7 +104,8 @@ def propose_source(
         "status": created["status"],
         "rank": created.get("proposed_rank"),
         "filed": f"{title.strip()} is now in the curator's review panel",
-        "note": "a person approves it there; you cannot approve it yourself",
+        "note": ("a person approves it there; you cannot approve it yourself. "
+                 "Move on to the next candidate — this one is recorded."),
     }
 
 

@@ -749,3 +749,88 @@ def test_every_tool_says_what_it_is_doing_in_words(registry):
         _kind, title, _detail = running_title(tool, {})
         assert not title.startswith("Running "), f"{tool} fell back to its own name"
         assert tool not in title, f"{tool} shows its function name to a curator"
+
+
+class TestTheCitationIsResolvedInTheRun:
+    """Where the "no invented citations" guarantee actually lives.
+
+    `article_spec` preferred a Crossref record stashed on the proposal —
+    but nothing ever stashed one, so the branch never fired and articles
+    were created from whatever the assistant typed. Resolving it in the run
+    fixes that and makes the guarantee unconditional: it no longer depends
+    on the assistant having been diligent before proposing.
+    """
+
+    def _executor(self, proposal, calls, records):
+        from wisefood_mcp import ToolContext
+
+        from integrator.executor import Integration
+
+        class Registry:
+            def call(self, tool, args, ctx):
+                import json as _json
+                parsed = _json.loads(args) if isinstance(args, str) else args
+                calls.append((tool, parsed))
+                if tool == "doi_metadata":
+                    return {"ok": True, "result": records.get(parsed["doi"],
+                                                              {"found": False})}
+                if tool == "search_catalog":
+                    return {"ok": True, "result": {"items": []}}
+                return {"ok": True, "result": {}}
+
+        ctx = ToolContext(proposal_store=None, data_client=object())
+        return Integration(proposal=proposal, registry=Registry(), ctx=ctx,
+                           persist=lambda _s: None)
+
+    def _proposal(self, **kw):
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        fields = dict(id=new_proposal_id(), kind="article", title="Typed title",
+                      status="approved", licence="CC-BY-4.0")
+        fields.update(kw)
+        return Proposal(**fields)
+
+    def test_the_publishers_record_replaces_what_was_typed(self):
+        calls = []
+        proposal = self._proposal(metadata={"doi": "10.1186/s12937-026-01386-8"})
+        ex = self._executor(proposal, calls, {
+            "10.1186/s12937-026-01386-8": {
+                "found": True, "title": "Dietary patterns and cardiovascular risk",
+                "authors": ["Real Author"], "publication_year": 2026,
+                "publisher": "Springer", "doi": "10.1186/s12937-026-01386-8"}})
+        ex._resolve_the_citation()
+
+        assert ("doi_metadata", {"doi": "10.1186/s12937-026-01386-8"}) in calls
+        from integrator.executor import article_spec
+        spec = article_spec(ex.proposal)
+        assert spec["title"] == "Dietary patterns and cardiovascular risk"
+        assert spec["authors"] == ["Real Author"]
+
+    def test_a_doi_crossref_does_not_know_stops_the_run(self):
+        """Better to refuse than to create an article from a typed citation."""
+        from integrator.executor import IntegrationError
+
+        calls = []
+        proposal = self._proposal(metadata={"doi": "10.9999/invented"})
+        ex = self._executor(proposal, calls, {})
+        with pytest.raises(IntegrationError) as caught:
+            ex._resolve_the_citation()
+        assert "no record" in str(caught.value)
+        assert "nothing was created" in str(caught.value)
+
+    def test_an_article_without_a_doi_is_still_allowed(self):
+        """A report or a preprint may have none. There is simply no record to
+        read, which is not the same as a citation that failed to check out."""
+        calls = []
+        proposal = self._proposal(metadata={})
+        ex = self._executor(proposal, calls, {})
+        ex._resolve_the_citation()
+        assert not any(t == "doi_metadata" for t, _ in calls)
+
+    def test_a_record_already_present_is_not_fetched_again(self):
+        calls = []
+        proposal = self._proposal(metadata={
+            "doi": "10.1/x", "doi_metadata": {"found": True, "title": "Known"}})
+        ex = self._executor(proposal, calls, {})
+        ex._resolve_the_citation()
+        assert not any(t == "doi_metadata" for t, _ in calls)
