@@ -11,7 +11,7 @@ with a console session can reach it.
 """
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, Query, Request
 from pydantic import BaseModel, Field
 
 from routers.generic import render
@@ -106,14 +106,14 @@ class IntegrateRequest(BaseModel):
 
 @router.post("/sessions")
 @render()
-async def create_session(body: SessionCreate):
+async def create_session(request: Request, body: SessionCreate):
     """Start a conversation."""
     return _service().create_session(user_sub=body.user_sub, title=body.title)
 
 
 @router.get("/sessions")
 @render()
-async def list_sessions(user_sub: str, limit: int = 50):
+async def list_sessions(request: Request, user_sub: str, limit: int = 50):
     """This curator's conversations, most recent first."""
     service = _service()
     return {"sessions": service.list_sessions(user_sub=user_sub, limit=limit)}
@@ -121,7 +121,7 @@ async def list_sessions(user_sub: str, limit: int = 50):
 
 @router.get("/sessions/{session_id}/history")
 @render()
-async def session_history(session_id: str, user_sub: str):
+async def session_history(request: Request, session_id: str, user_sub: str):
     """Everything said in one conversation, including tool turns."""
     service = _service()
     return {"messages": service.history(session_id=session_id, user_sub=user_sub)}
@@ -129,7 +129,7 @@ async def session_history(session_id: str, user_sub: str):
 
 @router.post("/sessions/{session_id}/chat")
 @render()
-async def chat(session_id: str, body: ChatRequest,
+async def chat(request: Request, session_id: str, body: ChatRequest,
                delegated: Optional[str] = Header(None, alias=DELEGATED_TOKEN_HEADER)):
     """One turn. The model may call tools; every call is recorded.
 
@@ -153,7 +153,7 @@ async def chat(session_id: str, body: ChatRequest,
 
 @router.get("/proposals")
 @render()
-async def list_proposals(session_id: Optional[str] = None,
+async def list_proposals(request: Request, session_id: Optional[str] = None,
                          status: Optional[str] = None, limit: int = 100):
     """Candidate sources, in the expert's order where one was set."""
     service = _service()
@@ -163,13 +163,13 @@ async def list_proposals(session_id: Optional[str] = None,
 
 @router.get("/proposals/{proposal_id}")
 @render()
-async def get_proposal(proposal_id: str):
+async def get_proposal(request: Request, proposal_id: str):
     return _service().get_proposal(proposal_id)
 
 
 @router.post("/proposals")
 @render()
-async def create_proposal(body: ProposalCreate):
+async def create_proposal(request: Request, body: ProposalCreate):
     """Add a candidate by hand, rather than through the conversation."""
     service = _service()
     fields: Dict[str, Any] = body.model_dump(exclude_none=True)
@@ -181,7 +181,7 @@ async def create_proposal(body: ProposalCreate):
 
 @router.post("/proposals/{proposal_id}/approve")
 @render()
-async def approve(proposal_id: str, body: ApproveRequest):
+async def approve(request: Request, proposal_id: str, body: ApproveRequest):
     """A person approves. The only way a proposal becomes integratable.
 
     Refuses a proposal whose licence is undetermined unless a reason is given,
@@ -193,14 +193,14 @@ async def approve(proposal_id: str, body: ApproveRequest):
 
 @router.post("/proposals/{proposal_id}/reject")
 @render()
-async def reject(proposal_id: str, body: RejectRequest):
+async def reject(request: Request, proposal_id: str, body: RejectRequest):
     return _service().reject(proposal_id=proposal_id, user_sub=body.user_sub,
                           reason=body.reason)
 
 
 @router.post("/proposals/rerank")
 @render()
-async def rerank(body: RerankRequest):
+async def rerank(request: Request, body: RerankRequest):
     """The expert's ordering, kept beside the agent's rather than over it."""
     service = _service()
     return {"proposals": service.rerank(order=body.order, user_sub=body.user_sub)}
@@ -208,7 +208,7 @@ async def rerank(body: RerankRequest):
 
 @router.get("/backlog")
 @render()
-async def backlog(kind: Optional[str] = None, status: Optional[str] = None,
+async def backlog(request: Request, kind: Optional[str] = None, status: Optional[str] = None,
                   limit: int = 100, offset: int = 0):
     """The queue of candidate sources, seeded from the project's catalogue."""
     return _service().list_backlog(kind=kind, status=status, limit=limit, offset=offset)
@@ -216,7 +216,7 @@ async def backlog(kind: Optional[str] = None, status: Optional[str] = None,
 
 @router.get("/audit")
 @render()
-async def audit(user_sub: str,
+async def audit(request: Request, user_sub: str,
                 session_id: Optional[str] = None,
                 proposal_id: Optional[str] = None,
                 is_admin: bool = False,
@@ -235,7 +235,7 @@ async def audit(user_sub: str,
 
 @router.post("/proposals/{proposal_id}/integrate")
 @render()
-async def integrate(proposal_id: str, body: IntegrateRequest,
+async def integrate(request: Request, proposal_id: str, body: IntegrateRequest,
                     delegated: Optional[str] = Header(None, alias=DELEGATED_TOKEN_HEADER)):
     """Run an approved proposal into the catalog. Returns a run to poll.
 
@@ -267,7 +267,7 @@ async def integrate(proposal_id: str, body: IntegrateRequest,
 
 @router.get("/runs/{run_id}")
 @render()
-async def run(run_id: str):
+async def run(request: Request, run_id: str):
     """One integration run, with its timeline. Poll this while it works."""
     from exceptions import APIException
 
@@ -279,7 +279,7 @@ async def run(run_id: str):
 
 @router.get("/runs")
 @render()
-async def runs(proposal_id: Optional[str] = None,
+async def runs(request: Request, proposal_id: Optional[str] = None,
                limit: int = Query(default=20, le=100)):
     """Every attempt at a proposal, newest first — the failed ones included."""
     return {"runs": _service().list_runs(proposal_id=proposal_id, limit=limit)}
