@@ -530,3 +530,81 @@ class TestWhatCountsAsTheSameCall:
         # Argument order is not a difference.
         assert call_key("search_catalog", {"kind": "guide", "q": "a"}) \
             == call_key("search_catalog", {"q": "a", "kind": "guide"})
+
+
+class TestTheRecipeTransportCarriesTheCaller:
+    """An import the curator could not start by hand must not be one the
+    assistant can start for them."""
+
+    def test_the_callers_token_is_sent(self, monkeypatch):
+        import integrator.service as service
+
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL",
+                            "http://wisefood-api:8000")
+        post, get = service._recipes_transport("tok-abc")
+        assert post is not None and get is not None
+
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None, headers=None):
+                seen.update(url=url, headers=headers, body=json)
+                return type("R", (), {"raise_for_status": lambda _s: None,
+                                      "json": lambda _s: {"run": {"id": "r1"}}})()
+
+        import httpx
+        monkeypatch.setattr(httpx, "Client", FakeClient)
+        assert post("/api/v1/recipewrangler/ingest/source", {"x": 1})["run"]["id"] == "r1"
+        assert seen["headers"]["Authorization"] == "Bearer tok-abc"
+        assert seen["url"].startswith("http://wisefood-api:8000/")
+
+    def test_no_token_means_no_transport(self, monkeypatch):
+        """Not a fallback to the service account: the tools then report that
+        the importer is not configured, which is the honest answer."""
+        import integrator.service as service
+
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL",
+                            "http://wisefood-api:8000")
+        assert service._recipes_transport(None) == (None, None)
+        assert service._recipes_transport("") == (None, None)
+
+    def test_no_gateway_configured_means_no_transport(self, monkeypatch):
+        import integrator.service as service
+
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL", "")
+        assert service._recipes_transport("tok") == (None, None)
+
+    def test_the_gateway_is_used_not_the_catalog(self, monkeypatch):
+        """The admin/expert check on these routes lives on the gateway, so
+        going straight to the service would step around it."""
+        import integrator.service as service
+
+        monkeypatch.setitem(service.config.settings, "WISEFOOD_API_URL",
+                            "http://wisefood-api:8000")
+        monkeypatch.setitem(service.config.settings, "DATA_API_URL",
+                            "http://data-catalog:8000")
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get(self, url, headers=None):
+                seen["url"] = url
+                return type("R", (), {"raise_for_status": lambda _s: None,
+                                      "json": lambda _s: {}})()
+
+        import httpx
+        monkeypatch.setattr(httpx, "Client", FakeClient)
+        _post, get = service._recipes_transport("tok")
+        get("/api/v1/recipewrangler/ingest/source/runs/r1")
+        assert "wisefood-api" in seen["url"] and "data-catalog" not in seen["url"]

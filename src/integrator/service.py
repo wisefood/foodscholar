@@ -93,11 +93,51 @@ def _data_client(access_token: Optional[str] = None):
         return None
 
 
+def _recipes_transport(access_token: Optional[str]):
+    """Call the recipe importer as the curator, through the gateway.
+
+    RecipeWrangler is a separate service, so unlike the guideline pipeline
+    this is a real HTTP call rather than an in-process one. It goes through
+    the gateway, which is where the `admin,expert` check on these routes
+    lives, and it carries the caller's own bearer — so an import the curator
+    could not start by hand is not one the assistant can start for them.
+
+    No token, no transport: the harvest tools then report that the importer
+    is not configured, which is the honest answer and is far better than
+    quietly harvesting a website as the platform.
+    """
+    base = config.settings.get("WISEFOOD_API_URL")
+    if not base or not access_token:
+        return None, None
+
+    import httpx
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    def post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(f"{base.rstrip('/')}{path}", json=body,
+                                   headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+    def get(path: str) -> Dict[str, Any]:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(f"{base.rstrip('/')}{path}", headers=headers)
+            response.raise_for_status()
+            return response.json()
+
+    return post, get
+
+
 def tool_context(*, user_sub: str, session_id: Optional[str] = None,
                  access_token: Optional[str] = None) -> ToolContext:
     """The context every tool runs under, for this caller and this session."""
+    recipes_post, recipes_get = _recipes_transport(access_token)
     return ToolContext(
         data_client=_data_client(access_token),
+        recipes_post=recipes_post,
+        recipes_get=recipes_get,
         groq_client=_groq_client(),
         proposal_store=_STORE,
         writes_enabled=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),

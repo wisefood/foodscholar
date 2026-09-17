@@ -834,3 +834,154 @@ class TestTheCitationIsResolvedInTheRun:
         ex = self._executor(proposal, calls, {})
         ex._resolve_the_citation()
         assert not any(t == "doi_metadata" for t, _ in calls)
+
+
+class TestHarvestingARecipeCollection:
+    """A recipe collection is read off a website, not created and filled.
+
+    It has no document to attach and no entity to hang one from, so it takes
+    its own path through the run — and the dry pass is the part that earns
+    its keep, because a corpus is far harder to take back out than a row.
+    """
+
+    def _run(self, *, proposal=None, statuses=None, start=None, dry_run=False,
+             calls=None):
+        from wisefood_mcp import ToolContext
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        from integrator.executor import Integration
+
+        seen = calls if calls is not None else []
+        polls = list(statuses or [])
+
+        class Registry:
+            def call(self, tool, args, ctx):
+                import json as _json
+                parsed = _json.loads(args) if isinstance(args, str) else args
+                seen.append((tool, parsed))
+                if tool == "import_recipe_source":
+                    default = {"run_id": f"run-{len(seen)}",
+                               "dry_run": parsed.get("dry_run"),
+                               "location": parsed.get("location")}
+                    return {"ok": True, "result": (start or default)}
+                if tool == "recipe_import_status":
+                    return {"ok": True, "result": (polls.pop(0) if polls else
+                                                   {"finished": True, "status": "done"})}
+                return {"ok": True, "result": {}}
+
+        if proposal is None:
+            proposal = Proposal(
+                id=new_proposal_id(), kind="rcollection", title="Good Food",
+                status="approved", licence="CC-BY-4.0", country="IE",
+                source_url="https://food.example",
+                metadata={"harvest_location": "https://food.example/recipes.xml"})
+
+        return Integration(
+            proposal=proposal, registry=Registry(),
+            ctx=ToolContext(proposal_store=None, data_client=object()),
+            persist=lambda _s: None, dry_run=dry_run,
+            poll_interval=0, sleep=lambda _s: None), seen
+
+    def test_a_dry_pass_runs_before_anything_is_written(self):
+        calls = []
+        ex, seen = self._run(calls=calls, statuses=[
+            {"finished": True, "status": "done", "found": 120, "written": 0},
+            {"finished": True, "status": "done", "found": 120, "written": 118,
+             "skipped": 2},
+        ])
+        out = ex.run()
+
+        imports = [a for t, a in seen if t == "import_recipe_source"]
+        assert [a["dry_run"] for a in imports] == [True, False], \
+            "dry first, then for real"
+        assert out["status"] == "succeeded"
+        assert out["result"]["harvest"]["written"] == 118
+        assert "118 recipes imported" in out["steps"][-1]["outcome"]
+
+    def test_a_source_with_nothing_in_it_writes_nothing(self):
+        """Discovering this after writing is the expensive way round."""
+        ex, seen = self._run(statuses=[
+            {"finished": True, "status": "done", "found": 0, "written": 0}])
+        out = ex.run()
+
+        assert out["status"] == "failed"
+        assert "found no recipes" in out["error"]
+        assert out["wrote_anything"] is False
+        assert [a["dry_run"] for t, a in seen if t == "import_recipe_source"] == [True]
+
+    def test_a_preview_stops_after_the_dry_pass(self):
+        ex, seen = self._run(dry_run=True, statuses=[
+            {"finished": True, "status": "done", "found": 90, "written": 0}])
+        out = ex.run()
+
+        assert out["status"] == "succeeded" and out["wrote_anything"] is False
+        assert len([1 for t, _ in seen if t == "import_recipe_source"]) == 1
+        assert "90 recipes found, none written" in out["steps"][-1]["outcome"]
+
+    def test_a_proposal_with_nowhere_to_harvest_is_refused(self):
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        proposal = Proposal(id=new_proposal_id(), kind="rcollection",
+                            title="Somewhere", status="approved",
+                            licence="CC-BY-4.0", metadata={})
+        ex, _seen = self._run(proposal=proposal)
+        out = ex.run()
+        assert out["status"] == "failed"
+        assert "recipe_source" in out["error"]
+
+    def test_the_source_url_serves_when_it_is_the_sitemap(self):
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        proposal = Proposal(
+            id=new_proposal_id(), kind="rcollection", title="Feed", status="approved",
+            licence="CC-BY-4.0", source_url="https://food.example/feed.xml",
+            metadata={})
+        ex, seen = self._run(proposal=proposal, statuses=[
+            {"finished": True, "status": "done", "found": 5, "written": 0},
+            {"finished": True, "status": "done", "found": 5, "written": 5}])
+        assert ex.run()["status"] == "succeeded"
+        assert seen[0][1]["location"] == "https://food.example/feed.xml"
+
+    def test_a_failed_import_says_how_much_it_wrote(self):
+        """Half a corpus is the state a curator most needs to know about."""
+        ex, _seen = self._run(statuses=[
+            {"finished": True, "status": "done", "found": 100, "written": 0},
+            {"finished": True, "status": "failed", "written": 40,
+             "error": "the site stopped answering"},
+        ])
+        out = ex.run()
+        assert out["status"] == "failed"
+        assert "after writing 40 recipes" in out["error"]
+        assert "the site stopped answering" in out["error"]
+        assert out["wrote_anything"] is True
+
+    def test_progress_is_reported_while_it_runs(self):
+        ex, _seen = self._run(statuses=[
+            {"finished": True, "status": "done", "found": 10, "written": 0},
+            {"finished": False, "found": 10, "written": 4},
+            {"finished": True, "status": "done", "found": 10, "written": 10},
+        ])
+        out = ex.run()
+        detail = [s.get("detail") for s in out["steps"]]
+        assert any(d and "written of" in d for d in detail)
+
+    def test_an_importer_that_starts_no_run_is_an_error(self):
+        ex, _seen = self._run(start={"run_id": None})
+        out = ex.run()
+        assert out["status"] == "failed" and "no run" in out["error"]
+
+    def test_an_import_that_never_finishes_gives_up_and_says_so(self):
+        import integrator.executor as executor_module
+
+        ex, _seen = self._run(statuses=[{"finished": False, "found": 1}] * 50)
+        ex.poll_timeout = -1  # already past the deadline on the first look
+        out = ex.run()
+        assert out["status"] == "failed"
+        assert "did not finish" in out["error"] and "check it" in out["error"]
+
+    def test_the_country_becomes_the_region(self):
+        ex, seen = self._run(statuses=[
+            {"finished": True, "status": "done", "found": 2, "written": 0},
+            {"finished": True, "status": "done", "found": 2, "written": 2}])
+        ex.run()
+        assert seen[0][1]["region"] == "IE"

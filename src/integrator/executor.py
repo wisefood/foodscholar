@@ -233,6 +233,16 @@ class Integration:
     def run(self) -> Dict[str, Any]:
         try:
             self._preflight()
+            # A recipe collection is harvested, not created and filled: there
+            # is no document to attach and no entity to hang it from. It has
+            # its own short path.
+            if self.proposal.kind == "rcollection":
+                self._harvest()
+                self.stage = "done"
+                self.steps.add("done", "Integration complete",
+                               outcome=self._closing_line())
+                self._save("succeeded", finished=True)
+                return self._snapshot("succeeded", finished=True)
             if self.proposal.kind in PROFILES:
                 self._profile()
             urn = self._create_entity()
@@ -261,6 +271,13 @@ class Integration:
             return self._snapshot("failed", error=message, finished=True)
 
     def _closing_line(self) -> str:
+        harvest = self.result.get("harvest") or {}
+        if harvest:
+            return (f"{harvest.get('written') or 0} recipes imported, "
+                    f"{harvest.get('skipped') or 0} skipped")
+        dry = self.result.get("dry_run_harvest")
+        if dry:
+            return f"{dry.get('found') or 0} recipes found, none written"
         created = self.result.get("guidelines_created")
         if created is not None:
             return f"{created} guideline{'' if created == 1 else 's'} imported under {self.result.get('urn')}"
@@ -293,10 +310,11 @@ class Integration:
                 "this run has no catalog access as you — the session token was "
                 "not forwarded or has expired. Sign in again and retry; nothing "
                 "was written.")
-        if self.proposal.kind not in CREATE_TOOL:
+        if self.proposal.kind not in CREATE_TOOL and self.proposal.kind != "rcollection":
             raise IntegrationError(
                 f"nothing is wired to integrate a {self.proposal.kind!r} yet; "
-                f"guides, articles and textbooks are")
+                f"guides, articles, textbooks, composition tables and recipe "
+                f"collections are")
 
         if self.proposal.kind == "article":
             self._resolve_the_citation()
@@ -380,6 +398,92 @@ class Integration:
                     f"the catalog already holds {doi} as {item.get('urn') or 'an article'}; "
                     f"nothing was created. Reject this proposal, or open that entry "
                     f"if it needs updating.")
+
+    def _harvest(self) -> None:
+        """Read a recipe site into the corpus, dry first.
+
+        The dry run is not a formality and is not skipped on the strength of
+        the profile: `recipe_source` sampled a handful of pages, and this
+        reads all of them. A source that looked fine in five pages and turns
+        out to carry markup on a tenth of them is worth discovering without
+        having written anything.
+
+        On a real run the dry pass is skipped — the curator has already seen
+        it — but `dry_run` at the top level still means "show me and write
+        nothing", which is the preview button in the console.
+        """
+        metadata = self.proposal.metadata or {}
+        location = (metadata.get("harvest_location")
+                    or (metadata.get("spec") or {}).get("harvest_location")
+                    or self.proposal.source_url)
+        if not location:
+            raise IntegrationError(
+                "no sitemap or feed to harvest — run recipe_source on the site "
+                "and put its harvest_location on the proposal")
+
+        args = {
+            "proposal_id": self.proposal.id,
+            "location": location,
+            "region": (self.proposal.country or "IE"),
+            "limit": int(metadata.get("limit") or 200),
+            "dry_run": True,
+        }
+        if metadata.get("include"):
+            args["include"] = metadata["include"]
+
+        started = self._call("import_recipe_source", args, stage="harvest") or {}
+        dry = self._await_harvest(started.get("run_id"), "Reading the site")
+        self.result["dry_run_harvest"] = dry
+
+        found, written = dry.get("found") or 0, dry.get("written") or 0
+        if not found:
+            raise IntegrationError(
+                f"the dry run read {location} and found no recipes to import; "
+                f"nothing was written. Check the sitemap, or reject this "
+                f"proposal.")
+
+        if self.dry_run:
+            self.steps.add("done", "Preview only",
+                           outcome=f"{found} recipes found, none written")
+            return
+
+        args["dry_run"] = False
+        real = self._call("import_recipe_source", args, stage="harvest") or {}
+        outcome = self._await_harvest(real.get("run_id"), "Importing the recipes")
+        self.result["harvest"] = outcome
+        self.wrote_anything = bool(outcome.get("written"))
+        if outcome.get("status") == "failed":
+            raise IntegrationError(
+                f"the import failed after writing {outcome.get('written') or 0} "
+                f"recipes: {outcome.get('error') or 'no reason given'}")
+
+    def _await_harvest(self, run_id, title: str) -> Dict[str, Any]:
+        """Poll one import to its end, saying how far it has got."""
+        if not run_id:
+            raise IntegrationError("the recipe importer started no run")
+        step = self.steps.start("read", title, detail=str(run_id))
+        deadline = time.monotonic() + self.poll_timeout
+        state: Dict[str, Any] = {}
+        while True:
+            self.sleep(self.poll_interval)
+            state = self._call("recipe_import_status", {"run_id": run_id},
+                               stage="harvesting", required=False) or {}
+            found, written = state.get("found"), state.get("written")
+            if found is not None:
+                step["detail"] = (f"{written or 0} written of {found} found"
+                                  if written is not None else f"{found} found")
+            self._save("running")
+            if state.get("finished"):
+                break
+            if time.monotonic() > deadline:
+                raise IntegrationError(
+                    f"the recipe import did not finish within "
+                    f"{int(self.poll_timeout // 60)} minutes; run {run_id} may "
+                    f"still be going — check it before starting another.")
+        self.steps.finish(step, ok=state.get("status") != "failed", outcome=(
+            f"{state.get('written') or 0} written, {state.get('skipped') or 0} "
+            f"skipped, {state.get('failed') or 0} failed"))
+        return state
 
     def _create_entity(self) -> str:
         if self.result.get("urn"):

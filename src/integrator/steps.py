@@ -33,6 +33,8 @@ RUNNING: Dict[str, tuple] = {
     "doi_metadata": ("read", "Looking up the DOI"),
     "journal_articles": ("search", "Listing what the journal has published"),
     "recipe_source": ("search", "Profiling the recipe site"),
+    "import_recipe_source": ("write", "Harvesting the recipes"),
+    "recipe_import_status": ("read", "Checking on the harvest"),
     "infer_guidelines": ("read", "Reading the rules out of the source"),
     "search_catalog": ("catalog", "Searching the catalog"),
     "catalog_coverage": ("catalog", "Checking what we already hold"),
@@ -153,6 +155,24 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
         estimate = data.get("estimated_recipes")
         return (f"{share}% of sampled pages carry recipe markup"
                 + (f" — about {estimate:,} recipes" if estimate else ""))
+
+    if tool == "import_recipe_source":
+        where = data.get("location") or "the source"
+        return (f"Dry run started on {where} — nothing will be written"
+                if data.get("dry_run") else f"Import started on {where}")
+
+    if tool == "recipe_import_status":
+        if not data.get("finished"):
+            found, written = data.get("found"), data.get("written")
+            if found is None:
+                return "Still going"
+            return (f"{written or 0} written of {found} found"
+                    if written is not None else f"{found} found so far")
+        if data.get("status") == "failed":
+            return data.get("error") or "The import failed"
+        return (f"{data.get('written') or 0} written, "
+                f"{data.get('skipped') or 0} skipped, "
+                f"{data.get('failed') or 0} failed")
 
     if tool == "journal_articles":
         if not data.get("found"):
