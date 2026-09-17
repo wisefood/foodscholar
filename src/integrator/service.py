@@ -260,6 +260,116 @@ def chat(*, session_id: str, user_sub: str, message: str,
     }
 
 
+async def chat_stream(*, session_id: str, user_sub: str, message: str,
+                      access_token: Optional[str] = None,
+                      heartbeat: float = 15.0):
+    """One turn, as it happens.
+
+    The agent loop is synchronous — it blocks on Groq and on HTTP — so it runs
+    in a thread and pushes events onto a queue this drains. The alternative,
+    an async rewrite of the loop, would mean two implementations of the part
+    that decides what the assistant may do, and that is the last thing to keep
+    in two places.
+
+    A heartbeat goes out whenever nothing has happened for a while. Without
+    one an idle stream looks identical to a dead connection to every proxy
+    between here and the browser, and a single web search can easily be
+    quieter than their patience.
+    """
+    import asyncio
+    import queue as queue_mod
+    import threading
+
+    from integrator.tracing import trace_run
+
+    with _session_factory() as db:
+        _owned_session(db, session_id, user_sub)
+        ceiling = int(config.settings.get("INTEGRATOR_MAX_TURNS_PER_HOUR", 60))
+        if _turns_last_hour(db, user_sub) >= ceiling:
+            raise RateLimited(
+                f"that is {ceiling} questions in an hour, which is this "
+                f"deployment's limit. It will clear as the hour rolls forward.",
+                retry_after=300)
+        rows = (
+            db.query(IntegratorMessage)
+            .filter(IntegratorMessage.session_id == session_id)
+            .order_by(IntegratorMessage.seq.asc()).all()
+        )
+        past = replay(rows)
+        seq = (rows[-1].seq + 1) if rows else 0
+        db.add(IntegratorMessage(session_id=session_id, seq=seq, role="user",
+                                 content=message))
+        db.commit()
+
+    events: "queue_mod.Queue" = queue_mod.Queue()
+    model = config.settings.get("INTEGRATOR_MODEL", "openai/gpt-oss-120b")
+
+    def work():
+        try:
+            with trace_run(session_id=session_id, user_sub=user_sub,
+                           question=message, model=model) as trace:
+                agent = IntegratorAgent(
+                    registry=_REGISTRY,
+                    tool_context=tool_context(user_sub=user_sub,
+                                              session_id=session_id,
+                                              access_token=access_token),
+                    groq_client=_groq_client(),
+                    allow_writes=bool(config.settings.get(
+                        "INTEGRATOR_WRITES_ENABLED", False)),
+                    trace=trace,
+                )
+                outcome = agent.run_streamed(
+                    past, message, lambda name, payload: events.put((name, payload)))
+            _persist_turn(session_id, seq, outcome, message)
+            events.put(("done", {
+                "session_id": session_id, "reply": outcome["reply"],
+                "stop_reason": outcome["stop_reason"],
+                "timeline": outcome["timeline"], "steps": outcome["steps"],
+                "tokens": outcome["tokens"], "model": outcome["model"],
+            }))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("integrator: streamed turn failed")
+            # The stream is already a 200 by the time this can happen, so a
+            # failure has to arrive as an event or the client waits forever.
+            events.put(("error", {"detail": f"{type(exc).__name__}: {exc}"[:400]}))
+        finally:
+            events.put((None, None))
+
+    threading.Thread(target=work, name=f"integrator-turn-{session_id}",
+                     daemon=True).start()
+
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            name, payload = await asyncio.wait_for(
+                loop.run_in_executor(None, events.get), timeout=heartbeat)
+        except asyncio.TimeoutError:
+            yield ("heartbeat", None)
+            continue
+        if name is None:
+            return
+        yield (name, payload)
+
+
+def _persist_turn(session_id: str, seq: int, outcome: Dict[str, Any],
+                  message: str) -> None:
+    """Write the turn down. Shared by the streamed and non-streamed paths."""
+    with _session_factory() as db:
+        session = db.get(IntegratorSession, session_id)
+        for offset, turn in enumerate(outcome["messages"], start=1):
+            db.add(IntegratorMessage(
+                session_id=session_id, seq=seq + offset, role=turn["role"],
+                content=turn.get("content"),
+                tool_calls=turn.get("tool_calls"),
+                tool_call_id=turn.get("tool_call_id"),
+                tool_name=turn.get("tool_name"),
+                steps=turn.get("steps"),
+            ))
+        if session is not None and not session.title:
+            session.title = message.strip()[:120] or None
+        db.commit()
+
+
 # ----------------------------------------------------------------- proposals --
 
 def list_proposals(*, session_id: Optional[str] = None, status: Optional[str] = None,

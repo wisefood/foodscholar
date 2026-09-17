@@ -9,12 +9,16 @@ which is gated on the admin and expert roles there.
 There is no approve *tool*; there is an approve *endpoint*, and only a person
 with a console session can reach it.
 """
+import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, Query, Request
 from pydantic import BaseModel, Field
 
 from routers.generic import render
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/integrator", tags=["Source Integrator"])
 
@@ -263,6 +267,54 @@ async def integrate(request: Request, proposal_id: str, body: IntegrateRequest,
     except RuntimeError as exc:
         # Already running. A second press should not start a second run.
         raise APIException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/sessions/{session_id}/chat/stream")
+async def chat_stream(request: Request, session_id: str, body: ChatRequest,
+                      delegated: Optional[str] = Header(None, alias=DELEGATED_TOKEN_HEADER)):
+    """The same turn, streamed as it happens.
+
+    Not decorated with `@render()`: this is `text/event-stream`, and the
+    success envelope that decorator builds is for JSON. Errors that occur
+    before the first frame are raised normally; after it the response is
+    already a 200, so they arrive as an `error` event — a client cannot be
+    told about a failure in a status code it has already received.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from services.qa_pipeline.events import SSE_HEARTBEAT_FRAME
+
+    service = _service()
+
+    async def frames():
+        try:
+            stream = service.chat_stream(
+                session_id=session_id, user_sub=body.user_sub,
+                message=body.message, access_token=_token(delegated))
+            async for name, payload in stream:
+                if name == "heartbeat":
+                    # A comment frame: it keeps every proxy between here and
+                    # the browser from calling an idle stream dead, and costs
+                    # a client nothing to ignore.
+                    yield SSE_HEARTBEAT_FRAME
+                    continue
+                yield f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("integrator: stream failed")
+            yield ("event: error\ndata: "
+                   + json.dumps({"detail": f"{type(exc).__name__}: {exc}"[:400]})
+                   + "\n\n")
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Tell nginx-style proxies not to buffer the stream.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/runs/{run_id}")

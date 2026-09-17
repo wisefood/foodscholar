@@ -86,3 +86,97 @@ def test_render_actually_rejects_an_endpoint_without_one():
 
     with pytest.raises(RuntimeError, match="request"):
         asyncio.run(no_request(thing="x"))
+
+
+def test_the_streaming_route_is_not_render_wrapped():
+    """It returns text/event-stream, and `@render()` builds a JSON envelope.
+
+    Wrapping it would either corrupt the frames or fail on the first call, so
+    this asserts the exception is deliberate rather than an oversight — the
+    check above would otherwise make it look like one.
+    """
+    from api.v1 import integrator
+
+    stream = [r for r in integrator.router.routes
+              if getattr(r, "path", "").endswith("/chat/stream")]
+    assert stream, "the streaming route disappeared"
+    assert not _is_render_wrapped(stream[0].endpoint)
+
+
+def test_the_streamed_turn_emits_each_step_as_it_happens():
+    """The point of the stream: a step is visible when it starts, not when
+    the whole turn ends a minute later."""
+    import json
+
+    from wisefood_mcp import ToolContext
+
+    from integrator.agent import Budget, IntegratorAgent
+
+    class Registry:
+        def openai_schemas(self, include_writes=False):
+            return [{"type": "function", "function": {"name": "research"}}]
+
+        def call(self, name, args, ctx):
+            return {"ok": True, "result": {"findings": [{"title": "x"}],
+                                           "tools_used": ["search"]}}
+
+    class Groq:
+        def __init__(self):
+            self.replies = [
+                {"choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "research",
+                                 "arguments": json.dumps({"query": "bulgaria"})}}]}}],
+                 "usage": {"total_tokens": 5}},
+                {"choices": [{"message": {"content": "Here you go."}}],
+                 "usage": {"total_tokens": 5}},
+            ]
+            self.chat = type("C", (), {"completions": self})()
+
+        def create(self, **kw):
+            data = self.replies.pop(0)
+            return type("R", (), {"model_dump": lambda _self: data})()
+
+    seen = []
+    agent = IntegratorAgent(registry=Registry(),
+                            tool_context=ToolContext(proposal_store=None),
+                            groq_client=Groq(), budget=Budget(max_steps=10))
+    outcome = agent.run_streamed([], "find a guide",
+                                 lambda name, payload: seen.append((name, payload)))
+
+    assert outcome["reply"] == "Here you go."
+    names = [s[1]["title"] for s in seen if s[0] == "step"]
+    assert "Searching the web" in names
+    # Started and finished are both emitted, so a watcher sees it run.
+    statuses = [s[1]["status"] for s in seen if s[0] == "step"]
+    assert "running" in statuses and "done" in statuses
+
+
+def test_a_listener_that_raises_does_not_kill_the_turn():
+    """A browser that hung up is not a reason to abandon a turn already
+    spending tokens — and the turn still has to be persisted."""
+    from wisefood_mcp import ToolContext
+
+    from integrator.agent import Budget, IntegratorAgent
+
+    class Registry:
+        def openai_schemas(self, include_writes=False):
+            return []
+
+        def call(self, name, args, ctx):
+            return {"ok": True, "result": {}}
+
+    class Groq:
+        def __init__(self):
+            self.chat = type("C", (), {"completions": self})()
+
+        def create(self, **kw):
+            return type("R", (), {"model_dump": lambda _s: {
+                "choices": [{"message": {"content": "Answer."}}],
+                "usage": {"total_tokens": 1}}})()
+
+    agent = IntegratorAgent(registry=Registry(),
+                            tool_context=ToolContext(proposal_store=None),
+                            groq_client=Groq(), budget=Budget(max_steps=5))
+    outcome = agent.run_streamed([], "hello", lambda *_a: 1 / 0)
+    assert outcome["reply"] == "Answer."

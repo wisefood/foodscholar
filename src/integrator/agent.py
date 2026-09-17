@@ -136,7 +136,9 @@ class IntegratorAgent:
         # rather than inside the tool loop so a turn that calls no tools still
         # says that it thought about the question.
         steps = StepTracker()
+        self._emit = getattr(self, "_emit", None)
         thinking = steps.start("plan", "Working out what to look for")
+        self._say("step", thinking)
 
         while True:
             limit = self.budget.exhausted
@@ -169,6 +171,7 @@ class IntegratorAgent:
                     f"Decided to {_describe_intent(calls)}" if calls
                     else "Answered from what was already known"
                 ))
+                self._say("step", thinking)
                 thinking = None
             assistant_turn: Dict[str, Any] = {
                 "role": "assistant",
@@ -195,6 +198,7 @@ class IntegratorAgent:
                 kind, title, detail = running_title(name, parsed_args or {})
                 step = steps.start(kind, title, detail=detail,
                                    data={"tool": name})
+                self._say("step", step)
 
                 key = f"{name}:{json.dumps(parsed_args, sort_keys=True, default=str)}"
                 repeat = key in seen
@@ -222,6 +226,7 @@ class IntegratorAgent:
                     if repeat else finished_detail(
                         name, parsed_args or {}, ok, outcome.get("result"),
                         outcome.get("error"))))
+                self._say("step", step)
 
                 tool_turn = {
                     "role": "tool",
@@ -232,6 +237,39 @@ class IntegratorAgent:
                 messages.append({k: v for k, v in tool_turn.items()
                                  if k not in ("tool_name", "steps")})
                 produced.append(tool_turn)
+
+    # ------------------------------------------------------ streamed turn --
+    def run_streamed(self, history: List[Dict[str, Any]], user_message: str,
+                     emit) -> Dict[str, Any]:
+        """`run`, with a callback fired as each step starts and finishes.
+
+        The loop itself is unchanged and deliberately so: a second
+        implementation of the conversation would drift from this one, and the
+        thing that would drift is the part that decides what the assistant is
+        allowed to do. `emit` is called with (name, payload) and must not
+        raise — a consumer that has hung up is not a reason to abandon a turn
+        that is already spending tokens.
+        """
+        self._emit = emit
+        try:
+            return self.run(history, user_message)
+        finally:
+            self._emit = None
+
+    def _say(self, name: str, payload: Dict[str, Any]) -> None:
+        emit = getattr(self, "_emit", None)
+        if emit is None:
+            return
+        try:
+            # A copy, because a step is *mutated* when it finishes and the
+            # consumer serialises later — off a queue, or across a thread.
+            # Passing the live object means the "running" frame has already
+            # become "done" by the time anyone reads it, and the stream shows
+            # every step completing instantly, which is the one thing it
+            # exists to avoid.
+            emit(name, dict(payload))
+        except Exception:  # noqa: BLE001 — see run_streamed
+            logger.debug("integrator: listener dropped the %s event", name)
 
     def _result(self, produced, text, stop_reason, steps) -> Dict[str, Any]:
         if self.trace is not None:
