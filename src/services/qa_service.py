@@ -409,6 +409,7 @@ class QAService:
                     payload,
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
+                    language=language,
                 )
                 if self._is_tips_payload_appropriate(
                     payload,
@@ -419,6 +420,7 @@ class QAService:
                         payload,
                         tips_count=tips_count,
                         did_you_know_count=did_you_know_count,
+                        language=language,
                     )
                     payload["did_you_know_detail"] = did_you_know_detail
                     payload["tips_detail"] = tips_detail
@@ -448,11 +450,13 @@ class QAService:
             generated_payload,
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
+            language=language,
         )
         did_you_know_detail, tips_detail = self._normalize_tip_details(
             generated_payload,
             tips_count=tips_count,
             did_you_know_count=did_you_know_count,
+            language=language,
         )
         response = TipsOfTheDayResponse(
             did_you_know=generated_payload["did_you_know"],
@@ -2010,6 +2014,7 @@ class QAService:
                     tips_count=tips_count,
                     did_you_know_count=did_you_know_count,
                     fill_with_fallback=False,
+                    language=language,
                 )
 
                 if self._is_tips_payload_appropriate(
@@ -2023,6 +2028,7 @@ class QAService:
                         tips_count=tips_count,
                         did_you_know_count=did_you_know_count,
                         fill_with_fallback=True,
+                        language=language,
                     )
 
                 logger.warning(
@@ -2521,9 +2527,19 @@ class QAService:
                 return value.strip()
         return None
 
-    def _guideline_rule_to_tip(self, rule_text: str) -> str:
-        """Turn a guideline rule into a concise actionable tip."""
+    def _guideline_rule_to_tip(self, rule_text: str, language: str = "en") -> str:
+        """Turn a guideline rule into a concise actionable tip.
+
+        The reshaping below is English string surgery: it matches English
+        imperatives ("add ", "avoid ", "choose ") and, when none matches,
+        prefixes the line with "Keep in mind that ". Text in any other language
+        matches none of them, so every Hungarian or Greek tip came back with an
+        English sentence welded to the front of it. Outside English the tip is
+        left as the model wrote it.
+        """
         text = self._clean_guideline_generated_text(rule_text)
+        if (language or "en").strip().lower()[:2] != "en":
+            return self._shorten_tip_sentence(text, max_words=18)
         lowered = text.lower()
         if lowered.startswith(
             ("people should ", "adults should ", "children should ")
@@ -3070,6 +3086,7 @@ class QAService:
         did_you_know_count: int,
         *,
         fill_with_fallback: bool = True,
+        language: str = "en",
     ) -> Dict[str, Any]:
         """Normalize cached/new payloads to did_you_know + tips shape."""
         # If detailed items exist, prefer them as the source of truth.
@@ -3086,6 +3103,7 @@ class QAService:
                         kind="did_you_know",
                         text=item["text"],
                         evidence=item.get("evidence"),
+                        language=language,
                     )
                     did_you_know.append(item["text"].strip())
             for item in details_tips:
@@ -3094,6 +3112,7 @@ class QAService:
                         kind="tip",
                         text=item["text"],
                         evidence=item.get("evidence"),
+                        language=language,
                     )
                     tips.append(item["text"].strip())
             payload["did_you_know"] = did_you_know[:did_you_know_count]
@@ -3135,6 +3154,7 @@ class QAService:
         kind: str,
         text: str,
         evidence: Any,
+        language: str = "en",
     ) -> str:
         """Clean old mechanical tip/fact wording while leaving evidence intact."""
         source_text = str(text or "").strip()
@@ -3161,7 +3181,7 @@ class QAService:
 
         if kind == "did_you_know":
             return self._guideline_rule_to_fact(source_text)
-        return self._guideline_rule_to_tip(source_text)
+        return self._guideline_rule_to_tip(source_text, language=language)
 
     def _normalize_tip_details(
         self,
@@ -3169,6 +3189,7 @@ class QAService:
         *,
         tips_count: int,
         did_you_know_count: int,
+        language: str = "en",
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Normalize `*_detail` arrays, and synthesize them for fallback-only payloads."""
         did_you_know_detail = payload.get("did_you_know_detail", [])
