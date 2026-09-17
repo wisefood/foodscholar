@@ -28,6 +28,7 @@ def _plural(n: int, one: str, many: Optional[str] = None) -> str:
 RUNNING: Dict[str, tuple] = {
     "research": ("search", "Searching the web"),
     "propose_source": ("propose", "Filing a proposal"),
+    "suggest_source": ("propose", "Offering a candidate"),
     "fetch_url": ("read", "Opening the page"),
     "licence_evidence": ("licence", "Checking the licence"),
     "doi_metadata": ("read", "Looking up the DOI"),
@@ -125,6 +126,10 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
         if count == 0:
             return "Nothing in the catalog matches — this would fill a gap"
         return f"{_plural(int(count or 0), 'match', 'matches')} already in the catalog"
+
+    if tool == "suggest_source":
+        title = (data.get("suggestion") or {}).get("title") or "a candidate"
+        return f"{title} — yours to take or leave"
 
     if tool == "propose_source":
         # Says where it went, because the panel is on the same screen and the

@@ -109,6 +109,57 @@ def propose_source(
     }
 
 
+def suggest_source(
+    ctx: ToolContext,
+    kind: str,
+    title: str,
+    source_url: Optional[str] = None,
+    doi: Optional[str] = None,
+    rationale: Optional[str] = None,
+    country: Optional[str] = None,
+    language: Optional[str] = None,
+    population_group: Optional[str] = None,
+    licence: Optional[str] = None,
+    licence_evidence: Optional[List[Dict[str, Any]]] = None,
+    plan: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Put a candidate in front of the curator as a one-click option.
+
+    Use this when the call is genuinely theirs — the source is off to the
+    side of what they asked for, the licence is undetermined and copying
+    matters, or it may duplicate something already held. It files nothing.
+    The curator sees it in the conversation with a button and decides.
+
+    Do not write the fields out as JSON in your reply. This is how a
+    candidate is shown; a code block is something nobody can act on. And
+    never say you have filed something unless `propose_source` returned an
+    id for it — a proposal that does not exist is worse than one you never
+    offered, because a curator goes looking for it.
+    """
+    if kind not in KINDS:
+        raise ToolError(f"{kind!r} is not a kind of source", allowed=list(KINDS))
+    if not (title or "").strip():
+        raise ToolError("a suggestion needs a title")
+
+    suggestion = {
+        "kind": kind, "title": title.strip(), "source_url": source_url,
+        "doi": doi, "rationale": rationale, "country": country,
+        "language": language, "population_group": population_group,
+        "licence": licence, "licence_evidence": licence_evidence or [],
+        "plan": plan or [],
+    }
+    return {
+        "suggested": True,
+        # The console reads this off the step and renders the button. It is
+        # the whole proposal, so accepting it needs no second guess at what
+        # was meant.
+        "suggestion": {k: v for k, v in suggestion.items() if v not in (None, [], "")},
+        "note": ("shown to the curator with a button to file it. Say in your "
+                 "reply what it is and why it is their call — do not repeat "
+                 "the fields, they can see them."),
+    }
+
+
 def register(registry) -> None:
     """Add the tool to a registry.
 
@@ -119,3 +170,4 @@ def register(registry) -> None:
     able to research and unable to say so.
     """
     registry.register(propose_source)
+    registry.register(suggest_source)

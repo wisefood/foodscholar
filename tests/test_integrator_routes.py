@@ -608,3 +608,95 @@ class TestTheRecipeTransportCarriesTheCaller:
         _post, get = service._recipes_transport("tok")
         get("/api/v1/recipewrangler/ingest/source/runs/r1")
         assert "wisefood-api" in seen["url"] and "data-catalog" not in seen["url"]
+
+
+class TestSuggestingRatherThanFiling:
+    """The assistant printed a proposal as JSON and then said it had filed
+    it. Neither half was any use: a code block is not something a curator can
+    act on, and the proposal it claimed to have made did not exist, so
+    looking for it was wasted time."""
+
+    def _ctx(self):
+        from wisefood_mcp import ToolContext
+        return ToolContext(proposal_store=None, actor="expert-1", extra={})
+
+    def test_a_suggestion_writes_nothing(self):
+        from integrator.propose import suggest_source
+
+        out = suggest_source(
+            self._ctx(), kind="guide",
+            title="Нутриционни препоръки за деца 3-7 г.",
+            source_url="https://www.namama.bg/upload/Deca_3-7.pdf",
+            country="Bulgaria", language="bg", population_group="children",
+            rationale="Commercial brochure repeating official advice.")
+
+        assert out["suggested"] is True
+        assert out["suggestion"]["title"].startswith("Нутриционни")
+        assert out["suggestion"]["population_group"] == "children"
+        # No id, because nothing was filed. The whole point.
+        assert "proposal_id" not in out
+
+    def test_empty_fields_are_left_out(self):
+        """The card renders what it is given; a licence of null should not
+        arrive as a badge saying null."""
+        from integrator.propose import suggest_source
+
+        out = suggest_source(self._ctx(), kind="article", title="A paper")
+        assert set(out["suggestion"]) == {"kind", "title"}
+
+    def test_a_bad_kind_is_refused_the_same_as_filing(self):
+        from wisefood_mcp.registry import ToolError
+
+        from integrator.propose import suggest_source
+
+        with pytest.raises(ToolError):
+            suggest_source(self._ctx(), kind="dataset", title="Something")
+
+    def test_the_suggestion_rides_on_its_step(self):
+        """The console reads it off the step, which is already persisted and
+        already streamed — no new column, no second request."""
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        suggestion = {"kind": "guide", "title": "Namama brochure"}
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "suggest_source"}}]
+
+            def call(self, name, args, ctx):
+                return {"ok": True, "result": {"suggested": True,
+                                               "suggestion": suggestion}}
+
+        class Groq:
+            def __init__(self):
+                self.replies = [
+                    [_delta(tool_calls=[{"index": 0, "id": "c1", "type": "function",
+                                         "function": {"name": "suggest_source",
+                                                      "arguments": "{}"}}]),
+                     _usage(1)],
+                    [_delta(content="Yours to take or leave."), _usage(1)],
+                ]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=6))
+        out = agent.run_streamed([], "anything", lambda *_a: None)
+
+        carried = [s for s in out["timeline"] if s.get("data", {}).get("suggestion")]
+        assert carried, "the console has nothing to render the button from"
+        assert carried[0]["data"]["suggestion"]["title"] == "Namama brochure"
+
+    def test_the_timeline_says_it_is_the_curators_call(self):
+        from integrator.steps import RUNNING, finished_detail
+
+        assert "suggest_source" in RUNNING
+        assert finished_detail(
+            "suggest_source", {}, True,
+            {"suggestion": {"title": "Namama brochure"}}, None
+        ) == "Namama brochure — yours to take or leave"

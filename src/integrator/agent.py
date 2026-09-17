@@ -62,7 +62,8 @@ How to work:
 - For an article, pass the DOI to `propose_source` and move on. The integration run reads the publisher's record from Crossref when a curator approves, and refuses to create anything if that DOI has no record — so the citation is guaranteed at the point it matters and you do not have to establish it for every candidate you merely considered. Give the title as you found it; the record corrects it. Never present a citation you typed as if you had checked it.
 - Check `catalog_coverage` before proposing. A source filling a gap is worth more than a fourth guide for a country that already has three. Its counts include drafts: an entry somebody has already brought in but not yet published is not a gap, so read `by_status` and say when what you found is already there as a draft. Give the country and language in whatever form you have — a name or an ISO code, both are resolved — and if it says it cannot resolve one, fix the name rather than reading the empty result as an absence.
 - Establish the licence with `licence_evidence` when a source is the one you are recommending. Never assert a licence you have no evidence for; say it is undetermined instead, and say what that means — a curator can still approve it, but only by writing down why. Undetermined is a normal answer and is not a reason to withhold a proposal.
-- File each candidate worth a curator's attention with `propose_source`, one call per source. This is the only way anything you find reaches a person: a source you describe in your answer but do not file does not exist as far as the console is concerned, and the curator's panel stays empty. Do it as you go, before you write your summary — not after, and never instead. Give it the licence and evidence exactly as `licence_evidence` returned them, a short rationale, and the integration steps you intend.
+- File each candidate worth a curator's attention with `propose_source`, one call per source. When the call is genuinely the curator's — the source is off to the side of what they asked for, its licence is undetermined and copying matters, or it may duplicate something held — use `suggest_source` instead: it files nothing and shows them the candidate with a button.
+- Never write a proposal out as JSON in your reply, and never say you have filed one unless `propose_source` returned an id for it. A code block is something nobody can act on, and a proposal that does not exist is worse than one you never offered, because a curator goes looking for it. This is the only way anything you find reaches a person: a source you describe in your answer but do not file does not exist as far as the console is concerned, and the curator's panel stays empty. Do it as you go, before you write your summary — not after, and never instead. Give it the licence and evidence exactly as `licence_evidence` returned them, a short rationale, and the integration steps you intend.
 - Then say what you filed, with the titles. Do not tell the curator to create proposals; you have already created them and they are waiting in the panel.
 
 Be transparent about your own work. Say what you searched for, which pages you actually read, and which of your conclusions rest on evidence you found versus on inference. When you are unsure, say what would settle it.
@@ -229,6 +230,12 @@ class IntegratorAgent:
                     self.trace.tool(name, parsed_args, ok, outcome.get("result"),
                                     step.get("elapsed_ms"))
                 payload = outcome.get("result") if ok else outcome.get("error")
+                # A suggestion rides on its step, which is already persisted
+                # and already streamed — so the console can render it as a
+                # button without a new column or a second request.
+                if ok and name == "suggest_source" and isinstance(payload, dict):
+                    step["data"] = {**step.get("data", {}),
+                                    "suggestion": payload.get("suggestion") or {}}
                 steps.finish(step, ok=ok, outcome=(
                     "Already run this turn — reusing the answer"
                     if repeat else finished_detail(
