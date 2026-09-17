@@ -443,3 +443,34 @@ def test_a_provider_that_rejects_stream_options_still_streams():
     # No usage frame came back, so the budget charges an estimate. A step that
     # costs nothing is a step the budget cannot stop.
     assert outcome["tokens"] > 0
+
+
+class TestAnAuditRecordSurvivesAwkwardBytes:
+    """Postgres refuses `\\u0000` in jsonb — it cannot be converted to text —
+    and the whole insert fails with it. Fetching a PDF whose bytes do not
+    decode cleanly puts a raw gzip header into a snippet, and the audit
+    record for that call was being dropped with a warning. Losing the record
+    of a tool call over one byte in its output defeats the audit trail."""
+
+    def test_nul_is_stripped_from_every_corner(self):
+        from integrator.store import _storable
+
+        out = _storable({
+            "query": "Greece guidelines",
+            "results": [{"snippet": "\x1f�\b\x00binary\x00"}],
+            "nested": {"deep": ["a\x00b"]},
+            "count": 3,
+            "ok": True,
+            "nothing": None,
+        })
+        assert "\x00" not in str(out)
+        assert out["results"][0]["snippet"] == "\x1f�\bbinary"
+        assert out["nested"]["deep"] == ["ab"]
+        # Everything else is left exactly as it was.
+        assert out["count"] == 3 and out["ok"] is True and out["nothing"] is None
+
+    def test_text_without_nul_is_untouched(self):
+        from integrator.store import _storable
+
+        value = {"quote": "Creative Commons — Attribution 4.0", "n": 1.5}
+        assert _storable(value) == value

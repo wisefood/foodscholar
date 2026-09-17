@@ -118,6 +118,25 @@ class PostgresProposalStore:
             return [_to_dataclass(r) for r in rows]
 
 
+def _storable(value: Any) -> Any:
+    """The same value with NUL characters removed, recursively.
+
+    Postgres refuses `\u0000` in `jsonb` — it cannot be converted to text —
+    and the whole insert fails with it. That is not a hypothetical: fetching
+    a PDF whose bytes do not decode cleanly puts the raw gzip header into a
+    snippet, and the audit record for that call was being dropped on the
+    floor with a warning. Losing the record of a tool call because of one
+    byte in its output defeats the point of having an audit trail.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _storable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_storable(v) for v in value]
+    return value
+
+
 def record_tool_call(record: Dict[str, Any], *, session_id: Optional[str] = None) -> None:
     """Persist one tool call. Never raises — auditing must not break the run.
 
@@ -141,9 +160,9 @@ def record_tool_call(record: Dict[str, Any], *, session_id: Optional[str] = None
                 tool=record.get("tool", "?")[:64],
                 is_write=bool(record.get("write")),
                 ok=bool(record.get("ok")),
-                arguments=record.get("arguments"),
-                result=result,
-                error=record.get("error"),
+                arguments=_storable(record.get("arguments")),
+                result=_storable(result),
+                error=_storable(record.get("error")),
                 duration_ms=record.get("duration_ms"),
                 actor=record.get("actor"),
             ))
