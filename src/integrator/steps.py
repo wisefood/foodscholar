@@ -32,6 +32,7 @@ RUNNING: Dict[str, tuple] = {
     "licence_evidence": ("licence", "Checking the licence"),
     "doi_metadata": ("read", "Looking up the DOI"),
     "journal_articles": ("search", "Listing what the journal has published"),
+    "recipe_source": ("search", "Profiling the recipe site"),
     "infer_guidelines": ("read", "Reading the rules out of the source"),
     "search_catalog": ("catalog", "Searching the catalog"),
     "catalog_coverage": ("catalog", "Checking what we already hold"),
@@ -144,11 +145,22 @@ def finished_detail(tool: str, args: Dict[str, Any], ok: bool,
         tail = f", {dropped} dropped for unverifiable quotes" if dropped else ""
         return f"{_plural(found, 'rule')} — {shape}{tail}"
 
+    if tool == "recipe_source":
+        if not data.get("harvestable"):
+            return (data.get("reason")
+                    or f"no machine-readable recipes in {data.get('sampled') or 0} sampled pages")
+        share = int(round(float(data.get("markup_share") or 0) * 100))
+        estimate = data.get("estimated_recipes")
+        return (f"{share}% of sampled pages carry recipe markup"
+                + (f" — about {estimate:,} recipes" if estimate else ""))
+
     if tool == "journal_articles":
         if not data.get("found"):
             return "More than one journal could be meant — needs an ISSN"
         n = int(data.get("count") or 0)
-        return f"{_plural(n, 'article')} from {data.get('journal') or 'the journal'}"
+        fresh = data.get("new_to_the_catalog")
+        tail = (f", {n - fresh} already held" if fresh is not None and n - fresh else "")
+        return f"{_plural(n, 'article')} from {data.get('journal') or 'the journal'}{tail}"
 
     if tool == "doi_metadata":
         if not data.get("found"):
