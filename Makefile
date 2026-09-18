@@ -44,7 +44,7 @@ verify:
 	@grep '^wisefood' requirements.txt | sed 's/^/    /'
 	@echo "==> got (inside the image):"
 	@$(DOCKER) run --rm --entrypoint /opt/venv/bin/pip $(IMAGE):$(TAG) \
-		show wisefood | sed -n '1,2p;s/^/    /p' | head -2
+		show wisefood | sed -n '1,2p' | sed 's/^/    /' 
 
 ## Ignore every cached layer. For when a build succeeds and still ships the
 ## wrong dependency — the dependency layer is keyed on requirements.txt, so
