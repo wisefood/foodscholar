@@ -32,6 +32,7 @@ class FakeProxy:
         self.created = []
         #: What a catalog search would return for this kind.
         self.hits = []
+        self.searches = []
 
     def create(self, **fields):
         # The catalog takes a urn *slug* and returns the full urn, prepending
@@ -40,7 +41,11 @@ class FakeProxy:
         self.created.append(fields)
         return {**fields, "urn": self.urn}
 
-    def search(self, q, limit=10):
+    def search(self, q, limit=10, fq=None, **kw):
+        # `fq` because the catalog filters region and language on the codes
+        # it stores: searching "Ireland" never matches a guide whose region
+        # is `IE`. The real proxy has always taken it.
+        self.searches.append({"q": q, "fq": fq})
         return list(self.hits)[:limit]
 
 
@@ -976,7 +981,8 @@ class TestHarvestingARecipeCollection:
             {"finished": True, "status": "done", "found": 5, "written": 0},
             {"finished": True, "status": "done", "found": 5, "written": 5}])
         assert ex.run()["status"] == "succeeded"
-        assert seen[0][1]["location"] == "https://food.example/feed.xml"
+        imports = [a for t, a in seen if t == "import_recipe_source"]
+        assert imports[0]["location"] == "https://food.example/feed.xml"
 
     def test_a_failed_import_says_how_much_it_wrote(self):
         """Half a corpus is the state a curator most needs to know about."""
@@ -1020,7 +1026,8 @@ class TestHarvestingARecipeCollection:
             {"finished": True, "status": "done", "found": 2, "written": 0},
             {"finished": True, "status": "done", "found": 2, "written": 2}])
         ex.run()
-        assert seen[0][1]["region"] == "IE"
+        imports = [a for t, a in seen if t == "import_recipe_source"]
+        assert imports[0]["region"] == "IE"
 
 
 class TestTheRunOpensTheDocumentItself:
@@ -1126,3 +1133,47 @@ def test_a_failed_run_keeps_the_document_for_the_retry(registry, store, fetched_
     outcome, _saved = run_integration(proposal, registry, ctx)
     assert outcome["status"] == "failed"
     assert pending_artifact_path(HANDLE).exists()
+
+
+def test_a_guide_already_in_the_catalog_is_refused(registry, store, fetched_file):
+    """A curator asked for Irish guides and was shown three the catalog
+    already held — the assistant had searched for "Ireland" while the catalog
+    stores `IE`, so it looked empty. Approving them would have made three
+    more copies, and nothing would even have collided: the urn carries the
+    proposal id."""
+    proposal = make_proposal(store)
+    client = FakeDataClient()
+    client.guides.hits = [{"urn": "urn:wf:guide:held",
+                           "url": "https://ncpha.bg/fbdg.pdf",
+                           "title": "Already here"}]
+    ctx, _core = make_context(store, data_client=client)
+
+    outcome, _saved = run_integration(proposal, registry, ctx)
+    assert outcome["status"] == "failed"
+    assert "already holds" in outcome["error"]
+    assert "urn:wf:guide:held" in outcome["error"]
+    assert outcome["wrote_anything"] is False
+    assert client.guides.created == []
+
+
+def test_a_trailing_slash_is_not_a_different_document(registry, store, fetched_file):
+    proposal = make_proposal(store)
+    client = FakeDataClient()
+    client.guides.hits = [{"urn": "urn:wf:guide:held",
+                           "url": "https://NCPHA.bg/fbdg.pdf/"}]
+    ctx, _core = make_context(store, data_client=client)
+    assert run_integration(proposal, registry, ctx)[0]["status"] == "failed"
+
+
+def test_a_different_document_on_the_same_site_is_let_through(registry, store, fetched_file):
+    """A national guide comes in numbered parts that share almost every word.
+    Only an exact URL match is certain enough to refuse on."""
+    proposal = make_proposal(store)
+    client = FakeDataClient()
+    client.guides.hits = [{"urn": "urn:wf:guide:part1",
+                           "url": "https://ncpha.bg/fbdg-part-1.pdf",
+                           "title": "Bulgarian FBDG for adults"}]
+    ctx, _core = make_context(store, data_client=client)
+
+    outcome, _saved = run_integration(proposal, registry, ctx)
+    assert outcome["status"] == "succeeded", outcome.get("error")

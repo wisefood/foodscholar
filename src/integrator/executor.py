@@ -364,6 +364,14 @@ class Integration:
         if self.proposal.kind == "article":
             self._resolve_the_citation()
             self._refuse_a_duplicate_doi()
+        else:
+            # Every other kind had no duplicate check at all. A curator asked
+            # for Irish guides, was shown three the catalog already held —
+            # the assistant had searched for "Ireland" and the catalog stores
+            # `IE`, so it looked empty — and approving them would have made
+            # three more copies. The urn carries the proposal id, so nothing
+            # would even have collided.
+            self._refuse_a_duplicate_source()
 
         wants_file = content_permitted(self.proposal)
         if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file:
@@ -468,6 +476,30 @@ class Integration:
                        detail=doi,
                        outcome=f"{record.get('title') or 'the record'} — "
                                f"{record.get('publisher') or 'publisher unknown'}")
+
+    def _refuse_a_duplicate_source(self) -> None:
+        """The same document at the same URL is the same document.
+
+        Deliberately narrow: an exact URL match is certain, the way a DOI
+        match is. Titles are not — a national guide comes in numbered parts
+        that share almost every word, and refusing "Μέρος 2ο" because
+        "Μέρος 1ο" is held would be worse than the duplicate. Those are
+        reported instead, for the curator to judge.
+        """
+        url = (self.proposal.source_url or "").strip().rstrip("/")
+        if not url:
+            return
+        found = self._call("search_catalog",
+                           {"kind": self.proposal.kind, "q": url, "limit": 10},
+                           stage="preflight", required=False) or {}
+        for item in found.get("items") or []:
+            held = str(item.get("url") or "").strip().rstrip("/")
+            if held and held.lower() == url.lower():
+                raise IntegrationError(
+                    f"the catalog already holds {url} as "
+                    f"{item.get('urn') or 'an entry'}; nothing was created. "
+                    f"Reject this proposal, or open that entry if it needs "
+                    f"updating.")
 
     def _refuse_a_duplicate_doi(self) -> None:
         """A DOI names one paper, so importing it twice is never right.

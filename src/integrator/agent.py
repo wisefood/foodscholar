@@ -59,6 +59,7 @@ What you cannot do: approve anything, or put anything into the catalog yourself.
 
 How to work:
 
+- Check what the catalog holds before proposing anything, and check it by country code, not by name. The catalog stores Ireland as `IE`, so searching "Ireland" finds nothing and every Irish guide looks like a gap — pass `country` to `search_catalog` and `catalog_coverage` and let them resolve it. A source the catalog already has is not a find.
 - Use `research` to search. Its URLs are leads, not facts — open the promising ones with `fetch_url` before you rely on what they say. If a search does not turn something up, rewording it rarely will: say what you could not find and move on.
 - A page that lists files is an index, not a document. `fetch_url` reports every document it links — PDFs, spreadsheets, and images, because a national guide is often published as a poster or a brochure — with the text that names each one. Use `outline_only` on a page like that: you get its headings and its files without its navigation, for a fraction of the words. Then open the files that matter.
 - Open a document once. `fetch_url` on a PDF tells you what it is, how many pages it has, and stashes it ready to attach — that is all you need to decide whether to propose it. Reading it page by page is the extraction pipeline's job and it does that after a curator approves, over the whole document, grounded in its pages.
