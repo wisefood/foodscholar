@@ -856,3 +856,289 @@ class TestATransientFailureCanBeTriedAgain:
         good = {"ok": True, "result": {"pending_artifact": "p1"}}
         _out, calls = self._agent([good] * 6)
         assert len(calls) == 1
+
+
+class TestACallThatCannotSucceedIsNotRepeated:
+    """A refused argument is permanent: the same call makes the same refusal.
+    Retrying spends a step to be told the same thing — and the model, seeing a
+    fresh error rather than "you already asked", tends to try a third time."""
+
+    def test_argument_refusals_are_permanent(self):
+        from integrator.agent import is_permanent
+
+        for code in ("unknown_kind", "unknown_licence", "not_a_doi",
+                     "approval_required", "writes_disabled",
+                     "licence_forbids_content", "journal_not_found"):
+            assert is_permanent({"error": {"code": code}}), code
+
+    def test_a_contract_violation_is_permanent(self):
+        """Nothing about the world will make the same arguments validate."""
+        from integrator.agent import is_permanent
+
+        assert is_permanent({"error": {"code": "tool_error",
+                                       "problems": [{"loc": ["q"]}]}})
+
+    def test_a_dropped_connection_is_not_permanent(self):
+        from integrator.agent import is_permanent
+
+        assert not is_permanent({"error": {
+            "code": "tool_error",
+            "message": "RemoteProtocolError: peer closed connection"}})
+
+    def test_a_shapeless_failure_is_treated_as_worth_one_retry(self):
+        from integrator.agent import is_permanent
+
+        assert not is_permanent({"error": {}})
+        assert not is_permanent({})
+
+    def test_a_permanent_failure_is_answered_from_the_record(self):
+        """The second identical call gets "you already asked" rather than a
+        fresh-looking error to react to."""
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        calls = []
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "propose_source"}}]
+
+            def call(self, name, args, ctx):
+                calls.append(args)
+                return {"ok": False, "error": {"code": "unknown_kind",
+                                               "message": "'artifact' is not a kind"}}
+
+        class Groq:
+            def __init__(self):
+                one = [_delta(tool_calls=[{
+                    "index": 0, "id": "c", "type": "function",
+                    "function": {"name": "propose_source",
+                                 "arguments": json.dumps(
+                                     {"kind": "artifact", "title": "KIDS.pdf"})}}]),
+                    _usage(1)]
+                self.replies = [list(one) for _ in range(4)] + [
+                    [_delta(content="done"), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=8))
+        agent.run_streamed([], "file it", lambda *_a: None)
+        assert len(calls) == 1, "one refusal is enough"
+
+
+class TestTheLoopDoesNotGetStuck:
+    """Ways a turn can be spent without going anywhere. Each of these has a
+    bound, because the alternative is a curator watching a spinner until the
+    token budget runs out."""
+
+    def _agent(self, replies, registry_call=None, max_steps=8):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        calls = []
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "research"}}]
+
+            def call(self, name, args, ctx):
+                calls.append((name, args))
+                if registry_call:
+                    return registry_call(name, args)
+                return {"ok": True, "result": {"findings": []}}
+
+        class Groq:
+            def __init__(self):
+                self.replies = list(replies)
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                if not self.replies:
+                    return iter([_delta(content="done"), _usage(1)])
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=max_steps))
+        return agent, calls
+
+    def _search(self, query):
+        return [_delta(tool_calls=[{
+            "index": 0, "id": f"c{abs(hash(query)) % 999}", "type": "function",
+            "function": {"name": "research",
+                         "arguments": json.dumps({"query": query})}}]), _usage(1)]
+
+    def test_a_model_that_only_ever_calls_tools_hits_the_step_budget(self):
+        agent, calls = self._agent([self._search(f"q{i}") for i in range(50)],
+                                   max_steps=5)
+        out = agent.run_streamed([], "search", lambda *_a: None)
+        assert len(calls) <= 5
+        # The reason is a sentence, because a curator reads it.
+        assert "limit" in out["stop_reason"]
+        assert out["reply"], "it still says something to the curator"
+
+    def test_the_same_search_reworded_is_not_paid_for_twice(self):
+        agent, calls = self._agent([
+            self._search("Bulgaria national dietary guidelines PDF"),
+            self._search("Bulgaria dietary guidelines 2020"),
+            self._search("bulgaria DIETARY guidelines"),
+        ])
+        agent.run_streamed([], "search", lambda *_a: None)
+        assert len(calls) == 1
+
+    def test_a_tool_that_does_not_exist_does_not_end_the_turn(self):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return []
+
+            def call(self, name, args, ctx):
+                return {"ok": False, "error": {"code": "unknown_tool",
+                                               "message": f"no tool {name!r}"}}
+
+        class Groq:
+            def __init__(self):
+                self.replies = [
+                    [_delta(tool_calls=[{
+                        "index": 0, "id": "c", "type": "function",
+                        "function": {"name": "invented_tool", "arguments": "{}"}}]),
+                     _usage(1)],
+                    [_delta(content="I could not do that."), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=6))
+        out = agent.run_streamed([], "do it", lambda *_a: None)
+        assert out["reply"] == "I could not do that."
+
+    def test_arguments_that_are_not_json_do_not_end_the_turn(self):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "research"}}]
+
+            def call(self, name, args, ctx):
+                return {"ok": True, "result": {}}
+
+        class Groq:
+            def __init__(self):
+                self.replies = [
+                    [_delta(tool_calls=[{
+                        "index": 0, "id": "c", "type": "function",
+                        "function": {"name": "research",
+                                     "arguments": "{not json at all"}}]),
+                     _usage(1)],
+                    [_delta(content="recovered"), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=6))
+        out = agent.run_streamed([], "go", lambda *_a: None)
+        assert out["reply"] == "recovered"
+
+    def test_a_turn_that_calls_nothing_still_answers(self):
+        agent, calls = self._agent([[_delta(content="Here is what I know."), _usage(1)]])
+        out = agent.run_streamed([], "tell me", lambda *_a: None)
+        assert out["reply"] == "Here is what I know." and calls == []
+
+
+class TestFilingAndSuggestingEdges:
+    def _ctx(self):
+        from wisefood_mcp import ToolContext
+        return ToolContext(proposal_store=None, actor="expert-1", extra={})
+
+    def test_a_title_that_is_only_whitespace(self):
+        from wisefood_mcp.registry import ToolError
+
+        from integrator.propose import suggest_source
+
+        for empty in ("", "   ", "\n\t", "\u00a0"):
+            with pytest.raises(ToolError):
+                suggest_source(self._ctx(), kind="guide", title=empty)
+
+    def test_a_title_in_another_alphabet_survives(self):
+        from integrator.propose import suggest_source
+
+        greek = "Εθνικός Διατροφικός Οδηγός για ενήλικες"
+        out = suggest_source(self._ctx(), kind="guide", title=f"  {greek}  ")
+        assert out["suggestion"]["title"] == greek
+
+    def test_a_licence_a_page_wrote_is_normalised_in_a_suggestion_too(self):
+        from integrator.propose import suggest_source
+
+        out = suggest_source(self._ctx(), kind="guide", title="A guide",
+                             licence="CC BY-NC-SA 4.0")
+        assert out["suggestion"]["licence"] == "CCBYNCSA"
+
+    def test_a_licence_nobody_can_place_is_refused_with_the_list(self):
+        from wisefood_mcp.registry import ToolError
+
+        from integrator.propose import propose_source
+
+        with pytest.raises(ToolError) as caught:
+            propose_source(self._ctx(), kind="guide", title="A guide",
+                           licence="Free for everyone", licence_evidence=[{"x": 1}])
+        assert caught.value.detail.get("code") == "unknown_licence"
+        assert "CCBYNCSA" in caught.value.detail.get("allowed", [])
+
+    def test_every_kind_is_named_when_one_is_wrong(self):
+        from wisefood_mcp.registry import ToolError
+
+        from integrator.propose import propose_source, KIND_MEANINGS
+
+        with pytest.raises(ToolError) as caught:
+            propose_source(self._ctx(), kind="pdf", title="x")
+        assert set(caught.value.detail["allowed"]) == set(KIND_MEANINGS)
+
+
+class TestCallKeyEdges:
+    def test_a_url_with_and_without_its_trailing_slash(self):
+        from integrator.agent import call_key
+
+        assert (call_key("fetch_url", {"url": "https://x/a.pdf"})
+                == call_key("fetch_url", {"url": "https://x/a.pdf/"}))
+
+    def test_a_query_that_is_only_filler(self):
+        """Two searches made of nothing but stopwords are the same search."""
+        from integrator.agent import call_key
+
+        assert (call_key("research", {"query": "the PDF of the"})
+                == call_key("research", {"query": "a PDF for an"}))
+
+    def test_a_missing_argument_does_not_raise(self):
+        from integrator.agent import call_key
+
+        for args in ({}, {"url": None}, {"query": ""}, {"doi": None}):
+            assert isinstance(call_key("fetch_url", args), str)
+            assert isinstance(call_key("research", args), str)
+
+    def test_unicode_in_a_query_is_handled(self):
+        from integrator.agent import call_key
+
+        assert isinstance(call_key("research", {"query": "Οδηγός"}), str)
+
+    def test_two_different_tools_never_share_a_key(self):
+        from integrator.agent import call_key
+
+        assert (call_key("fetch_url", {"url": "https://x/a"})
+                != call_key("licence_evidence", {"url": "https://x/a"}))

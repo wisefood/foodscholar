@@ -282,6 +282,17 @@ class Integration:
             # is no document to attach and no entity to hang it from. It has
             # its own short path.
             if self.proposal.kind == "rcollection":
+                # A harvested recipe is the site's own text in our database,
+                # so there is no pointer-only version of this: either the
+                # licence permits copying or there is nothing to do. Refused
+                # here rather than by the write tool, so the run does not
+                # start an import that is going to be rejected.
+                if not content_permitted(self.proposal):
+                    raise IntegrationError(
+                        "this licence does not permit copying the content in, "
+                        "and a recipe collection is nothing but content — there "
+                        "is no reference-only version to register. Establish a "
+                        "licence that permits it, or reject this proposal.")
                 self._harvest()
                 self.stage = "done"
                 self.steps.add("done", "Integration complete",
@@ -376,6 +387,15 @@ class Integration:
         wants_file = content_permitted(self.proposal)
         if self.proposal.kind in (*EXTRACTS, *CHUNKS) and wants_file:
             self._fetch_the_document()
+        # The catalog requires a canonical URL on a guide, and a proposal
+        # without one only fails at the create call, after the document has
+        # been fetched and the curator's time spent.
+        if self.proposal.kind in ("guide", "textbook") and not self.proposal.source_url:
+            raise IntegrationError(
+                "this proposal has no source URL, and the catalog requires one "
+                "on the entry. Add it to the proposal, or reject it. Nothing "
+                "was created.")
+
         # The catalog requires a licence on a guide, and `approve` guarantees
         # that a proposal without one carries a written reason instead — so
         # this only fires if a proposal reached here some other way.

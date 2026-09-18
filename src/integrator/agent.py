@@ -45,6 +45,31 @@ KEEP_FULL_RESULTS = 3
 #: connection and the one that is not will not improve on the third go.
 MAX_ATTEMPTS = 2
 
+#: Failures that will not come out differently on a second go, because the
+#: arguments are the problem rather than the world. Retrying these spends a
+#: step to be told the same thing — and the model, seeing a fresh error
+#: rather than "you already asked", tends to try a third time.
+PERMANENT_CODES = frozenset({
+    "approval_required", "writes_disabled", "licence_forbids_content",
+    "unknown_kind", "unknown_licence", "not_a_doi", "journal_not_found",
+    "not_a_url", "blocked_destination",
+})
+
+
+def is_permanent(outcome: Dict[str, Any]) -> bool:
+    """Whether a failed call is worth trying again.
+
+    A refused argument is permanent: the same call makes the same refusal. A
+    dropped connection is not — that one is worth a second go, and is why
+    failures are retried at all.
+    """
+    error = outcome.get("error") or {}
+    if error.get("code") in PERMANENT_CODES:
+        return True
+    # The arguments did not match the tool's contract. Nothing about the
+    # world will change that.
+    return bool(error.get("problems"))
+
 SYSTEM_PROMPT = """\
 You help a WiseFood curator find and integrate new sources into the platform's data catalog: national dietary guides, scientific articles, textbooks, food composition tables and recipe collections.
 
@@ -244,7 +269,7 @@ class IntegratorAgent:
                     # the same error, so the turn could never recover from a
                     # blip. A call that keeps failing still stops, at
                     # MAX_ATTEMPTS, so this cannot become a loop.
-                    if outcome.get("ok"):
+                    if outcome.get("ok") or is_permanent(outcome):
                         seen[key] = outcome
                     else:
                         attempts[key] = attempts.get(key, 0) + 1

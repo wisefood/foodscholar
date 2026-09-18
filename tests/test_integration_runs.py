@@ -19,6 +19,7 @@ from __future__ import annotations
 
 
 
+import json
 import re
 from pathlib import Path
 import pytest
@@ -1177,3 +1178,156 @@ def test_a_different_document_on_the_same_site_is_let_through(registry, store, f
 
     outcome, _saved = run_integration(proposal, registry, ctx)
     assert outcome["status"] == "succeeded", outcome.get("error")
+
+
+class TestARunStopsWithSomethingUsefulToSay:
+    """Every way a run can fail should leave a curator knowing what happened
+    and whether anything landed. A run that stops with a stack trace, or with
+    half a guide and no mention of it, is worse than one that never started.
+    """
+
+    def test_a_proposal_for_a_kind_nothing_handles(self, registry, store):
+        proposal = make_proposal(store, kind="fctable")
+        store.update(proposal.id, kind="dataset")
+        ctx, _core = make_context(store, data_client=FakeDataClient())
+        outcome, _saved = run_integration(store.get(proposal.id), registry, ctx)
+        assert outcome["status"] == "failed"
+        assert "dataset" in outcome["error"]
+        # It names the kinds that do work, so the next try is informed.
+        assert "guide" in outcome["error"]
+
+    def test_a_proposal_nobody_approved(self, registry, store):
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        proposal = store.create(Proposal(
+            id=new_proposal_id(), kind="guide", title="Unapproved",
+            status="proposed", licence="CC-BY-4.0",
+            source_url="https://x.test/a.pdf"))
+        ctx, _core = make_context(store, data_client=FakeDataClient())
+        outcome, _saved = run_integration(proposal, registry, ctx)
+        assert outcome["status"] == "failed" and "approved" in outcome["error"]
+        assert outcome["wrote_anything"] is False
+
+    def test_a_run_with_no_catalog_access(self, registry, store):
+        """The token was not forwarded or has expired. Saying so is the whole
+        job — retrying without signing in again cannot work."""
+        from wisefood_mcp import ToolContext
+
+        proposal = make_proposal(store)
+        ctx = ToolContext(data_client=None, proposal_store=store,
+                          writes_enabled=True, actor="curator-1")
+        outcome, _saved = run_integration(proposal, registry, ctx)
+        assert outcome["status"] == "failed"
+        assert "sign in again" in outcome["error"].lower()
+
+    def test_a_guide_with_no_source_url_at_all(self, registry, store):
+        """The catalog requires a canonical URL. Catching it here costs a
+        preflight; catching it at the create call costs the fetch, the
+        entity and the curator's afternoon."""
+        proposal = make_proposal(store)
+        store.update(proposal.id, source_url=None)
+        ctx, _core = make_context(store, data_client=FakeDataClient())
+        outcome, _saved = run_integration(store.get(proposal.id), registry, ctx)
+        assert outcome["status"] == "failed"
+        assert "source URL" in outcome["error"]
+
+    def test_the_timeline_survives_a_failure(self, registry, store):
+        """Whatever went wrong, the steps up to it are still readable — that
+        is what a curator reads to decide what to do next."""
+        proposal = make_proposal(store)
+        client = FakeDataClient()
+
+        def refuse(**_fields):
+            raise RuntimeError("the catalog said no")
+
+        client.guides.create = refuse
+        ctx, _core = make_context(store, data_client=client)
+
+        outcome, _saved = run_integration(proposal, registry, ctx)
+        assert outcome["status"] == "failed"
+        assert outcome["steps"], "a failed run still shows its work"
+        assert outcome["steps"][-1]["kind"] == "stop"
+        assert all("title" in step for step in outcome["steps"])
+
+    def test_an_unexpected_exception_is_still_a_clean_failure(self, registry, store):
+        proposal = make_proposal(store)
+        client = FakeDataClient()
+
+        def explode(**_fields):
+            raise ZeroDivisionError("something nobody predicted")
+
+        client.guides.create = explode
+        ctx, _core = make_context(store, data_client=client)
+
+        outcome, _saved = run_integration(proposal, registry, ctx)
+        assert outcome["status"] == "failed"
+        assert "ZeroDivisionError" in outcome["error"]
+        assert outcome["finished"] is True, "the run closes rather than hanging"
+
+
+class TestHarvestEdges:
+    """A recipe import reads somebody's whole site. The ways it can go wrong
+    are all ways a curator ends up with a partial corpus and no idea."""
+
+    def _ex(self, *, statuses, metadata=None, licence="CC-BY-4.0", dry_run=False):
+        from wisefood_mcp import ToolContext
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        from integrator.executor import Integration
+
+        polls = list(statuses)
+        seen = []
+
+        class Registry:
+            def call(self, tool, args, ctx):
+                parsed = json.loads(args) if isinstance(args, str) else args
+                seen.append((tool, parsed))
+                if tool == "import_recipe_source":
+                    return {"ok": True, "result": {"run_id": "r1"}}
+                if tool == "recipe_import_status":
+                    return {"ok": True, "result": polls.pop(0) if polls else
+                            {"finished": True, "status": "done"}}
+                return {"ok": True, "result": {"items": []}}
+
+        proposal = Proposal(
+            id=new_proposal_id(), kind="rcollection", title="A site",
+            status="approved", licence=licence, country="IE",
+            source_url="https://food.test",
+            metadata=metadata if metadata is not None
+            else {"harvest_location": "https://food.test/sitemap.xml"})
+        ex = Integration(proposal=proposal, registry=Registry(),
+                         ctx=ToolContext(proposal_store=None, data_client=object()),
+                         persist=lambda _s: None, dry_run=dry_run,
+                         poll_interval=0, sleep=lambda _s: None)
+        return ex, seen
+
+    def test_an_import_that_reports_nothing_at_all(self):
+        ex, _seen = self._ex(statuses=[{"finished": True, "status": "done"}])
+        out = ex.run()
+        assert out["status"] == "failed" and "found no recipes" in out["error"]
+
+    def test_counts_that_come_back_as_none(self):
+        ex, _seen = self._ex(statuses=[
+            {"finished": True, "status": "done", "found": 5, "written": None},
+            {"finished": True, "status": "done", "found": 5, "written": None},
+        ])
+        out = ex.run()
+        assert out["status"] in ("succeeded", "failed"), "it decides, either way"
+
+    def test_a_limit_from_the_proposal_is_carried_through(self):
+        ex, seen = self._ex(metadata={"harvest_location": "https://food.test/s.xml",
+                                      "limit": 25},
+                            statuses=[{"finished": True, "status": "done",
+                                       "found": 3, "written": 0},
+                                      {"finished": True, "status": "done",
+                                       "found": 3, "written": 3}])
+        ex.run()
+        imports = [a for t, a in seen if t == "import_recipe_source"]
+        assert imports[0]["limit"] == 25
+
+    def test_a_licence_that_forbids_copying_never_starts_an_import(self):
+        """A recipe corpus is content. Undetermined counts as not permitted."""
+        ex, seen = self._ex(licence=None, statuses=[])
+        out = ex.run()
+        assert not any(t == "import_recipe_source" for t, _ in seen)
+        assert out["status"] == "failed"
