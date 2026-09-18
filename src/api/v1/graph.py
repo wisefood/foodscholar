@@ -29,6 +29,7 @@ from typing import Optional
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
+from config import config
 from exceptions import NotFoundError
 from models.kg import (
     CardView,
@@ -99,6 +100,17 @@ def graph_summary(request: Request):
     document at projection time, so a stale index is visible rather than
     merely suspected.
     """
+    # Whether the feature is on is answered before whether it has been built,
+    # and separately, because the two are different situations. Only the routes
+    # that reach the source stores check KG_ENABLED — the browse routes read an
+    # Elasticsearch index and would happily serve one left behind by a
+    # deployment that has since switched the graph off. Without this an
+    # interface cannot tell "not enabled here" from "nobody has run the
+    # projector", and it will tell the user to look for a button that does not
+    # exist.
+    if not config.settings["KG_ENABLED"]:
+        return GraphSummary(enabled=False, built=False)
+
     status = kg_projector.status()
     if not status.get("built"):
         return GraphSummary(built=False)
@@ -426,8 +438,6 @@ async def stream_graph(
     than asking for everything at once.
     """
     if depth_max is None:
-        from config import config
-
         depth_max = config.settings["KG_STREAM_DEFAULT_DEPTH"]
 
     filters = _filters(

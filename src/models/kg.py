@@ -216,6 +216,14 @@ class FacetSummary(BaseModel):
 class GraphSummary(BaseModel):
     """What the browse index currently holds."""
 
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether this deployment serves the graph at all. Distinct from "
+            "`built`: switched off and never projected are different answers "
+            "and want different words in an interface"
+        ),
+    )
     built: bool
     alias: Optional[str] = None
     documents: int = 0

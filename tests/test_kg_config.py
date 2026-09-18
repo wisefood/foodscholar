@@ -83,3 +83,18 @@ def test_the_stream_depth_default_matches_what_the_interface_asks_for(settings):
     shows the truth on first paint. If this default moved, the two would
     disagree about what the map is showing."""
     assert settings()["KG_STREAM_DEFAULT_DEPTH"] == 2
+
+
+def test_the_summary_model_separates_enabled_from_built():
+    """An interface has to tell "switched off here" from "nobody has run the
+    projector". Only the summary can answer the first: every other browse route
+    reads the projected Elasticsearch index, which an index left behind by a
+    deployment that later switched the graph off would still satisfy."""
+    from models.kg import GraphSummary
+
+    off = GraphSummary(enabled=False, built=False)
+    assert off.enabled is False and off.built is False
+
+    # Enabled but never projected — the case with a rebuild button behind it.
+    not_built = GraphSummary(built=False)
+    assert not_built.enabled is True and not_built.built is False
