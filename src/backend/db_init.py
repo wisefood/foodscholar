@@ -95,6 +95,15 @@ def _apply_schema_updates(conn) -> None:
         CREATE INDEX IF NOT EXISTS ix_qa_feedback_correlation_id
         ON {SCHEMA}.qa_feedback (correlation_id)
         """,
+        # A successful integration used to be written as "integrated", which
+        # is not in stores.STATUSES and which the console does not recognise:
+        # those proposals render as "dropped" with no status label. The writer
+        # now says "imported"; this brings the rows already on disk with it.
+        f"""
+        UPDATE {SCHEMA}.integration_proposals
+        SET status = 'imported'
+        WHERE status = 'integrated'
+        """,
     ]
 
     for stmt in statements:

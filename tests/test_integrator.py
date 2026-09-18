@@ -20,6 +20,8 @@ import os
 import types
 import uuid
 
+import pathlib
+
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -658,6 +660,39 @@ def test_a_second_press_does_not_start_a_second_run(store, proposal, monkeypatch
 
     with pytest.raises(RuntimeError, match="already running"):
         service.start_integration(proposal_id=proposal.id, user_sub="curator-1")
+
+
+def test_a_failed_proposal_can_be_approved_again(store, proposal, monkeypatch):
+    """The dead end. A proposal's status follows its last run, so a failure
+    left it neither `approved` (start_integration refused it) nor approvable
+    (approve refused it), and the console showed the run panel without an
+    Approve button — the only button on the card was the one that 403s.
+
+    This stops at the gate rather than starting a run: what was broken is the
+    pair of status checks, and the work behind them needs a live extraction.
+    """
+    from config import config
+    from wisefood_mcp.stores import approve
+    from integrator import service
+
+    approve(store, proposal.id, actor="curator-1",
+            override_reason="national agency, licence being confirmed by email")
+    monkeypatch.setitem(config.settings, "INTEGRATOR_WRITES_ENABLED", True)
+
+    # What the executor writes when a run does not finish.
+    store.update(proposal.id, status="failed")
+    with pytest.raises(PermissionError, match="not been approved"):
+        service.start_integration(proposal_id=proposal.id, user_sub="curator-1")
+
+    # Re-approving is the way back, and it records who asked for the retry.
+    retried = approve(store, proposal.id, actor="curator-2",
+                      override_reason="retrying after a timeout")
+    assert retried.status == "approved"
+    assert retried.approved_by == "curator-2"
+
+    # Which is exactly what start_integration gates on, so the refusal above
+    # no longer applies.
+    assert store.get(proposal.id).status == "approved"
 
 
 def test_a_stalled_run_does_not_block_a_retry(store, proposal, monkeypatch):

@@ -847,7 +847,12 @@ def start_integration(*, proposal_id: str, user_sub: str,
         # the queue sees what happened without opening each one.
         try:
             _STORE.update(proposal_id,
-                          status="integrated" if outcome["status"] == "succeeded"
+                          # "imported" is the name in stores.STATUSES and the
+                          # only one the console knows. This wrote "integrated",
+                          # which is in neither, so a successful integration
+                          # fell through stageOf() to "dropped" and showed with
+                          # no label at all.
+                          status="imported" if outcome["status"] == "succeeded"
                           else "failed",
                           result={**(proposal.result or {}), **outcome["result"]})
         except Exception:  # noqa: BLE001
