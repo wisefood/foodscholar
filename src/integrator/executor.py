@@ -154,6 +154,15 @@ def article_spec(proposal) -> Dict[str, Any]:
         spec.setdefault("language", proposal.language)
     if proposal.population_group:
         spec.setdefault("population_group", proposal.population_group)
+    # Both required by `ArticleCreationSchema` and neither guaranteed by
+    # Crossref: a preprint or a report often has no container-title, and the
+    # abstract is frequently absent. Saying so is better than an invented
+    # venue, which would read as a real journal.
+    spec.setdefault("venue", record.get("publisher") or "Not stated")
+    spec.setdefault("content", spec.get("abstract")
+                    or "Awaiting enrichment. The abstract and keywords are "
+                       "filled in from the publisher's record and the article "
+                       "itself after this entry exists.")
     if proposal.rationale and not spec.get("description"):
         spec["description"] = proposal.rationale
     doi = metadata.get("doi") or record.get("doi")
@@ -172,10 +181,96 @@ _PROFILE_TO_FCTABLE = (
 )
 
 
+#: Fields no creation schema for this kind declares. Every schema is
+#: `extra="forbid"`, so sending one is a validation error rather than a field
+#: quietly dropped — `guide_spec` was adding `content` to textbooks and
+#: composition tables, neither of which has it, and every such integration
+#: would have stopped at the create call.
+NOT_ON = {
+    "textbook": ("content", "region"),
+    "fctable": ("content",),
+}
+
+
+def _common(proposal) -> Dict[str, Any]:
+    """The floor every kind shares: what the proposal already knows."""
+    spec = dict((proposal.metadata or {}).get("spec") or {})
+    spec.setdefault("title", proposal.title)
+    if proposal.source_url:
+        spec.setdefault("url", proposal.source_url)
+    if proposal.rationale:
+        spec.setdefault("description", proposal.rationale)
+    return spec
+
+
+def _iso(spec: Dict[str, Any], proposal) -> None:
+    """Region and language as the codes the catalog stores, in place.
+
+    Only where the schema constrains them to two characters. An article takes
+    free text in both, so a name there is not an error and not worth
+    discarding.
+    """
+    region = country_code(spec.get("region") or proposal.country)
+    spec["region"] = region
+    if not region:
+        spec.pop("region", None)
+    language = language_code(spec.get("language") or proposal.language)
+    spec["language"] = language
+    if not language:
+        spec.pop("language", None)
+
+
+def textbook_spec(proposal) -> Dict[str, Any]:
+    """A textbook takes a title and a urn, and has no `content` field.
+
+    Its text arrives as passages, which is a different call and a different
+    table — sending `content` here is rejected outright.
+    """
+    spec = _common(proposal)
+    _iso(spec, proposal)
+    return {k: v for k, v in spec.items() if k not in NOT_ON["textbook"]}
+
+
+def fctable_spec(proposal, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A composition table, with the two fields its schema insists on.
+
+    `compiling_institution` and `database_name` are required and neither is
+    something the profiler measures, so they come from what the proposal
+    knows — and say plainly when that is nothing, rather than inventing an
+    institution that would read as established.
+    """
+    spec = _common(proposal)
+    _iso(spec, proposal)
+    if profile:
+        spec.update(fctable_fields(profile))
+    spec.setdefault("database_name", spec.get("title") or proposal.title)
+    spec.setdefault("compiling_institution",
+                    (proposal.metadata or {}).get("publisher") or "Not stated")
+    return {k: v for k, v in spec.items() if k not in NOT_ON["fctable"]}
+
+
 def fctable_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
     """The measured fields, skipping anything the profiler could not tell."""
     return {key: profile[key] for key in _PROFILE_TO_FCTABLE
             if profile.get(key) not in (None, "", [], {})}
+
+
+def spec_for(proposal, profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The catalog fields for whichever kind this is.
+
+    One builder per kind rather than one for all of them, because the four
+    creation schemas do not agree on what they require or even accept — a
+    textbook has no `content` field, an article insists on `venue`, a
+    composition table insists on a compiling institution. Sending the union
+    of them is how an approved integration stops at the very last call.
+    """
+    if proposal.kind == "article":
+        return article_spec(proposal)
+    if proposal.kind == "textbook":
+        return textbook_spec(proposal)
+    if proposal.kind == "fctable":
+        return fctable_spec(proposal, profile)
+    return guide_spec(proposal)
 
 
 def would_create_count(preview: Dict[str, Any]) -> int:
@@ -636,10 +731,7 @@ class Integration:
                            outcome=f"reusing {self.result['urn']} from an earlier attempt")
             return self.result["urn"]
         tool = CREATE_TOOL[self.proposal.kind]
-        spec = (article_spec if self.proposal.kind == "article" else guide_spec)(
-            self.proposal)
-        if self.proposal.kind in PROFILES and getattr(self, "_profiled", None):
-            spec.update(fctable_fields(self._profiled))
+        spec = spec_for(self.proposal, getattr(self, "_profiled", None))
         created = self._call(tool, {"proposal_id": self.proposal.id, "spec": spec},
                              stage="create")
         urn = (created or {}).get("urn")

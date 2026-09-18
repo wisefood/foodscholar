@@ -1331,3 +1331,63 @@ class TestHarvestEdges:
         out = ex.run()
         assert not any(t == "import_recipe_source" for t, _ in seen)
         assert out["status"] == "failed"
+
+
+class TestEveryKindGetsItsOwnSpec:
+    """The four creation schemas do not agree on what they require or even
+    accept. One builder for all of them is how an approved integration stops
+    at the very last call."""
+
+    def _spec(self, kind, **kw):
+        from integrator.executor import spec_for
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        fields = dict(id=new_proposal_id(), kind=kind, title="A source",
+                      status="approved", licence="CC-BY-4.0", country="Greece",
+                      language="Greek", source_url="https://x.test/a.pdf")
+        fields.update(kw)
+        return spec_for(Proposal(**fields), kw.pop("profile", None))
+
+    def test_a_textbook_is_not_sent_content(self):
+        """Its text arrives as passages — a different call and a different
+        table. `TextbookCreationSchema` has no `content` field at all."""
+        assert "content" not in self._spec("textbook")
+
+    def test_a_composition_table_is_not_sent_content_either(self):
+        assert "content" not in self._spec("fctable")
+
+    def test_a_composition_table_gets_the_two_fields_it_insists_on(self):
+        spec = self._spec("fctable")
+        assert spec["database_name"] and spec["compiling_institution"]
+
+    def test_an_unknown_compiling_institution_says_so(self):
+        """Rather than an invented one, which would read as established."""
+        assert self._spec("fctable")["compiling_institution"] == "Not stated"
+
+    def test_an_article_always_has_a_venue_and_content(self):
+        """Both required, and neither guaranteed by Crossref: a preprint
+        often has no container-title and no abstract."""
+        spec = self._spec("article")
+        assert spec["venue"] and spec["content"]
+
+    def test_a_venue_from_crossref_wins_over_the_fallback(self):
+        from integrator.executor import article_spec
+        from wisefood_mcp.stores import Proposal, new_proposal_id
+
+        proposal = Proposal(
+            id=new_proposal_id(), kind="article", title="A paper",
+            status="approved", licence="CC-BY-4.0",
+            metadata={"doi_metadata": {"found": True, "venue": "Nutrition Journal",
+                                       "abstract": "A real abstract."}})
+        spec = article_spec(proposal)
+        assert spec["venue"] == "Nutrition Journal"
+        assert spec["content"] == "A real abstract."
+
+    def test_a_textbook_gets_its_language_as_a_code(self):
+        assert self._spec("textbook")["language"] == "el"
+
+    def test_a_country_nobody_can_resolve_is_left_out_rather_than_sent(self):
+        """The field is optional, and a name the catalog rejects is worse
+        than no region at all."""
+        spec = self._spec("guide", country="Atlantis")
+        assert "region" not in spec
