@@ -38,3 +38,16 @@ pyarrow==23.0.1
 numpy==1.26.4
 pandas==3.0.1
 langfuse>=3.0.0,<4.0.0
+# The hierarchical knowledge graph, read-only. The graph is built offline by a
+# job running the library's own phases; this service projects it into an
+# Elasticsearch browse index and serves browse reads from there.
+#
+# Extras are [elastic,neo4j] deliberately. annotate/clustering/bertopic/llm are
+# what *builds* a graph — they pull GLiNER, Leiden, BERTopic and four LLM SDKs,
+# and gliner pins transformers versions that fight the 4.49.0 above. [viz] is
+# omitted too: the VizGraph model this service streams is plain Pydantic, and
+# only the renderers behind .render() need that extra, which nothing here calls.
+#
+# Pinned to a commit because the library has no release tag yet. Replace with
+# @v0.1.0 once one is cut — a moving branch is not a dependency.
+foodscholar[elastic,neo4j] @ git+https://github.com/wisefood/foodscholar-lib.git@a5289474f1f151cb113ea6e27c543887b3bc0c7b

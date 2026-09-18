@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy import text
 
 from routers.generic import install_error_handler
-from api.v1 import search, sessions, enrich, qa, guidelines, integrator
+from api.v1 import search, sessions, enrich, qa, guidelines, integrator, graph
 from services.linearrag_service import get_retriever
 from backend.db_init import init_db
 from workers.enrichment_worker import (
@@ -56,6 +56,32 @@ async def lifespan(app: FastAPI):
     init_db()
     # Warm up LinearRAG
     get_retriever()
+
+    # Open the knowledge graph stores, if this deployment serves the graph.
+    # Deliberately not a reindex: the browse index is built by an explicit
+    # POST /graph/reindex after an offline graph build, so a rolling restart
+    # cannot kick off one projection per replica. A missing index is logged
+    # here and reported by /health rather than discovered by a user.
+    if config.settings["KG_ENABLED"]:
+        try:
+            from services import kg_projector, kg_service
+
+            logger.info("Knowledge graph: %s", kg_service.info())
+            kg_status = kg_projector.status()
+            if kg_status.get("built"):
+                logger.info(
+                    "Knowledge graph browse index ready: %s documents, build %s",
+                    kg_status.get("documents"), kg_status.get("graph_version"),
+                )
+            else:
+                logger.warning(
+                    "Knowledge graph browse index is missing - browse routes will "
+                    "answer 503 until POST /api/v1/graph/reindex runs."
+                )
+        except Exception as exc:
+            # The graph is one feature among many; it must not stop the rest
+            # of the service from starting.
+            logger.error("Knowledge graph unavailable at startup: %s", exc)
     
     from backend.postgres import POSTGRES_ASYNC_ENGINE
     eng = POSTGRES_ASYNC_ENGINE()
@@ -107,6 +133,10 @@ async def lifespan(app: FastAPI):
     if config.settings.get("ENABLE_GUIDELINE_ENRICHMENT_WORKER", True):
         logger.info("Stopping guideline enrichment worker...")
         stop_guideline_enrichment_worker()
+
+    if config.settings["KG_ENABLED"]:
+        from services import kg_service
+        kg_service.shutdown()
 
     logger.info("App shutdown: closing DB connections")
     from backend.postgres import PostgresConnectionSingleton
@@ -177,6 +207,7 @@ app.include_router(enrich.router, prefix="/api/v1")
 app.include_router(qa.router, prefix="/api/v1")
 app.include_router(guidelines.router, prefix="/api/v1")
 app.include_router(integrator.router, prefix="/api/v1")
+app.include_router(graph.router, prefix="/api/v1")
 
 
 @app.get("/")
@@ -206,6 +237,15 @@ async def root():
             "guideline_worker_status": "/api/v1/guidelines/worker/status",
             "trending": "/api/v1/search/trending",
             "chat": "/api/v1/sessions/chat",
+            "graph_summary": "/api/v1/graph/summary",
+            "graph_facets": "/api/v1/graph/facets",
+            "graph_node": "/api/v1/graph/nodes/{node_id}",
+            "graph_search": "/api/v1/graph/search",
+            "graph_suggest": "/api/v1/graph/suggest",
+            "graph_stream": "/api/v1/graph/stream",
+            "graph_stream_expand": "/api/v1/graph/stream/expand",
+            "graph_entities": "/api/v1/graph/entities",
+            "graph_reindex": "/api/v1/graph/reindex",
             "docs": "/docs",
             "health": "/health",
         },
@@ -222,6 +262,10 @@ async def health_check():
         "cache_enabled": config.settings["CACHE_ENABLED"],
         "elasticsearch_host": config.settings["ELASTIC_HOST"],
     }
+
+    if config.settings["KG_ENABLED"]:
+        from services import kg_projector
+        health_data["knowledge_graph"] = kg_projector.status()
 
     # Add worker status if enabled
     if config.settings["ENABLE_BACKGROUND_WORKER"]:
