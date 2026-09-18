@@ -14,8 +14,13 @@ ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# git is not a build tool here, it is a transport: requirements.txt installs
+# the foodscholar knowledge graph library from a git URL because it has no PyPI
+# release yet. It stays in this stage, so unlike the single-stage version there
+# is nothing to purge — it never exists in the image that ships. Drop it once
+# the library is published as a wheel.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
 # A venv rather than the system site-packages, so stage 2 is one COPY of one
