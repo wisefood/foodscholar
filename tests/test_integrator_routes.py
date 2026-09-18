@@ -1142,3 +1142,67 @@ class TestCallKeyEdges:
 
         assert (call_key("fetch_url", {"url": "https://x/a"})
                 != call_key("licence_evidence", {"url": "https://x/a"}))
+
+
+class TestARunningCountTheModelCannotWriteAround:
+    """Told once in the prompt not to overstate its filings, the assistant
+    reported eight for five calls, then five for two. A number handed back
+    after every call is harder to write around than an instruction it read at
+    the start of the turn."""
+
+    def _agent(self, filings):
+        from wisefood_mcp import ToolContext
+
+        from integrator.agent import Budget, IntegratorAgent
+
+        results = []
+
+        class Registry:
+            def openai_schemas(self, include_writes=False):
+                return [{"type": "function", "function": {"name": "propose_source"}}]
+
+            def call(self, name, args, ctx):
+                parsed = json.loads(args) if isinstance(args, str) else args
+                return {"ok": True, "result": {
+                    "proposal_id": f"id-{parsed['title']}", "status": "proposed"}}
+
+        class Groq:
+            def __init__(self):
+                calls = [_delta(tool_calls=[{
+                    "index": i, "id": f"c{i}", "type": "function",
+                    "function": {"name": "propose_source",
+                                 "arguments": json.dumps(
+                                     {"kind": "guide", "title": t})}}])
+                    for i, t in enumerate(filings)]
+                self.replies = [[*calls, _usage(1)],
+                                [_delta(content="done"), _usage(1)]]
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                return iter(self.replies.pop(0))
+
+        agent = IntegratorAgent(registry=Registry(),
+                                tool_context=ToolContext(proposal_store=None),
+                                groq_client=Groq(), budget=Budget(max_steps=20))
+        out = agent.run_streamed([], "file them", lambda *_a: None)
+        for message in out["messages"]:
+            if message.get("role") == "tool":
+                results.append(json.loads(message["content"]))
+        return out, results
+
+    def test_each_filing_is_told_how_many_there_have_been(self):
+        _out, results = self._agent(["A", "B", "C"])
+        counts = [r.get("filed_so_far_this_turn") for r in results]
+        assert counts == [1, 2, 3]
+
+    def test_the_count_is_said_in_words_it_will_read(self):
+        _out, results = self._agent(["A", "B"])
+        assert "2 filed in this turn" in results[-1]["note"]
+        assert "do not count sources you only considered" in results[-1]["note"]
+
+    def test_the_record_and_the_count_agree(self):
+        """Two ways of saying the same thing, from the same source — if they
+        ever disagree, the record is the one on screen."""
+        out, results = self._agent(["A", "B", "C", "D"])
+        filed = [s for s in out["timeline"] if s.get("data", {}).get("filed")]
+        assert len(filed) == results[-1]["filed_so_far_this_turn"] == 4

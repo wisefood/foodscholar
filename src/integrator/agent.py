@@ -188,6 +188,8 @@ class IntegratorAgent:
         #: Failures per call, so a transient one can be retried and a
         #: permanent one still stops.
         attempts: Dict[str, int] = {}
+        #: How many proposals this turn has actually filed.
+        filed_count = 0
         # What the curator sees while this runs and afterwards. Started here
         # rather than inside the tool loop so a turn that calls no tools still
         # says that it thought about the question.
@@ -298,6 +300,19 @@ class IntegratorAgent:
                             "title": (parsed_args or {}).get("title"),
                             "kind": (parsed_args or {}).get("kind"),
                         }}
+                        filed_count += 1
+                        # The running total, in the result the model reads.
+                        # Telling it once in the prompt not to overstate its
+                        # filings has not held: it reported eight for five
+                        # calls, then five for two. A number it is handed
+                        # after every call is harder to write around than an
+                        # instruction it saw at the start.
+                        payload["filed_so_far_this_turn"] = filed_count
+                        payload["note"] = (
+                            f"that is {filed_count} filed in this turn. If you "
+                            f"summarise your work, this is the number — do not "
+                            f"count sources you only considered.")
+                        outcome = {**outcome, "result": payload}
                 steps.finish(step, ok=ok, outcome=(
                     "Already run this turn — reusing the answer"
                     if repeat else finished_detail(

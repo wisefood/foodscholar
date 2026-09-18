@@ -210,6 +210,14 @@ def history(*, session_id: str, user_sub: str) -> List[Dict[str, Any]]:
         ]
 
 
+class AlreadyIntegrated(RuntimeError):
+    """The proposal has already been through a successful run.
+
+    A RuntimeError so the route answers 409: this is a conflict with the
+    state of the thing, not a question of permission.
+    """
+
+
 class RateLimited(RuntimeError):
     """Too much, too fast. Carries how long to wait, so a client can say so."""
 
@@ -791,7 +799,24 @@ def start_integration(*, proposal_id: str, user_sub: str,
     proposal = _STORE.get(proposal_id)
     if proposal is None:
         raise LookupError("no such proposal")
-    if proposal.status != "approved":
+    # Already done. Saying "not approved" here sent a curator looking for an
+    # approve button when the truth was the opposite: it was approved, it ran,
+    # and it worked.
+    if proposal.status == "imported":
+        raise AlreadyIntegrated(
+            f"this proposal was already integrated"
+            + (f" as {(proposal.result or {}).get('urn')}"
+               if (proposal.result or {}).get("urn") else "")
+            + ". Open that entry if it needs changing; running it again would "
+              "create a second copy.")
+
+    # `failed` is retryable, and has to be. Approval is a person's judgement
+    # about a source, and it does not stop being true because a run hit a bug
+    # — which is exactly what happened to eight proposals in one afternoon,
+    # every one of them left permanently unrunnable by a check that only
+    # accepted `approved`. The run itself is idempotent about what already
+    # landed, so a retry resumes rather than duplicating.
+    if proposal.status not in ("approved", "failed"):
         raise PermissionError("this proposal has not been approved")
     if not config.settings.get("INTEGRATOR_WRITES_ENABLED", False):
         raise PermissionError(
