@@ -415,8 +415,25 @@ class Config:
         self.settings["KG_NEO4J_URL"] = os.getenv(
             "KG_NEO4J_URL", "bolt://neo4j:7687"
         )
-        self.settings["KG_NEO4J_USER"] = os.getenv("KG_NEO4J_USER", "neo4j")
-        self.settings["KG_NEO4J_PASSWORD"] = os.getenv("KG_NEO4J_PASSWORD", "")
+        # Credentials, from either shape.
+        #
+        # This platform already holds one Neo4j credential, as the secret the
+        # database itself is started with: NEO4J_AUTH, a single "user/password"
+        # string, which is the format Neo4j's own image defines. Accepting it
+        # here means the deployment passes that same secret through rather than
+        # storing the password a second time under a different key — and two
+        # copies of one credential is a rotation that quietly half-applies.
+        #
+        # Split on the FIRST separator only: a password may contain "/", a
+        # username may not.
+        _neo4j_auth = os.getenv("KG_NEO4J_AUTH", "")
+        _auth_user, _, _auth_password = _neo4j_auth.partition("/")
+        self.settings["KG_NEO4J_USER"] = os.getenv(
+            "KG_NEO4J_USER", _auth_user or "neo4j"
+        )
+        self.settings["KG_NEO4J_PASSWORD"] = os.getenv(
+            "KG_NEO4J_PASSWORD", _auth_password
+        )
 
         # The browse index. Reads go through the alias; the projector writes
         # <alias>_<graph_version> and repoints it, so a reader never sees a
