@@ -1,0 +1,8 @@
+# Pins that exist to stop a resolver spending gigabytes of disk.
+#
+# Nothing in requirements.txt asks for torch; sentence-transformers and
+# scispacy do. The Dockerfile installs the CPU build first, and this file makes
+# that binding: if a dependency bump ever wants a different version, pip stops
+# and says so instead of quietly fetching the CUDA wheel and its nvidia-*
+# dependencies, which is ~800MB downloaded and several GB on disk.
+torch==2.6.0

@@ -23,6 +23,18 @@ tests/
 .venv/
 venv/
 
+# The LinearRAG index — 617MB, and the whole build context.
+#
+# It is runtime data, not build input: `linearrag_service` sets
+# `working_dir=src/data` and reads `src/data/<dataset_name>`. It is also
+# untracked in git, so baking it in produced an image that could not be
+# rebuilt from a checkout — a clean clone shipped an empty index silently.
+#
+# Mount it instead (docker-compose does; see the volume there). Without the
+# mount the `linearrag` retriever fails on a missing file and the `rag` and
+# `no_rag` retrievers are unaffected.
+src/data/
+
 # Docker
 Dockerfile
 docker-compose.yaml
