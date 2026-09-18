@@ -43,10 +43,15 @@ def _proposal(kind, **kw):
     return Proposal(**fields)
 
 
+#: proxy name per kind, as `_create` is called with.
+PROXY = {"guide": "guides", "article": "articles",
+         "textbook": "textbooks", "fctable": "fctables"}
+
+
 def _posted(proposal, profile=None):
     """The body `_create` would actually send for this proposal."""
     from wisefood_mcp.licences import normalise_licence
-    from wisefood_mcp.tools.writes import _slug
+    from wisefood_mcp.tools.writes import HAS_STATUS, _slug
 
     from integrator.executor import spec_for
 
@@ -54,6 +59,8 @@ def _posted(proposal, profile=None):
     spec.setdefault("url", proposal.source_url)
     spec["urn"] = _slug(spec.get("title") or proposal.title, proposal.id)
     spec["license"] = normalise_licence(proposal.licence)
+    if PROXY[proposal.kind] in HAS_STATUS:
+        spec.setdefault("status", "draft")
     return {k: v for k, v in spec.items() if v is not None}
 
 
@@ -151,3 +158,33 @@ def test_every_urn_we_build_matches_the_slug_pattern(kind):
         assert re.fullmatch(r"[a-z0-9]+(?:[-_][a-z0-9]+)*", body["urn"]), title
         assert len(body["urn"]) <= 100
         _model(schemas, kind)(**body)
+
+
+@pytest.mark.parametrize("kind", ["guide", "textbook"])
+def test_nothing_is_published_by_being_created(kind):
+    """`GuideCreationSchema` defaults `status` to `active`, and the catalog
+    refuses an active guide that nobody has verified — `entities/guides.py`
+    raises "Guide must be verified before it can be published as active."
+    So an integration asked for publication every time and was refused every
+    time. Nothing the assistant brings in is published by being brought in.
+    """
+    _schemas()
+    assert _posted(_proposal(kind))["status"] == "draft"
+
+
+@pytest.mark.parametrize("kind", ["article", "fctable"])
+def test_a_kind_with_no_status_field_is_never_sent_one(kind):
+    schemas = _schemas()
+    assert "status" not in _model(schemas, kind).model_fields
+    assert "status" not in _posted(_proposal(kind))
+
+
+@pytest.mark.parametrize("kind", ["guide", "textbook"])
+def test_a_draft_does_not_need_a_verifier(kind):
+    """The whole point of landing as a draft: the editorial gate applies to
+    publishing, and this is not publishing."""
+    schemas = _schemas()
+    body = _posted(_proposal(kind))
+    built = _model(schemas, kind)(**body)
+    assert built.status == "draft"
+    assert getattr(built, "review_status", "unreviewed") == "unreviewed"
