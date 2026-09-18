@@ -377,6 +377,90 @@ class Config:
             os.getenv("QA_STREAM_HEARTBEAT_SECONDS", "15")
         )
 
+        # ------------------------------------------------------------------
+        # Knowledge graph browsing (foodscholar-lib)
+        #
+        # The graph itself is built offline: a job runs the library's phases
+        # and writes shelves/themes/cards into Neo4j and chunks/cards into
+        # Elasticsearch. This service never builds it. It projects that graph
+        # into one denormalized browse index (services/kg_projector.py) and
+        # serves every browse read from there, so replicas stay stateless and
+        # a page of the tree is an inverted-index lookup rather than a graph
+        # traversal.
+        #
+        # Off by default: a deployment that has never run the build should
+        # start clean and answer a readable 503 on the browse routes, not
+        # fail a request at a time.
+        # ------------------------------------------------------------------
+        self.settings["KG_ENABLED"] = (
+            os.getenv("KG_ENABLED", "false").lower() == "true"
+        )
+
+        # Source stores, written by the offline build. KG_ES_URL follows
+        # backend.elastic's ELASTIC_HOST rather than the ELASTIC_HOST setting
+        # above: the two disagree on the service name, and backend.elastic is
+        # the one that actually opens connections.
+        self.settings["KG_ES_URL"] = os.getenv(
+            "KG_ES_URL", os.getenv("ELASTIC_HOST", "http://elastic:9200")
+        )
+        self.settings["KG_CHUNK_INDEX"] = os.getenv(
+            "KG_CHUNK_INDEX", "foodscholar_chunks"
+        )
+        self.settings["KG_CARD_INDEX"] = os.getenv(
+            "KG_CARD_INDEX", "foodscholar_cards"
+        )
+        self.settings["KG_ES_API_KEY"] = os.getenv("KG_ES_API_KEY", "")
+        self.settings["KG_ES_USERNAME"] = os.getenv("KG_ES_USERNAME", "")
+        self.settings["KG_ES_PASSWORD"] = os.getenv("KG_ES_PASSWORD", "")
+        self.settings["KG_NEO4J_URL"] = os.getenv(
+            "KG_NEO4J_URL", "bolt://neo4j:7687"
+        )
+        self.settings["KG_NEO4J_USER"] = os.getenv("KG_NEO4J_USER", "neo4j")
+        self.settings["KG_NEO4J_PASSWORD"] = os.getenv("KG_NEO4J_PASSWORD", "")
+
+        # The browse index. Reads go through the alias; the projector writes
+        # <alias>_<graph_version> and repoints it, so a reader never sees a
+        # half-built index and a rollback is one alias move.
+        self.settings["KG_BROWSE_ALIAS"] = os.getenv(
+            "KG_BROWSE_ALIAS", "foodscholar_browse"
+        )
+        self.settings["KG_BROWSE_BULK_SIZE"] = int(
+            os.getenv("KG_BROWSE_BULK_SIZE", "500")
+        )
+        # Only one replica may project at a time: the job reads the whole
+        # graph and rewrites an index, and two of them racing would burn the
+        # cluster for no extra freshness.
+        self.settings["KG_REINDEX_LOCK_KEY"] = os.getenv(
+            "KG_REINDEX_LOCK_KEY", "kg:reindex:lock"
+        )
+        self.settings["KG_REINDEX_LOCK_TIMEOUT"] = int(
+            os.getenv("KG_REINDEX_LOCK_TIMEOUT", "3600")
+        )
+        # Node positions are computed once, here, instead of by a force
+        # simulation in every visitor's browser. The seed is fixed so the map
+        # a user learns is the same map next week.
+        self.settings["KG_LAYOUT_SEED"] = int(os.getenv("KG_LAYOUT_SEED", "42"))
+
+        # --- Graph streaming (SSE) ----------------------------------------
+        # Nodes per frame. Bigger frames flush less often and reveal the
+        # graph in chunks; smaller frames draw more smoothly.
+        self.settings["KG_STREAM_BATCH_SIZE"] = int(
+            os.getenv("KG_STREAM_BATCH_SIZE", "250")
+        )
+        # Ceiling per stream, so one unfiltered request on a large graph
+        # cannot hold a worker indefinitely. The terminal event reports
+        # truncated=true when this bites, rather than lying by omission.
+        self.settings["KG_STREAM_MAX_NODES"] = int(
+            os.getenv("KG_STREAM_MAX_NODES", "20000")
+        )
+        # Default level of detail for a stream that asked for no depth.
+        self.settings["KG_STREAM_DEFAULT_DEPTH"] = int(
+            os.getenv("KG_STREAM_DEFAULT_DEPTH", "2")
+        )
+        self.settings["KG_STREAM_HEARTBEAT_SECONDS"] = int(
+            os.getenv("KG_STREAM_HEARTBEAT_SECONDS", "15")
+        )
+
         self._validate_models()
 
         # Langfuse observability (opt-in). Tracing activates only when both
