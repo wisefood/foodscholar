@@ -5,11 +5,13 @@ embed, layer A/B/C) and writes shelves, themes and cards into Neo4j and chunks
 and cards into Elasticsearch. This service never builds it. It opens those
 stores once per process and reads.
 
-Two callers use the facade:
+Three callers use the facade:
 
   - the projector (services/kg_projector), which reads the whole graph once per
     rebuild and writes the browse index;
-  - the detail routes, which read individual chunks and entities.
+  - the detail routes, which read individual chunks and entities;
+  - the `kggen` QA retriever (services/kggen_service), which scores passages
+    over the chunk and relation stores.
 
 Everything else — search, autocomplete, filtering, the tree, the graph slices —
 is served from the browse index and never touches this module.
@@ -76,10 +78,45 @@ def kg_config() -> Dict[str, Any]:
                 "password": s["KG_NEO4J_PASSWORD"] or None,
             },
         },
-        # No "annotate" key and no "llm" key. The embedder is a lazy property
-        # on the facade, so as long as nothing calls search_cards() or a kNN
-        # helper, the 440 MB sentence-transformers model is never loaded —
-        # which is the whole reason browse search is lexical.
+        # Layer 0 relations, on the same cluster as the chunks. This is what
+        # the `kggen` QA retriever's triplet and PageRank branches read; the
+        # browse routes never touch it. `backend` is a separate switch from
+        # the chunk store in the library, so it has to be said explicitly —
+        # left at its "memory" default the relation store would open empty
+        # and both graph branches would silently score nothing.
+        "relations": {
+            "store": {
+                "backend": "elastic",
+                "es_index": s["KG_RELATION_INDEX"],
+            },
+        },
+        # Retrieval scoring. Weights must sum to 1.0 or the library refuses
+        # the config, which surfaces as a 503 on the first graph question
+        # rather than a quietly skewed ranking.
+        "retrieval": {
+            "candidate_k": s["KG_RETRIEVAL_CANDIDATE_K"],
+            "w_text": s["KG_RETRIEVAL_W_TEXT"],
+            "w_triplet": s["KG_RETRIEVAL_W_TRIPLET"],
+            "w_ppr": s["KG_RETRIEVAL_W_PPR"],
+            "subgraph_depth": s["KG_RETRIEVAL_SUBGRAPH_DEPTH"],
+            "max_expansion_calls": s["KG_RETRIEVAL_MAX_EXPANSION_CALLS"],
+            "max_relations": s["KG_RETRIEVAL_MAX_RELATIONS"],
+            "embed_cache_size": s["KG_RETRIEVAL_EMBED_CACHE_SIZE"],
+        },
+        # Only the embedder from the annotate section, and no "llm" key.
+        #
+        # It is named rather than left to the library default because it has
+        # to match the model the graph's chunks were embedded with: kNN
+        # compares the query vector against the stored ones, so a mismatch is
+        # a dimension error or silently meaningless distances, not a small
+        # quality loss. Naming it here also means a graph built with a
+        # different encoder is one env var away from working.
+        #
+        # The model still loads lazily — it is a property on the facade — so
+        # browse-only deployments never pay for it and browse search stays
+        # lexical. A deployment serving `kggen` pays on the first graph
+        # question rather than at boot.
+        "annotate": {"embedder": s["KG_EMBED_MODEL"]},
     }
 
 

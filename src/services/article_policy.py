@@ -205,7 +205,7 @@ def filter_and_rank(
     Drop articles this audience may not see and re-rank the rest by tier.
 
     Belt-and-braces for the ES pre-filter, and the only enforcement available for
-    retrievers that do not go through Elasticsearch (LinearRAG). Guideline
+    retrievers that do not go through the article index (KG-Gen). Guideline
     results pass through untouched, and articles keep their block position in the
     payload list — only their order *within* that block changes, because
     retrieval scores are not comparable across the two indices.

@@ -399,9 +399,9 @@ def format_answer_context(
     # partial answer misleads. Empty for almost every question.
     parts.extend(coverage_prompt_lines(question or ""))
 
-    if retriever == "linearrag":
+    if retriever == "kggen":
         parts.append(
-            "- Evidence shape: graph/passage retrieval; each source text may be a passage rather than a full abstract."
+            "- Evidence shape: knowledge-graph retrieval; each source text is a passage from a document rather than a full abstract."
         )
     elif retriever == "rag":
         parts.append(

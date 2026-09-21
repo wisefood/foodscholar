@@ -746,27 +746,27 @@ async def run_pipeline(
             )
             to_search = repair_plan.to_search
 
-    elif effective_rag and effective_retriever == "linearrag":
-        # Advanced/debug retriever: single pass through the legacy adapter,
-        # then the same ranking and answer stages.
+    elif effective_rag and effective_retriever == "kggen":
+        # Graph retriever: single pass through the adapter, then the same
+        # ranking and answer stages.
         retrieve_started = time.monotonic()
         yield emit(
             "stage.search_started",
             {
                 "sub_question_id": "sq1",
-                "branch": "linearrag",
-                "why": "Graph-based passage retrieval over the article corpus.",
+                "branch": "kggen",
+                "why": "Hybrid retrieval over the knowledge graph: passage text, extracted relationships, and graph proximity.",
                 "lexical_query": plan.article_query,
                 "round": 0,
             },
         )
-        linearrag_step = steps.start(
+        kggen_step = steps.start(
             "search",
             f'Searching the knowledge graph: "{plan.article_query}"',
-            detail="Graph-based passage retrieval over the article corpus.",
-            data={"branch": "linearrag"},
+            detail="Hybrid retrieval over the knowledge graph: passage text, extracted relationships, and graph proximity.",
+            data={"branch": "kggen"},
         )
-        yield emit("step", linearrag_step.model_dump())
+        yield emit("step", kggen_step.model_dump())
         result = await asyncio.to_thread(
             service._retrieve_sources,
             question=effective_question,
@@ -777,7 +777,7 @@ async def run_pipeline(
             expertise_level=request.expertise_level,
         )
         state.branch_statuses.append(
-            {"sub_question_id": "sq1", "branch": "linearrag", **result.status}
+            {"sub_question_id": "sq1", "branch": "kggen", **result.status}
         )
         max_score = max(
             [p.get("_score", 0.0) or 0.0 for p in result.source_payloads] or [1.0]
@@ -804,7 +804,7 @@ async def run_pipeline(
             "stage.search_results",
             {
                 "sub_question_id": "sq1",
-                "branch": "linearrag",
+                "branch": "kggen",
                 "hit_count": len(selected),
                 "ok": result.status.get("ok", False),
                 "top": [],
@@ -823,7 +823,7 @@ async def run_pipeline(
         yield emit(
             "step",
             steps.finish(
-                linearrag_step.id,
+                kggen_step.id,
                 title=f"Found {len(selected)} sources in the knowledge graph",
                 data={"hit_count": len(selected)},
             ).model_dump(),

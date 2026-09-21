@@ -106,8 +106,9 @@ deliberately more than "embed, retrieve, prompt":
   detail genuinely changes the answer (country, age group), the service asks one targeted question
   and resumes from a short-lived thread rather than guessing.
 - **Three retrieval strategies** — `rag` (Elasticsearch kNN over articles plus keyword search over
-  guideline rules), `linearrag` (a graph-based passage retriever), or `no_rag` (model knowledge
-  only, clearly labelled).
+  guideline rules), `kggen` (Extended KG-Gen hybrid retrieval over the knowledge graph: passage
+  text, the relationships extracted from it, and PageRank proximity in the entity graph), or
+  `no_rag` (model knowledge only, clearly labelled).
 - **Expertise-adjusted answers** — `beginner` · `intermediate` · `expert` change both the prose and
   which articles are eligible as evidence.
 - **Citations** — every answer carries the sources it used, with per-source scores.
@@ -217,12 +218,12 @@ the restaurant manager coordinating orders, inventory and staff.
 
 | Module | Responsibility |
 |---|---|
-| **`src/app.py`** | FastAPI app, lifespan (DB init, retriever warm-up, worker start/stop, prompt sync), CORS, router registration, `/health` |
+| **`src/app.py`** | FastAPI app, lifespan (DB init, graph stores, worker start/stop, prompt sync), CORS, router registration, `/health` |
 | **`src/config.py`** | Every environment variable, read once into `config.settings` |
 | **`src/routers/generic.py`** | Response envelope (`APIEnvelope`) and global exception handlers |
 | **`src/api/v1/`** | HTTP surface: `qa`, `search`, `sessions`, `enrich`, `guidelines` |
 | **`src/services/qa_service.py`** | The Q&A pipeline: planning, caching, retrieval, answer assembly, persistence |
-| **`src/services/qa_retrievers.py`** | Retriever adapters (`rag`, `linearrag`, `no_rag`) normalising evidence into one shape |
+| **`src/services/qa_retrievers.py`** | Retriever adapters (`rag`, `kggen`, `no_rag`) normalising evidence into one shape |
 | **`src/services/article_policy.py`** | Reader-visibility filtering and indexing-tier ranking |
 | **`src/services/search_summarizer.py`** | Search-result synthesis with caching |
 | **`src/services/memory_service.py`** | Consented per-user memory extraction and storage |
@@ -233,7 +234,7 @@ the restaurant manager coordinating orders, inventory and staff.
 | **`src/services/guideline_jobs.py`** | Extraction job orchestration and result persistence |
 | **`src/services/guideline_enricher.py`** | Post-extraction facet enrichment of guideline rules |
 | **`src/services/guideline_corpus.py`** | Corpus-level audit and the activation that makes rules retrievable |
-| **`src/services/linearrag_service.py`** | Lazy singleton around the LinearRAG graph retriever |
+| **`src/services/kggen_service.py`** | Extended KG-Gen retrieval via the library facade, over the graph stores |
 | **`src/services/model_backoff.py`** | Retry-with-backoff wrapper for model calls |
 | **`src/agents/`** | `qa_agent`, `qa_clarifier`, `synthesis_agent`, `enrichment_agent`, `guideline_enrichment_agent`, plus `json_output` for recovering JSON from imperfect completions |
 | **`src/workers/`** | Four background threads — see [Background Workers](#background-workers) |
@@ -253,7 +254,7 @@ the restaurant manager coordinating orders, inventory and staff.
 | **Groq** | Chat and annotation inference (`GROQ_API_KEY`) | Yes |
 | **OpenAI** | Vision-based guideline extraction from PDF pages (`OPENAI_API_KEY`) | For guideline extraction |
 | **Sentence Transformers** | `all-MiniLM-L6-v2` query embeddings (384-dim, matching `ES_DIM`) | Yes (baked into the image) |
-| **scispaCy** | `en_core_sci_sm` biomedical NER for LinearRAG | Yes (baked into the image) |
+| **Elasticsearch + Neo4j (graph)** | The knowledge-graph stores the `kggen` retriever reads | For `kggen` retrieval |
 | **Langfuse** | LLM tracing and the prompt registry | Optional |
 
 ### Request lifecycle: `POST /api/v1/qa/ask`
@@ -355,8 +356,8 @@ artifact PDF ──▶ download to workspace ──▶ render pages (PyMuPDF, GU
 │   │   ├── guideline_enrichment_jobs.py
 │   │   ├── guideline_corpus.py
 │   │   ├── model_backoff.py
-│   │   ├── linearrag_service.py
-│   │   └── linearrag/                    # graph retriever implementation
+│   │   ├── kg_service.py                 # shared foodscholar-lib facade
+│   │   └── kggen_service.py              # Extended KG-Gen retrieval
 │   ├── agents/
 │   │   ├── qa_agent.py
 │   │   ├── qa_clarifier.py
@@ -380,9 +381,8 @@ artifact PDF ──▶ download to workspace ──▶ render pages (PyMuPDF, GU
 │   │   ├── prompts.py                     # prompt registry (Langfuse + fallbacks)
 │   │   └── langfuse.py                    # optional tracing
 │   ├── models/                           # Pydantic contracts + SQLAlchemy tables
-│   ├── utilities/                        # cache, chunking, citation validation
-│   └── data/linearrag/                   # prebuilt graph + embeddings (shipped)
-└── tests/                                # 179 tests
+│   └── utilities/                        # cache, chunking, citation validation
+└── tests/                                # 782 tests
 ```
 
 ---
@@ -421,8 +421,8 @@ editor's field.
 
 - **Excluded in-query.** The Elasticsearch filter drops restricted articles before `top_k` is
   applied, so a hidden article never displaces a usable one.
-- **Post-pass for non-ES retrievers.** LinearRAG has no queryable policy fields, so a second pass
-  filters and ranks uniformly across all retrievers.
+- **Post-pass for non-article-index retrievers.** Graph chunks carry no editorial policy fields,
+  so a second pass filters and ranks uniformly across all retrievers.
 - **Absent means permissive.** Every filter is phrased as an exclusion. Articles indexed before
   these fields existed carry neither, and a positive clause would have hidden the entire legacy
   corpus.
@@ -742,6 +742,48 @@ off it. `tests/test_model_config.py` asserts no configured default references a 
 | `QA_GUIDELINE_RETRIEVAL_MODE` | `bm25` | `bm25` or `hybrid` (BM25 + kNN). Hybrid only helps after the guideline embedding backfill has run |
 | `QA_GUIDELINE_KNN_BOOST` | `1.0` | Weight of the vector leg in hybrid mode |
 
+### Knowledge-graph retrieval (`retriever=kggen`)
+
+Extended KG-Gen hybrid scoring, served by the `foodscholar` library over the same stores the
+offline graph build writes. There is no index artifact: nothing to bake into the image, mount, or
+keep in step with the graph.
+
+It needs `KG_ENABLED=true` and the graph store addresses (`KG_ES_URL`, `KG_NEO4J_URL`,
+`KG_NEO4J_AUTH`). Without them the retriever reports `ok: false` in its status and the pipeline
+answers from what it has — `rag` and `no_rag` are unaffected.
+
+It also needs the **graph build to have written its relations to Elasticsearch**. The library's
+`relations.store.backend` defaults to `memory`, which means a build run on defaults put them in the
+builder's process (gone at exit) and mirrored them into Neo4j, which currently has no relation read
+path. Check `GET {KG_ES_URL}/{KG_RELATION_INDEX}/_count` before expecting the graph branches to
+contribute.
+
+The triplet and PageRank branches read **Layer 0 relations**, written by the build's
+`build_relations()` pass. If that pass has not run, those two branches stay silent and `kggen`
+degrades to plain kNN, which is still a usable ranking.
+
+| Variable | Default | Description |
+|---|---|---|
+| `KG_RELATION_INDEX` | `foodscholar_relations` | Elasticsearch index holding Layer 0 relations |
+| `KG_EMBED_MODEL` | `BAAI/bge-base-en-v1.5` | Query embedder. **Must match the model the graph's chunks were embedded with** — kNN compares the query vector against the stored ones, so a mismatch is a dimension error, not a quality loss. Baked into the image; keep the two in step |
+| `KG_RETRIEVAL_CANDIDATE_K` | `100` | Chunks the text branch pulls for the other two to re-rank. The recall knob: a passage outside this pool cannot be retrieved however well it scores on the graph |
+| `KG_RETRIEVAL_W_TEXT` | `0.3` | Weight of cosine(query, passage text) |
+| `KG_RETRIEVAL_W_TRIPLET` | `0.3` | Weight of mean cosine(query, the passage's extracted triples) |
+| `KG_RETRIEVAL_W_PPR` | `0.4` | Weight of Personalized PageRank over the entity graph |
+| `KG_RETRIEVAL_SUBGRAPH_DEPTH` | `1` | Hops out from the query's entities. Each hop costs one store call per frontier entity |
+| `KG_RETRIEVAL_MAX_EXPANSION_CALLS` | `50` | Ceiling on those store calls per query — what makes a deeper walk safe to configure |
+| `KG_RETRIEVAL_MAX_RELATIONS` | `500` | Triples embedded per query, best-supported first |
+| `KG_RETRIEVAL_EMBED_CACHE_SIZE` | `50000` | Process-local LRU over triple and entity embeddings, so a warm replica re-encodes almost nothing |
+
+> The three weights **must sum to 1.0**. The library refuses a config that does not, which surfaces
+> as a 503 on the first graph question rather than a quietly skewed ranking.
+
+Retrieval status carries a `graph` block — candidate count, relations scored, subgraph size,
+expansion calls, seed entities and which branches contributed — so a ranking can be reviewed rather
+than taken on trust. A `degraded` entry there means the answer is less trustworthy than usual; most
+importantly it appears when the library fell back to its hash embedder because the real one could
+not load, which otherwise produces confidently-ranked nonsense.
+
 ### Observability
 
 | Variable | Default | Description |
@@ -761,9 +803,6 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Biomedical NER model used by LinearRAG
-pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
-
 export GROQ_API_KEY=...            # required
 export OPENAI_API_KEY=...          # required for guideline extraction
 export ELASTIC_HOST=http://localhost:9200
@@ -775,8 +814,8 @@ python src/app.py
 ```
 
 The service listens on `PORT` (default `8000`). Reachable Elasticsearch, Redis, PostgreSQL and
-WiseFood Data API endpoints are required — startup verifies the database connection and warms the
-LinearRAG retriever before serving.
+WiseFood Data API endpoints are required — startup verifies the database connection before
+serving. No retriever is warmed at boot: `kggen` opens its stores on first use.
 
 For autoreload during development:
 
@@ -835,8 +874,10 @@ the result would be too large to build or unpack on a constrained disk.
 > `PORT` (default `8000` in `src/config.py`), so keep `EXPOSE`, `PORT` and your deployment's service
 > port aligned.
 
-The prebuilt LinearRAG artifacts in `src/data/linearrag/` (graph plus parquet embeddings) are copied
-into the image and loaded at startup.
+Nothing but code goes into the image. The `kggen` retriever reads the knowledge graph over the
+network from the same Elasticsearch and Neo4j stores the offline build writes, so unlike the
+LinearRAG retriever it replaced there is no 617MB index to bake in, mount, or keep in step with the
+graph.
 
 ---
 
@@ -849,7 +890,7 @@ PYTHONPATH=src python -m pytest tests/ -q
 `PYTHONPATH=src` is **required** — the suite imports modules as `services.…`, `agents.…`, and a bare
 `pytest tests/` fails collection with `ModuleNotFoundError`.
 
-The suite is **179 tests** and runs in seconds, with no live Elasticsearch, Redis, PostgreSQL or LLM
+The suite is **782 tests** and runs in seconds, with no live Elasticsearch, Redis, PostgreSQL or LLM
 provider required — infrastructure is faked at the seams. Coverage focuses on the logic where
 mistakes are expensive and hard to spot in review:
 
@@ -866,6 +907,7 @@ mistakes are expensive and hard to spot in review:
 | Prompt registry and Langfuse fallbacks | `tests/test_prompts_registry.py` |
 | QA clarification flow and guideline RAG | `tests/test_qa_clarification.py`, `tests/test_qa_guideline_rag.py` |
 | Tips generation and LLM token budgets | `tests/test_tips_generation.py` |
+| Knowledge-graph retrieval adapter (source mapping, degraded rankings, missing graph) | `tests/test_qa_kggen_retriever.py` |
 
 ---
 

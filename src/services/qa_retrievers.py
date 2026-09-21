@@ -68,10 +68,22 @@ class NoRagRetrieverAdapter:
         )
 
 
-class LinearragRetrieverAdapter:
-    """Adapter for LinearRAG passage retrieval."""
+class KGGenRetrieverAdapter:
+    """Adapter for Extended KG-Gen hybrid retrieval over the knowledge graph.
 
-    retriever_name = "linearrag"
+    The graph-aware retriever: alongside text similarity it scores a passage on
+    the triples extracted from it and on Personalized PageRank over the entity
+    graph, so a passage can surface because it sits near the question's
+    entities even when its wording does not match. `rag` (Elastic kNN + BM25)
+    remains the default; this is the branch to select when the question is
+    about relationships between foods, nutrients and outcomes.
+
+    Everything it reads lives in the stores the offline graph build writes, so
+    unlike the LinearRAG retriever it replaced there is no index file to mount
+    and nothing that can drift from the graph.
+    """
+
+    retriever_name = "kggen"
 
     def retrieve(
         self,
@@ -82,18 +94,22 @@ class LinearragRetrieverAdapter:
         user_context: Optional[QAUserContext],
         expertise_level: Optional[str] = None,
     ) -> RetrievalResult:
-        # LinearRAG has no queryable policy fields, so reader visibility and
+        # Chunks carry no editorial policy fields, so reader visibility and
         # tiers are enforced downstream by article_policy.filter_and_rank.
+        query = contextualize_query(
+            plan.article_query or plan.canonical_question or question,
+            user_context,
+        )
         try:
-            from services.linearrag_service import retrieve as linearrag_retrieve
+            from services.kggen_service import retrieve as kggen_retrieve
 
-            query = contextualize_query(
-                plan.article_query or plan.canonical_question or question,
-                user_context,
-            )
-            raw_results = linearrag_retrieve(query, top_k=top_k)
+            raw_results, trace = kggen_retrieve(query, top_k=top_k)
         except Exception as exc:
-            logger.error("LinearRAG retrieval failed: %s", exc, exc_info=True)
+            # Includes the 503 raised when this deployment has no graph
+            # enabled: a retriever that cannot run reports it in status and
+            # the pipeline answers from what it has, exactly as it did when
+            # LinearRAG's index was missing.
+            logger.error("KG-Gen retrieval failed: %s", exc, exc_info=True)
             return RetrievalResult(
                 status={
                     "retriever": self.retriever_name,
@@ -108,25 +124,27 @@ class LinearragRetrieverAdapter:
         retrieved: List[RetrievedSource] = []
         article_hits = 0
         guideline_hits = 0
-        for lr in raw_results:
-            source = lr.get("source") or {}
-            source_type = infer_source_type(source)
-            text = lr.get("text", "")
+
+        for item in raw_results:
+            text = item.get("text", "")
+            source_type = kggen_source_type(item)
             payload = {
+                **item,
                 "abstract": text,
                 "description": text,
-                "_score": lr.get("score", 0.0),
+                "_score": item.get("score", 0.0),
+                "relevance_score": item.get("score", 0.0),
                 "source_type": source_type,
                 "retriever": self.retriever_name,
-                **source,
             }
+            urn = text_value(
+                item.get("urn") or item.get("source_doc_id") or item.get("chunk_id")
+            )
+            payload["urn"] = urn
+
             if source_type == "guideline":
                 guideline_hits += 1
-                payload["rule_text"] = (
-                    payload.get("rule_text")
-                    or payload.get("description")
-                    or payload.get("abstract")
-                )
+                payload["rule_text"] = payload.get("rule_text") or text
             else:
                 article_hits += 1
 
@@ -134,28 +152,15 @@ class LinearragRetrieverAdapter:
             retrieved.append(
                 RetrievedSource(
                     source_type=source_type,
-                    urn=text_value(
-                        source.get("urn")
-                        or source.get("id")
-                        or source.get("_id")
-                    ),
-                    title=text_value(source.get("title")),
-                    authors=(
-                        normalize_string_list(source.get("authors"))
-                        if source_type == "article"
-                        else None
-                    ),
-                    venue=text_value(
-                        source.get("venue") or source.get("guide_region"),
-                        default=None,
-                    ),
-                    publication_year=text_value(
-                        source.get("publication_year"),
-                        default=None,
-                    ),
-                    category=text_value(source.get("category"), default=None),
-                    tags=normalize_string_list(source.get("tags")),
-                    similarity_score=score_value(lr.get("score")),
+                    urn=urn,
+                    title=text_value(item.get("title") or item.get("heading")),
+                    authors=None,
+                    venue=text_value(item.get("country"), default=None),
+                    publication_year=text_value(item.get("year"), default=None),
+                    category=text_value(item.get("chunk_source_type"), default=None),
+                    tags=None,
+                    similarity_score=score_value(item.get("score")),
+                    doi=text_value(item.get("doi"), default=None),
                 )
             )
 
@@ -168,8 +173,25 @@ class LinearragRetrieverAdapter:
                 "article_hits": article_hits,
                 "guideline_hits": guideline_hits,
                 "used_query": query,
+                # The branch scores are why a passage ranked where it did, and
+                # without them a graph-retrieval result is unreviewable.
+                "graph": trace,
             },
         )
+
+
+def kggen_source_type(item: Dict[str, Any]) -> str:
+    """Map a library chunk's `source_type` onto the QA source vocabulary.
+
+    The library types its corpus by document shape — `abstract`, `textbook`,
+    `guide` — while the answer layer splits sources by how they may be cited:
+    a `guideline` carries a rule to follow, an `article` carries evidence.
+    `guide` is the only one that crosses over.
+    """
+    chunk_type = str(item.get("chunk_source_type") or "").strip().lower()
+    if chunk_type == "guide":
+        return "guideline"
+    return "article"
 
 
 def normalize_article_hit(
@@ -508,7 +530,7 @@ class QARetrieverAdapters:
                 articles_index=articles_index,
                 guidelines_index=guidelines_index,
             ),
-            "linearrag": LinearragRetrieverAdapter(),
+            "kggen": KGGenRetrieverAdapter(),
             "no_rag": NoRagRetrieverAdapter(),
         }
 

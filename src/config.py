@@ -478,6 +478,69 @@ class Config:
             os.getenv("KG_STREAM_HEARTBEAT_SECONDS", "15")
         )
 
+        # --- Graph retrieval: the `kggen` QA retriever --------------------
+        #
+        # Extended KG-Gen hybrid scoring, served by the library over the same
+        # stores as browsing. It replaced LinearRAG, whose 617MB index had to
+        # be mounted beside the service; there is no artifact here, so the
+        # only thing to configure is the scoring.
+        #
+        # The relation index is Layer 0, written by the offline
+        # `build_relations()` pass. Without it the triplet and PageRank
+        # branches stay silent and `kggen` degrades to plain kNN — which is a
+        # usable ranking, so a deployment mid-build answers rather than fails.
+        self.settings["KG_RELATION_INDEX"] = os.getenv(
+            "KG_RELATION_INDEX", "foodscholar_relations"
+        )
+        # The query embedder, which MUST be the model the graph's chunks were
+        # embedded with. Elasticsearch kNN compares a query vector against the
+        # stored ones, so a mismatch is not a quality regression — it is a
+        # dimension error (BGE-base is 768, MiniLM is 384) or, between two
+        # same-size models, silently meaningless distances.
+        #
+        # This is deliberately NOT the ES_DIM/MiniLM embedder used for the
+        # `rag` retriever's article index. That index and the graph's chunk
+        # index are built by different pipelines with different models, and
+        # each retriever has to use its own. The default matches the library's
+        # `annotate.embedder` default, which is what a stock graph build uses.
+        self.settings["KG_EMBED_MODEL"] = os.getenv(
+            "KG_EMBED_MODEL", "BAAI/bge-base-en-v1.5"
+        )
+        # Chunks the text branch pulls for the other two branches to re-rank.
+        # A passage outside this pool cannot be retrieved however well it
+        # scores on the graph, so this is the recall knob.
+        self.settings["KG_RETRIEVAL_CANDIDATE_K"] = int(
+            os.getenv("KG_RETRIEVAL_CANDIDATE_K", "100")
+        )
+        # Branch weights. They must sum to 1.0 — the library refuses the
+        # config otherwise, which surfaces here as a 503 on the first graph
+        # question rather than a silently skewed ranking.
+        self.settings["KG_RETRIEVAL_W_TEXT"] = float(
+            os.getenv("KG_RETRIEVAL_W_TEXT", "0.3")
+        )
+        self.settings["KG_RETRIEVAL_W_TRIPLET"] = float(
+            os.getenv("KG_RETRIEVAL_W_TRIPLET", "0.3")
+        )
+        self.settings["KG_RETRIEVAL_W_PPR"] = float(
+            os.getenv("KG_RETRIEVAL_W_PPR", "0.4")
+        )
+        # Hops out from the query's entities. Each hop is one store call per
+        # frontier entity, bounded by KG_RETRIEVAL_MAX_EXPANSION_CALLS.
+        self.settings["KG_RETRIEVAL_SUBGRAPH_DEPTH"] = int(
+            os.getenv("KG_RETRIEVAL_SUBGRAPH_DEPTH", "1")
+        )
+        self.settings["KG_RETRIEVAL_MAX_EXPANSION_CALLS"] = int(
+            os.getenv("KG_RETRIEVAL_MAX_EXPANSION_CALLS", "50")
+        )
+        # Triples embedded per query, and the process-local cache that keeps
+        # a warm replica from re-encoding the same corpus triples every time.
+        self.settings["KG_RETRIEVAL_MAX_RELATIONS"] = int(
+            os.getenv("KG_RETRIEVAL_MAX_RELATIONS", "500")
+        )
+        self.settings["KG_RETRIEVAL_EMBED_CACHE_SIZE"] = int(
+            os.getenv("KG_RETRIEVAL_EMBED_CACHE_SIZE", "50000")
+        )
+
         self._validate_models()
 
         # Langfuse observability (opt-in). Tracing activates only when both

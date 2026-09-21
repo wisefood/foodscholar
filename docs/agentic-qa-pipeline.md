@@ -299,8 +299,8 @@ rationales, rounds, verdicts, repairs, notes, evidence counts, stage timings.
   `done`.
 - **Memory suggestions** — kept; computed by the pipeline and embedded in
   `done` (the `/qa/ask` handler only fills them in when absent, i.e. legacy).
-- **`retriever=linearrag`** — single pass through the legacy adapter, then
-  the same ranking and streamed answer; **`no_rag`** skips retrieval and
+- **`retriever=kggen`** — single pass through the Extended KG-Gen adapter,
+  then the same ranking and streamed answer; **`no_rag`** skips retrieval and
   streams a general-knowledge answer with no citations.
 - **Tips / starter questions / feedback / models endpoints** — untouched.
 

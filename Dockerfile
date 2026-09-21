@@ -32,9 +32,8 @@ COPY requirements.txt constraints.txt ./
 
 # CPU torch first, and then CONSTRAINED for everything after it.
 #
-# `requirements.txt` never mentions torch; sentence-transformers and scispacy
-# pull it in. Installing the CPU build first satisfies them — as long as they
-# accept 2.6.0. If a future bump does not, pip resolves torch from PyPI, which
+# `requirements.txt` never mentions torch; sentence-transformers pulls it in.
+# Installing the CPU build first satisfies it — as long as it accepts 2.6.0. If a future bump does not, pip resolves torch from PyPI, which
 # means the CUDA wheel: ~800MB to download, several GB unpacked once the nvidia
 # dependencies come with it. On a machine with 6GB free that is the difference
 # between a build and a full disk.
@@ -42,9 +41,7 @@ COPY requirements.txt constraints.txt ./
 # The constraint turns that from a silent 5GB into a resolver error naming the
 # conflict, which is the failure you want.
 RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu \
-    && pip install -c constraints.txt -r requirements.txt \
-    && pip install -c constraints.txt \
-       https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+    && pip install -c constraints.txt -r requirements.txt
 
 # The embedding model, into a location that SURVIVES.
 #
@@ -53,10 +50,21 @@ RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu \
 # time and the bandwidth and then deleted the model, and every container
 # downloaded it again on first question. Pointing the cache somewhere explicit
 # is what makes the warm-up mean anything.
+# TWO models, because the service runs two retrievers over two indices:
+#   all-MiniLM-L6-v2   384-dim — the `rag` retriever's article/guideline index
+#   BAAI/bge-base-en-v1.5  768-dim — the knowledge graph's chunk index, which
+#                          the `kggen` retriever queries through the library
+#
+# The second one is not optional for a deployment that serves `kggen`. Without
+# it the library downloads it on the first graph question, and in a cluster
+# with no egress to HuggingFace that download fails, the facade falls back to
+# its hash embedder, and retrieval returns a confidently-ranked list of
+# nonsense. Keep this in step with KG_EMBED_MODEL.
 ENV SENTENCE_TRANSFORMERS_HOME=/opt/models \
     HF_HOME=/opt/models
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-    SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')" \
+    SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); \
+    SentenceTransformer('BAAI/bge-base-en-v1.5')" \
     && find /opt/models -name '*.h5' -delete \
     && find /opt/models -name '*.ot' -delete \
     && find /opt/models -name '*.msgpack' -delete \
@@ -78,22 +86,17 @@ COPY --from=builder /opt/models /opt/models
 
 WORKDIR /app
 
-# Code only. The LinearRAG index is NOT copied — see .dockerignore.
+# Code only, and code is now all there is.
 #
-# `src/data/linearrag` is 617MB and it was the entire build context: every
-# build shipped it to the daemon, wrote it into a layer, and re-wrote that
-# layer whenever any source file changed. It is also untracked in git, so the
-# image was never reproducible from a checkout anyway — a clean clone built an
-# image with an empty index and nothing said so.
+# This used to be followed by a VOLUME for /app/src/data, because the LinearRAG
+# retriever read a 617MB index from disk: untracked in git, so a clean clone
+# built an image with an empty index and nothing said so, and mounted at
+# runtime because baking it in made every source edit rewrite a 617MB layer.
 #
-# It is runtime data, so it is mounted at runtime. `linearrag_service` reads
-# `src/data/<dataset_name>`, so the mount target is /app/src/data.
+# The `kggen` retriever that replaced it reads the same Elasticsearch and Neo4j
+# stores the graph build writes, so there is no index to ship, mount or keep in
+# sync — the graph is reachable over the network like every other backend.
 COPY . .
-
-# Present so the mount has somewhere to land, and so the `linearrag` retriever
-# fails with "no such file" rather than something stranger. The `rag` and
-# `no_rag` retrievers do not touch it and keep working without the mount.
-VOLUME ["/app/src/data"]
 
 # PORT env (deployment sets it; default 8000 in src/config.py) decides the
 # listen port — this EXPOSE is documentation and must match the deployment.

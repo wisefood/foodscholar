@@ -32,15 +32,23 @@ pycountry>=23
 groq>=0.30
 openai>=1.0.0,<2.0.0
 PyMuPDF>=1.24.0,<2.0.0
-python-igraph==1.0.0
-scispacy==0.6.2
+# scispacy and python-igraph are gone with the LinearRAG retriever that was
+# their only consumer: scispacy supplied its biomedical NER (`en_core_sci_sm`,
+# also dropped from the Dockerfile) and igraph its graph walk. The `kggen`
+# retriever that replaced it walks the entity graph with networkx, which
+# arrives as a core dependency of the foodscholar library below.
+#
+# These three stay. They are transitive dependencies of that library rather
+# than direct imports of this service, and the pins are what stop a resolver
+# picking a combination that fights the versions above.
 pyarrow==23.0.1
 numpy==1.26.4
 pandas==3.0.1
 langfuse>=3.0.0,<4.0.0
 # The hierarchical knowledge graph, read-only. The graph is built offline by a
 # job running the library's own phases; this service projects it into an
-# Elasticsearch browse index and serves browse reads from there.
+# Elasticsearch browse index, serves browse reads from there, and runs the
+# `kggen` QA retriever over the chunk and relation stores.
 #
 # Extras are [elastic,neo4j] deliberately. annotate/clustering/bertopic/llm are
 # what *builds* a graph — they pull GLiNER, Leiden, BERTopic and four LLM SDKs,
@@ -48,6 +56,16 @@ langfuse>=3.0.0,<4.0.0
 # omitted too: the VizGraph model this service streams is plain Pydantic, and
 # only the renderers behind .render() need that extra, which nothing here calls.
 #
+# `kggen` retrieval needs no further extra: networkx is a core dependency of
+# the library and the embedder it loads needs only sentence-transformers,
+# which is pinned above. The library's annotate modules lazy-import GLiNER
+# inside their functions, so importing the embedder does not drag it in.
+#
 # Pinned to a commit because the library has no release tag yet. Replace with
 # @v0.1.0 once one is cut — a moving branch is not a dependency.
+#
+# !! THIS PIN MUST BE BUMPED BEFORE THE IMAGE IS BUILT. The commit below
+# predates `fs.retrieve()`, so `kggen` retrieval will fail with AttributeError
+# against it. Bump to the foodscholar-lib commit that adds
+# `foodscholar/retrieval/kggen.py` once that lands on main.
 foodscholar[elastic,neo4j] @ git+https://github.com/wisefood/foodscholar-lib.git@a5289474f1f151cb113ea6e27c543887b3bc0c7b

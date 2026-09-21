@@ -372,9 +372,14 @@ class QARequest(BaseModel):
             "formulation. Defaults to expertise_level."
         ),
     )
-    retriever: Literal["rag", "no_rag", "linearrag"] = Field(
+    retriever: Literal["rag", "no_rag", "kggen"] = Field(
         default="rag",
-        description="Retrieval strategy: 'rag' for Elasticsearch kNN, 'linearrag' for graph-based retrieval, 'no_rag' for LLM-only",
+        description=(
+            "Retrieval strategy: 'rag' for Elasticsearch kNN over articles and "
+            "guidelines, 'kggen' for Extended KG-Gen hybrid retrieval over the "
+            "knowledge graph (text + triple similarity + PageRank), 'no_rag' "
+            "for LLM-only"
+        ),
     )
     qa_thread_id: Optional[str] = Field(
         default=None,

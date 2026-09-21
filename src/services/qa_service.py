@@ -187,12 +187,6 @@ _ANIMAL_TERM_PATTERNS = _compile_term_patterns(ANIMAL_EVIDENCE_TERMS)
 _HUMAN_TERM_PATTERNS = _compile_term_patterns(HUMAN_EVIDENCE_TERMS)
 
 
-def _linearrag_retrieve(question: str, top_k: int) -> List[Dict[str, Any]]:
-    """Lazy-load LinearRAG so non-Linearrag paths do not require its dependencies."""
-    from services.linearrag_service import retrieve
-
-    return retrieve(question, top_k=top_k)
-
 AMBIGUITY_KEYWORDS = [
     "better", "worse", "should", "recommend", "best", "opinion",
     "compared", "versus", "vs", "controversial", "debate",
@@ -942,7 +936,7 @@ class QAService:
         Articles the catalog marks as restricted for this audience are dropped and
         the rest are re-ranked by indexing tier. The Elastic retriever already
         excludes them in the query; this second pass covers retrievers that cannot
-        (LinearRAG) and applies the tier boost uniformly.
+        (KG-Gen) and applies the tier boost uniformly.
         """
         adapter = self._retriever_adapters.get(retriever)
 

@@ -14,18 +14,16 @@ services:
       # so nothing needs setting here. Override a role to pin it, e.g.:
       # - QA_DEFAULT_MODEL=openai/gpt-oss-20b
       # - QA_AVAILABLE_MODELS=openai/gpt-oss-20b,qwen/qwen3.6-27b
+      #
+      # The `kggen` retriever needs the knowledge graph. It reads the same
+      # stores the offline build writes, so it needs their addresses and not
+      # a mounted index:
+      # - KG_ENABLED=true
+      # - KG_ES_URL=http://elastic:9200
+      # - KG_NEO4J_URL=bolt://neo4j:7687
+      # - KG_NEO4J_AUTH=neo4j/your_password
     volumes:
       - ./app.py:/app/app.py
-      # The LinearRAG index, mounted rather than baked in.
-      #
-      # 617MB of runtime data that used to be the entire build context and a
-      # layer in the image. `linearrag_service` reads
-      # `src/data/<dataset_name>`, so this is where it has to land. Read-only:
-      # the retriever loads it and never writes.
-      #
-      # Without this mount the `linearrag` retriever fails on a missing file;
-      # `rag` and `no_rag` are unaffected.
-      - ./src/data:/app/src/data:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
