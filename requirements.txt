@@ -61,11 +61,16 @@ langfuse>=3.0.0,<4.0.0
 # which is pinned above. The library's annotate modules lazy-import GLiNER
 # inside their functions, so importing the embedder does not drag it in.
 #
-# Pinned to a commit because the library has no release tag yet. Replace with
-# @v0.1.0 once one is cut — a moving branch is not a dependency.
+# An exact version off PyPI, now that the library publishes one. This replaces
+# a git+https pin on a commit, which was the right stopgap while there was no
+# release and is the wrong thing to keep: it made the image build clone a
+# repository, which is why `git` was installed in the builder stage at all.
 #
-# !! THIS PIN MUST BE BUMPED BEFORE THE IMAGE IS BUILT. The commit below
-# predates `fs.retrieve()`, so `kggen` retrieval will fail with AttributeError
-# against it. Bump to the foodscholar-lib commit that adds
-# `foodscholar/retrieval/kggen.py` once that lands on main.
-foodscholar[elastic,neo4j] @ git+https://github.com/wisefood/foodscholar-lib.git@a5289474f1f151cb113ea6e27c543887b3bc0c7b
+# 0.2.0 is the first release carrying `fs.retrieve()`; the commit this used to
+# pin predates it, so kggen retrieval failed with AttributeError against it.
+#
+# The library leaves numpy, pandas, pyarrow and networkx unpinned and asks only
+# for pydantic>=2 and elasticsearch>=8, so the exact versions above decide what
+# lands — which is the correct division of labour, but it does mean relaxing a
+# pin here is what lets the resolver drift, not anything the library does.
+foodscholar[elastic,neo4j]==0.2.0
