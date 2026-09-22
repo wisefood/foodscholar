@@ -239,10 +239,14 @@ class TestTheLoop:
         assert "search_catalog" in offered
         assert not {"create_guide", "upload_artifact"} & offered
 
-    def test_the_research_model_is_not_the_conversation_model(self):
+    def test_the_research_model_can_search_the_web(self):
+        """Groq retired its Compound systems on 21 September 2026. Its built-in
+        browser search runs only on the GPT-OSS family, so that is what the
+        research role must name — anything else would search through the
+        DuckDuckGo fallback alone, and quietly."""
         from config import config
-        assert config.settings["INTEGRATOR_RESEARCH_MODEL"].startswith("groq/compound")
-        assert config.settings["INTEGRATOR_MODEL"] != config.settings["INTEGRATOR_RESEARCH_MODEL"]
+        assert config.settings["INTEGRATOR_RESEARCH_MODEL"].startswith("openai/gpt-oss")
+        assert not config.settings["INTEGRATOR_RESEARCH_MODEL"].startswith("groq/compound")
 
 
 class TestReplay:

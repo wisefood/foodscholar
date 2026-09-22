@@ -1,9 +1,9 @@
 """Putting an integrator run on the same trace board as everything else.
 
 The console's LLM observability page already shows what every model call
-cost. A research turn that can make a dozen of them — some on Compound with
-web search, some on the conversation model — would otherwise be the one
-expensive thing on the platform nobody can see.
+cost. A research turn that can make a dozen of them — some with browser
+search on the research model, some on the conversation model — would
+otherwise be the one expensive thing on the platform nobody can see.
 
 Deliberately best-effort and deliberately quiet: a tracing backend that is
 down, misconfigured, or switched off must never cost a curator their answer.

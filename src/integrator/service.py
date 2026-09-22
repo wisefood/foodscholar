@@ -41,8 +41,9 @@ def _groq_client():
     """A raw Groq client.
 
     The raw SDK rather than the LangChain pool: the loop needs `tool_calls`
-    round-tripped exactly as the provider returns them, and Compound's
-    `executed_tools` are not something a chat wrapper surfaces.
+    round-tripped exactly as the provider returns them, and the
+    `executed_tools` a built-in browser search reports are not something a
+    chat wrapper surfaces.
     """
     import os
 
@@ -142,7 +143,7 @@ def tool_context(*, user_sub: str, session_id: Optional[str] = None,
         proposal_store=_STORE,
         writes_enabled=bool(config.settings.get("INTEGRATOR_WRITES_ENABLED", False)),
         respect_robots=bool(config.settings.get("INTEGRATOR_RESPECT_ROBOTS", False)),
-        research_model=config.settings.get("INTEGRATOR_RESEARCH_MODEL", "groq/compound"),
+        research_model=config.settings.get("INTEGRATOR_RESEARCH_MODEL", "openai/gpt-oss-120b"),
         inference_model=config.settings.get("INTEGRATOR_INFERENCE_MODEL"),
         actor=user_sub,
         contact_email=config.settings.get("INTEGRATOR_CONTACT_EMAIL"),

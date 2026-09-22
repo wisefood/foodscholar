@@ -20,8 +20,11 @@ transformers==4.49.0
 # reach the catalog as the curator driving it rather than as a service account.
 # Deliberately NOT the [mcp] extra: that pulls the MCP SDK, which needs
 # starlette>=1.0 and would fight FastAPI here. Only the standalone
-# `wisefood-mcp` server process needs that extra.
-wisefood>=0.0.41
+# `wisefood-mcp` server process needs that extra. 0.0.42 moved `research`
+# off Groq's retired Compound systems (switched off 21 September 2026) onto
+# the built-in browser search, with a DuckDuckGo fallback; anything older
+# cannot search the web at all.
+wisefood>=0.0.42
 # The catalog tools resolve a country or language to the ISO code the
 # catalog actually stores. It arrives with the [mcp] extra, which this image
 # deliberately does not install (see above), so it is named here directly —

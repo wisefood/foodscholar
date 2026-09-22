@@ -182,22 +182,29 @@ class Config:
         # validated against, so the UI picker follows this list without a
         # redeploy.
         # --- Source Integrator -------------------------------------------
-        # The conversation model. Tool-calling is required; Groq's Compound
-        # systems cannot be used here because they refuse user-defined tools.
+        # The conversation model. Tool-calling is required: it drives the
+        # catalog, research and write tools by name.
         self.settings["INTEGRATOR_MODEL"] = os.getenv(
             "INTEGRATOR_MODEL", "openai/gpt-oss-120b"
         )
-        # The research model, which is the one place a provider executes
-        # anything for us: Compound has built-in web search and decides on its
-        # own when to use it.
-        # Reading rules out of a source. A plain tool-calling model, not a
-        # Compound one: Compound's value is its web search, and this reads text
-        # it has already been handed.
+        # Reading rules out of a source. A plain tool-calling model: this
+        # reads text it has already been handed, and never searches.
         self.settings["INTEGRATOR_INFERENCE_MODEL"] = os.getenv(
             "INTEGRATOR_INFERENCE_MODEL", "openai/gpt-oss-120b"
         )
+        # The research model, which is the one place a provider executes
+        # anything for us: the `research` tool asks Groq for its built-in
+        # `browser_search`, and the model searches and opens pages on its own
+        # initiative. Groq retired the Compound systems that used to do this
+        # on 21 September 2026, and browser search on the GPT-OSS family is
+        # the web search it offers now — so this must be a GPT-OSS id. It is
+        # the same id as the conversation model, but a separate call with a
+        # different tool set; a deployment that wants the cheaper
+        # `openai/gpt-oss-20b` here can say so. A model that cannot search
+        # does not break a run — the library falls back to DuckDuckGo and
+        # logs why — but it is a misconfiguration.
         self.settings["INTEGRATOR_RESEARCH_MODEL"] = os.getenv(
-            "INTEGRATOR_RESEARCH_MODEL", "groq/compound"
+            "INTEGRATOR_RESEARCH_MODEL", "openai/gpt-oss-120b"
         )
         # A run that can search the web needs a ceiling, or one question can
         # spend an afternoon and a month's quota.
