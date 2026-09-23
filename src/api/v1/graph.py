@@ -174,9 +174,104 @@ def facet_roots(
 
 
 # ------------------------------------------------------------------ nodes
+#
+# Node ids take the `path` converter because theme ids are slash-separated
+# (`foods/olive_oil/monounsaturated_fat_r1`) and card ids embed them. The
+# server decodes `%2F` before routing, so with a plain `{node_id}` every theme
+# and card was a 404 that never reached a handler, while shelves (`foodon:…`)
+# worked — the tree opened, and nothing inside it did.
+#
+# `path` matches slashes, so order is now load-bearing: the bare
+# `/nodes/{node_id:path}` comes last, or it takes `x/children` as an id. A
+# sub-route cannot claim a real id in return — theme ids end in `_r1`, `_m2`
+# or `_g3`, never in `/children`, `/themes`, `/breadcrumb` or `/chunks`.
 
 
-@router.get("/nodes/{node_id}")
+@router.get("/nodes/{node_id:path}/children")
+@render()
+def node_children(
+    request: Request,
+    node_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    cursor: Optional[str] = Query(None, description="Cursor from a previous page"),
+):
+    """Child shelves of a shelf."""
+    page = browse.children(node_id, limit=limit, cursor=cursor)
+    return SearchPage(
+        items=[NodeSummary.from_doc(d) for d in page["items"]],
+        total=page["total"],
+        next_cursor=page["next_cursor"],
+    )
+
+
+@router.get("/nodes/{node_id:path}/themes")
+@render()
+def node_themes(
+    request: Request,
+    node_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    cursor: Optional[str] = Query(None),
+):
+    """Themes discovered on a shelf."""
+    page = browse.themes_for(node_id, limit=limit, cursor=cursor)
+    return SearchPage(
+        items=[NodeSummary.from_doc(d) for d in page["items"]],
+        total=page["total"],
+        next_cursor=page["next_cursor"],
+    )
+
+
+@router.get("/nodes/{node_id:path}/breadcrumb")
+@render()
+def node_breadcrumb(request: Request, node_id: str):
+    """Ancestors of a node, root first, in one round-trip."""
+    doc = browse.get_node(node_id)
+    if doc is None:
+        raise NotFoundError(detail=f"No graph node with id {node_id!r}.")
+    return [NodeSummary.from_doc(d) for d in browse.breadcrumb(doc)]
+
+
+@router.get("/nodes/{node_id:path}/chunks")
+@render()
+def node_chunks(
+    request: Request,
+    node_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Evidence passages attached to a shelf or theme.
+
+    Chunks live in the library's own index, not the browse index, so this is
+    the one browse route that reads through the facade. It queries the chunk
+    index by attachment id: the library's shelf.chunks() would read the entire
+    corpus and filter in Python, which is fine in a notebook and not here.
+    """
+    doc = browse.get_node(node_id)
+    if doc is None:
+        raise NotFoundError(detail=f"No graph node with id {node_id!r}.")
+
+    field = "theme_ids" if doc["kind"] == "theme" else "shelf_ids"
+    fs = kg_service.get_graph()
+    store = fs.chunk_store
+    resp = store._es.search(
+        index=store.index,
+        body={
+            "from": offset,
+            "size": limit,
+            "query": {"bool": {"filter": [{"term": {field: node_id}}]}},
+            "sort": [{"chunk_id": "asc"}],
+        },
+        source_excludes=["embedding"],
+    )
+    from foodscholar.io.chunk import Chunk
+
+    return [
+        ChunkView.from_chunk(Chunk.model_validate(hit["_source"]))
+        for hit in resp["hits"]["hits"]
+    ]
+
+
+@router.get("/nodes/{node_id:path}")
 @render()
 def get_node(request: Request, node_id: str):
     """One node, with everything its detail page needs.
@@ -219,91 +314,7 @@ def get_node(request: Request, node_id: str):
     )
 
 
-@router.get("/nodes/{node_id}/children")
-@render()
-def node_children(
-    request: Request,
-    node_id: str,
-    limit: int = Query(100, ge=1, le=500),
-    cursor: Optional[str] = Query(None, description="Cursor from a previous page"),
-):
-    """Child shelves of a shelf."""
-    page = browse.children(node_id, limit=limit, cursor=cursor)
-    return SearchPage(
-        items=[NodeSummary.from_doc(d) for d in page["items"]],
-        total=page["total"],
-        next_cursor=page["next_cursor"],
-    )
-
-
-@router.get("/nodes/{node_id}/themes")
-@render()
-def node_themes(
-    request: Request,
-    node_id: str,
-    limit: int = Query(100, ge=1, le=500),
-    cursor: Optional[str] = Query(None),
-):
-    """Themes discovered on a shelf."""
-    page = browse.themes_for(node_id, limit=limit, cursor=cursor)
-    return SearchPage(
-        items=[NodeSummary.from_doc(d) for d in page["items"]],
-        total=page["total"],
-        next_cursor=page["next_cursor"],
-    )
-
-
-@router.get("/nodes/{node_id}/breadcrumb")
-@render()
-def node_breadcrumb(request: Request, node_id: str):
-    """Ancestors of a node, root first, in one round-trip."""
-    doc = browse.get_node(node_id)
-    if doc is None:
-        raise NotFoundError(detail=f"No graph node with id {node_id!r}.")
-    return [NodeSummary.from_doc(d) for d in browse.breadcrumb(doc)]
-
-
-@router.get("/nodes/{node_id}/chunks")
-@render()
-def node_chunks(
-    request: Request,
-    node_id: str,
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-):
-    """Evidence passages attached to a shelf or theme.
-
-    Chunks live in the library's own index, not the browse index, so this is
-    the one browse route that reads through the facade. It queries the chunk
-    index by attachment id: the library's shelf.chunks() would read the entire
-    corpus and filter in Python, which is fine in a notebook and not here.
-    """
-    doc = browse.get_node(node_id)
-    if doc is None:
-        raise NotFoundError(detail=f"No graph node with id {node_id!r}.")
-
-    field = "theme_ids" if doc["kind"] == "theme" else "shelf_ids"
-    fs = kg_service.get_graph()
-    store = fs.chunk_store
-    resp = store._es.search(
-        index=store.index,
-        body={
-            "from": offset,
-            "size": limit,
-            "query": {"bool": {"filter": [{"term": {field: node_id}}]}},
-            "sort": [{"chunk_id": "asc"}],
-        },
-        source_excludes=["embedding"],
-    )
-    from foodscholar.io.chunk import Chunk
-
-    return [
-        ChunkView.from_chunk(Chunk.model_validate(hit["_source"]))
-        for hit in resp["hits"]["hits"]
-    ]
-
-
-@router.get("/cards/{target_id}")
+@router.get("/cards/{target_id:path}")
 @render()
 def card_for_target(request: Request, target_id: str):
     """The Layer C card describing a shelf or theme."""
