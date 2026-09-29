@@ -13,8 +13,11 @@ lands in ``properties.memory_optouts`` so neither app ever re-asks.
 Policy (mirrors FoodChat's MemoryService, deliberately conservative):
   - only explicit, high-confidence statements nudge — EXCEPT allergy hints,
     which nudge at any confidence (safety data demands explicit consent);
-  - same-kind dedupe: a dislike of something currently in the LIKES list
-    still nudges (it's a contradiction the user should resolve);
+  - same-kind dedupe: a value the profile already holds comes back marked
+    ``already_known`` so the UI can show it pre-selected rather than ask
+    again, and it is never written twice; a dislike of something currently
+    in the LIKES list still nudges (it's a contradiction the user should
+    resolve);
   - declined values (memory_optouts, shared with FoodChat) never re-nudge;
   - at most MAX_SUGGESTIONS_PER_TURN per question.
 
@@ -42,6 +45,35 @@ VALID_KINDS = {
 }
 MAX_SUGGESTIONS_PER_TURN = 2
 EXTRACTOR_MODEL = config.settings["MEMORY_EXTRACTOR_MODEL"]
+
+
+def _known_statement(kind: str, value: str) -> str:
+    """What the chip says for a value the profile already holds."""
+    label = value.replace("_", " ")
+    if kind == "goal":
+        return f"“{label}” is already one of your goals."
+    if kind == "dietary_pattern":
+        return f"“{label}” is already part of your dietary profile."
+    if kind == "allergy_hint":
+        return f"“{label}” is already listed among your allergies."
+    if kind == "dislike":
+        return f"“{label}” is already in your dislikes."
+    return f"“{label}” is already in your likes."
+
+
+def _profile_fingerprint(prefs, props, allergies, groups) -> str:
+    """The parts of a profile a memory write can touch, in a comparable form."""
+    return json.dumps(
+        {
+            "likes": prefs.get("food_likes") or [],
+            "dislikes": prefs.get("food_dislikes") or [],
+            "goals": props.get("dietary_goals") or [],
+            "allergies": allergies,
+            "groups": groups,
+        },
+        sort_keys=True,
+        default=str,
+    )
 
 
 class MemoryService:
@@ -129,15 +161,35 @@ class MemoryService:
             "dietary_pattern": patterns,
         }
 
-        suggestions: List[Dict[str, Any]] = []
+        # What the model saw before the policy touched it: the one line that
+        # separates "the model never said it" from "it said it at medium".
+        logger.info(
+            "Memory extractor candidates: %s",
+            [(c.get("kind"), c.get("value"), c.get("confidence"))
+             for c in candidates if isinstance(c, dict)],
+        )
+
+        fresh: List[Dict[str, Any]] = []
+        known: List[Dict[str, Any]] = []
         for cand in candidates:
             kind = cand.get("kind")
             value = str(cand.get("value", "")).strip().lower()
             if kind not in VALID_KINDS or not value:
                 continue
-            if value in known_by_kind.get(kind, set()) or value in optouts:
-                continue
             if kind != "allergy_hint" and cand.get("confidence") != "high":
+                continue
+            if value in optouts:
+                continue
+            if value in known_by_kind.get(kind, set()):
+                # Already on the profile: shown pre-selected so the user sees
+                # it was recognised, never re-asked and never written twice.
+                known.append({
+                    "id": str(uuid.uuid4()),
+                    "kind": kind,
+                    "value": value,
+                    "statement": _known_statement(kind, value),
+                    "already_known": True,
+                })
                 continue
             statement = cand.get("statement") or (
                 f"It seems “{value}” matters to you — want me to remember this?"
@@ -152,20 +204,23 @@ class MemoryService:
                     f"“{value}” is currently in your dislikes, but it sounds "
                     f"like you enjoy it now — update your profile?"
                 )
-            suggestions.append({
+            fresh.append({
                 "id": str(uuid.uuid4()),
                 "kind": kind,
                 "value": value,
                 "statement": statement,
+                "already_known": False,
             })
-            if len(suggestions) >= MAX_SUGGESTIONS_PER_TURN:
-                break
+
+        # New nudges take the slots first; what is already known fills the rest.
+        suggestions = (fresh + known)[:MAX_SUGGESTIONS_PER_TURN]
 
         if suggestions:
             logger.info(
                 "%d memory suggestion(s) for question: %s",
                 len(suggestions),
-                [(s["kind"], s["value"]) for s in suggestions],
+                [(s["kind"], s["value"], "known" if s["already_known"] else "new")
+                 for s in suggestions],
             )
         return suggestions
 
@@ -179,9 +234,10 @@ class MemoryService:
     ) -> bool:
         """Apply an accepted suggestion or record a declined one.
 
-        Returns True if a durable profile change was persisted. The SDK
-        profile object auto-PATCHes the gateway on attribute assignment, and
-        every write carries provenance (``source: "foodscholar"``).
+        Returns True if a durable profile change was persisted; accepting a
+        value the profile already holds writes nothing and returns False. The
+        SDK profile object auto-PATCHes the gateway on attribute assignment,
+        and every write carries provenance (``source: "foodscholar"``).
         """
         value_norm = str(value).strip().lower()
         if kind not in VALID_KINDS or not value_norm:
@@ -201,6 +257,9 @@ class MemoryService:
             profile = client.members.get(member_id).profile
             prefs = dict(profile.nutritional_preferences or {})
             props = dict(profile.properties or {})
+            allergies = list(profile.allergies or [])
+            groups = list(profile.dietary_groups or [])
+            before = _profile_fingerprint(prefs, props, allergies, groups)
 
             if kind in ("like", "cuisine"):
                 likes = list(prefs.get("food_likes") or [])
@@ -212,7 +271,6 @@ class MemoryService:
                     v for v in (prefs.get("food_dislikes") or [])
                     if str(v).lower() != value
                 ]
-                profile.nutritional_preferences = prefs
             elif kind == "dislike":
                 dislikes = list(prefs.get("food_dislikes") or [])
                 if value not in [str(v).lower() for v in dislikes]:
@@ -222,12 +280,9 @@ class MemoryService:
                     v for v in (prefs.get("food_likes") or [])
                     if str(v).lower() != value
                 ]
-                profile.nutritional_preferences = prefs
             elif kind == "allergy_hint":
-                allergies = list(profile.allergies or [])
                 if value not in [str(a).lower() for a in allergies]:
                     allergies.append(value)
-                profile.allergies = allergies
             elif kind == "goal":
                 # value is a canonical slug (e.g. "reduce_fat"). Stored under
                 # properties.dietary_goals as {slug, label} so FoodChat's meal
@@ -239,9 +294,23 @@ class MemoryService:
             elif kind == "dietary_pattern":
                 # Standing regimen (keto, mediterranean, vegan...). Stored in
                 # dietary_groups, which FoodChat already reads.
-                groups = list(profile.dietary_groups or [])
                 if value not in [str(g).lower() for g in groups]:
                     groups.append(value)
+
+            if _profile_fingerprint(prefs, props, allergies, groups) == before:
+                # Nothing to remember twice: no PATCH, no second log entry.
+                logger.info(
+                    "Memory already on profile for member %s: %s=%r; not rewritten",
+                    member_id, kind, value,
+                )
+                return False
+
+            # Each assignment is a PATCH, so only the field this kind touches.
+            if kind in ("like", "cuisine", "dislike"):
+                profile.nutritional_preferences = prefs
+            elif kind == "allergy_hint":
+                profile.allergies = allergies
+            elif kind == "dietary_pattern":
                 profile.dietary_groups = groups
 
             log = list(props.get("memory_log") or [])

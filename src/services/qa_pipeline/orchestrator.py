@@ -22,6 +22,7 @@ from config import config
 from models.qa import (
     ClarificationRequest,
     ConversationContext,
+    MemorySuggestion,
     PlannedSubQuestion,
     QARequest,
     QAResponse,
@@ -73,6 +74,30 @@ class _Emitter:
 
 def _notes_cache_key(thread_id: str) -> str:
     return f"qa_notes:{thread_id}"
+
+
+async def _memory_suggestions(
+    request: QARequest,
+) -> Optional[List[MemorySuggestion]]:
+    """Consent nudges for this asker and this question; None without a member.
+
+    Computed on every request, cache hit or miss, and never stored with the
+    answer: the answer to a question is shared, whether the asker already
+    tracks the goal it expresses is not. Best-effort, never blocks: a failure
+    is an empty list, not a lost answer.
+    """
+    if not request.member_id:
+        return None
+    try:
+        from services.memory_service import MEMORY_SERVICE
+
+        suggestions = await asyncio.to_thread(
+            MEMORY_SERVICE.suggest, request.member_id, request.question
+        )
+        return [MemorySuggestion(**s) for s in suggestions]
+    except Exception as exc:
+        logger.warning("Memory suggestion skipped: %s", exc)
+        return []
 
 
 def _load_prior_notes(service: "QAService", thread_id: Optional[str]) -> List[ResearchNote]:
@@ -412,6 +437,12 @@ async def run_pipeline(
                     "confidence": answer_payload.get("confidence", "medium"),
                     "follow_up_suggestions": cached.get("follow_up_suggestions"),
                 },
+            )
+            # Nudges are the asker's, not the answer's: fresh on every hit,
+            # replacing whatever an entry written before this baked in.
+            nudges = await _memory_suggestions(request)
+            cached["memory_suggestions"] = (
+                None if nudges is None else [n.model_dump() for n in nudges]
             )
             yield emit("done", cached)
             return
@@ -930,20 +961,7 @@ async def run_pipeline(
     )
 
     # Memory nudges ride the done payload; best-effort, never blocks.
-    if request.member_id:
-        try:
-            from services.memory_service import MEMORY_SERVICE
-            from models.qa import MemorySuggestion
-
-            suggestions = await asyncio.to_thread(
-                MEMORY_SERVICE.suggest, request.member_id, request.question
-            )
-            if suggestions:
-                response.memory_suggestions = [
-                    MemorySuggestion(**s) for s in suggestions
-                ]
-        except Exception as exc:
-            logger.warning("Memory suggestion skipped: %s", exc)
+    response.memory_suggestions = await _memory_suggestions(request)
 
     # Research notes persist on the thread so a follow-up question's planner
     # starts from what this run already found.
@@ -954,8 +972,11 @@ async def run_pipeline(
 
     from services.qa_service import TTL_QA_RESPONSE
 
+    # The cached answer carries no nudges: they are recomputed per asker.
+    cache_payload = response.model_dump()
+    cache_payload["memory_suggestions"] = None
     await asyncio.to_thread(
-        service.cache_manager.set, cache_key, response.model_dump(), TTL_QA_RESPONSE
+        service.cache_manager.set, cache_key, cache_payload, TTL_QA_RESPONSE
     )
 
     _spawn_background(

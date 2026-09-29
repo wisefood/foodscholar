@@ -346,6 +346,78 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.primary_answer.answer, "Whole grains help.")
         self.assertFalse(response.needs_clarification)
 
+    # --- memory nudges ----------------------------------------------------- #
+
+    PROTEIN = "I want to eat more protein, what foods should I aim for?"
+
+    async def test_cache_hit_recomputes_memory_suggestions_for_the_asker(self):
+        """A replayed answer carries the asker's nudges, not the first asker's."""
+        stale = {"id": "stale", "kind": "goal", "value": "increase_protein",
+                 "statement": "baked in by whoever asked first", "already_known": False}
+        cached = {
+            "primary_answer": {"answer": "Cached answer.", "citations": [],
+                               "confidence": "high", "model_used": "test"},
+            "follow_up_suggestions": None,
+            "memory_suggestions": [stale],
+        }
+        fresh = {"id": "fresh", "kind": "goal", "value": "increase_protein",
+                 "statement": "“increase protein” is already one of your goals.",
+                 "already_known": True}
+        request = QARequest(question=self.PROTEIN, member_id="member-1")
+
+        def cache_get(key):
+            return dict(cached) if str(key).startswith("qa:") else None
+
+        with patch.object(
+            self.service.cache_manager, "get", side_effect=cache_get
+        ), patch(
+            "services.memory_service.MEMORY_SERVICE.suggest", return_value=[fresh]
+        ) as suggest:
+            events, calls = await self._run(request)
+
+        self.assertIn("stage.cache", [e.name for e in events])
+        self.assertEqual(calls, [])  # a hit never retrieves
+        done = events[-1]
+        self.assertEqual(done.name, "done")
+        self.assertEqual(
+            [(s["id"], s["already_known"]) for s in done.data["memory_suggestions"]],
+            [("fresh", True)],
+        )
+        suggest.assert_called_once_with("member-1", self.PROTEIN)
+
+    async def test_cache_miss_serves_nudges_but_never_stores_them(self):
+        fresh = {"id": "fresh", "kind": "goal", "value": "increase_protein",
+                 "statement": "Track this goal?", "already_known": False}
+        request = QARequest(question=self.PROTEIN, member_id="member-1")
+
+        with patch.object(self.service.cache_manager, "set") as cache_set, patch(
+            "services.memory_service.MEMORY_SERVICE.suggest", return_value=[fresh]
+        ):
+            events, _ = await self._run(request)
+
+        done = events[-1]
+        self.assertEqual(done.name, "done")
+        self.assertEqual([s["id"] for s in done.data["memory_suggestions"]], ["fresh"])
+        stored = [
+            c.args[1] for c in cache_set.call_args_list
+            if c.args and str(c.args[0]).startswith("qa:")
+        ]
+        self.assertEqual(len(stored), 1)
+        self.assertIsNone(stored[0]["memory_suggestions"])
+
+    async def test_member_with_nothing_to_remember_gets_an_empty_list(self):
+        """[] not None: tells the non-streaming route the extractor already ran."""
+        request = QARequest(question=self.PROTEIN, member_id="member-1")
+        with patch("services.memory_service.MEMORY_SERVICE.suggest", return_value=[]):
+            events, _ = await self._run(request)
+        self.assertEqual(events[-1].data["memory_suggestions"], [])
+
+    async def test_no_member_means_no_extractor_call(self):
+        with patch("services.memory_service.MEMORY_SERVICE.suggest") as suggest:
+            events, _ = await self._run()
+        self.assertIsNone(events[-1].data["memory_suggestions"])
+        suggest.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,13 +47,48 @@ class MemoryPolicyTests(unittest.TestCase):
         ])
         self.assertEqual([s["kind"] for s in out], ["allergy_hint"])
 
-    def test_known_same_kind_and_optouts_filtered(self):
+    def test_known_same_kind_comes_back_preselected_and_optouts_are_dropped(self):
         out = _suggest(self.service, [
             {"kind": "like", "value": "chicken", "confidence": "high"},      # already liked
             {"kind": "allergy_hint", "value": "peanuts", "confidence": "high"},  # known allergy
             {"kind": "like", "value": "cilantro", "confidence": "high"},     # opted out
         ])
+        self.assertEqual(
+            [(s["kind"], s["value"], s["already_known"]) for s in out],
+            [("like", "chicken", True), ("allergy_hint", "peanuts", True)],
+        )
+        self.assertIn("already in your likes", out[0]["statement"])
+        self.assertIn("already listed among your allergies", out[1]["statement"])
+
+    def test_fresh_nudges_are_not_marked_known(self):
+        out = _suggest(self.service, [
+            {"kind": "like", "value": "lentils", "confidence": "high"},
+        ])
+        self.assertFalse(out[0]["already_known"])
+
+    def test_known_value_below_high_confidence_is_not_shown(self):
+        """Pre-selected chips obey the same confidence gate as real nudges."""
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "reduce_sugar", "confidence": "medium"},  # known goal
+            {"kind": "like", "value": "chicken", "confidence": "low"},          # known like
+        ])
         self.assertEqual(out, [])
+
+    def test_new_nudges_take_the_slots_before_known_ones(self):
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "reduce_sugar", "confidence": "high"},  # known
+            {"kind": "like", "value": "lentils", "confidence": "high"},       # new
+            {"kind": "like", "value": "tofu", "confidence": "high"},          # new
+        ])
+        self.assertEqual([s["value"] for s in out], ["lentils", "tofu"])
+        out = _suggest(self.service, [
+            {"kind": "goal", "value": "reduce_sugar", "confidence": "high"},  # known
+            {"kind": "like", "value": "lentils", "confidence": "high"},       # new
+        ])
+        self.assertEqual(
+            [(s["value"], s["already_known"]) for s in out],
+            [("lentils", False), ("reduce_sugar", True)],
+        )
 
     def test_contradiction_still_nudges_with_callout(self):
         """A dislike of something in LIKES must nudge (same-kind dedupe only)."""
@@ -113,11 +148,17 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertEqual([(s["kind"], s["value"]) for s in out],
                          [("goal", "reduce_fat")])
 
-    def test_known_goal_deduped(self):
+    def test_known_goal_comes_back_preselected(self):
+        """An existing goal is shown as already tracked, never inferred twice."""
         out = _suggest(self.service, [
-            {"kind": "goal", "value": "reduce_sugar", "confidence": "high"},  # already a goal
+            {"kind": "goal", "value": "reduce_sugar", "confidence": "high",
+             "statement": "It sounds like you want to cut sugar — track this goal?"},
         ])
-        self.assertEqual(out, [])
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0]["already_known"])
+        self.assertEqual(out[0]["value"], "reduce_sugar")
+        # The model's question is replaced by an observation.
+        self.assertEqual(out[0]["statement"], "“reduce sugar” is already one of your goals.")
 
     def test_low_confidence_goal_dropped(self):
         out = _suggest(self.service, [
@@ -134,11 +175,14 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertEqual([(s["kind"], s["value"]) for s in out],
                          [("dietary_pattern", "keto")])
 
-    def test_known_pattern_deduped(self):
+    def test_known_pattern_comes_back_preselected(self):
         out = _suggest(self.service, [
             {"kind": "dietary_pattern", "value": "vegetarian", "confidence": "high"},  # in dietary_groups
         ])
-        self.assertEqual(out, [])
+        self.assertEqual(
+            [(s["value"], s["already_known"]) for s in out], [("vegetarian", True)]
+        )
+        self.assertIn("already part of your dietary profile", out[0]["statement"])
 
     def test_new_kinds_accepted_by_decide(self):
         # decide() must not reject the new kinds as invalid payloads.
@@ -188,6 +232,80 @@ class MemoryPolicyTests(unittest.TestCase):
             "vegetarian",
             [str(v).lower() for v in prof.nutritional_preferences.get("food_likes", [])],
         )
+
+
+class MemoryWriteTests(unittest.TestCase):
+    """_apply against a fake platform profile (no network)."""
+
+    class _Prof:
+        def __init__(self, **fields):
+            self.nutritional_preferences = fields.get("nutritional_preferences", {})
+            self.allergies = fields.get("allergies", [])
+            self.dietary_groups = fields.get("dietary_groups", [])
+            self.properties = fields.get("properties", {})
+            self.writes = 0
+
+        def __setattr__(self, name, value):
+            if name in ("nutritional_preferences", "allergies",
+                        "dietary_groups", "properties") and "writes" in self.__dict__:
+                self.__dict__["writes"] += 1
+            object.__setattr__(self, name, value)
+
+    def _decide(self, prof, kind, value, source_text=""):
+        import sys
+        from unittest.mock import MagicMock
+
+        member = MagicMock()
+        member.profile = prof
+        client = MagicMock()
+        client.members.get.return_value = member
+        plat = MagicMock()
+        plat.WISEFOOD_PLATFORM.get_client.return_value = client
+
+        saved = sys.modules.get("backend.platform")
+        sys.modules["backend.platform"] = plat
+        try:
+            return MemoryService().decide("m", kind, value, "accept", source_text)
+        finally:
+            if saved is not None:
+                sys.modules["backend.platform"] = saved
+            else:
+                sys.modules.pop("backend.platform", None)
+
+    def test_new_goal_is_written_once_with_a_log_entry(self):
+        prof = self._Prof(properties={"memory_log": []})
+        self.assertTrue(self._decide(prof, "goal", "increase_protein", "more protein please"))
+        self.assertEqual(
+            [g["slug"] for g in prof.properties["dietary_goals"]], ["increase_protein"]
+        )
+        self.assertEqual(len(prof.properties["memory_log"]), 1)
+        self.assertEqual(prof.properties["memory_log"][0]["source_text"], "more protein please")
+        self.assertEqual(prof.writes, 1)  # properties only
+
+    def test_reaccepting_a_known_goal_writes_nothing(self):
+        prof = self._Prof(properties={
+            "dietary_goals": [{"slug": "increase_protein", "label": "increase protein"}],
+            "memory_log": [{"kind": "goal", "value": "increase_protein",
+                            "source": "foodscholar", "recorded_at": "2026-07-01T00:00:00+00:00"}],
+        })
+        self.assertFalse(self._decide(prof, "goal", "increase_protein"))
+        self.assertEqual(len(prof.properties["dietary_goals"]), 1)
+        self.assertEqual(len(prof.properties["memory_log"]), 1)
+        self.assertEqual(prof.writes, 0)
+
+    def test_reaccepting_a_known_like_writes_nothing(self):
+        prof = self._Prof(nutritional_preferences={"food_likes": ["lentils"]},
+                          properties={"memory_log": []})
+        self.assertFalse(self._decide(prof, "like", "lentils"))
+        self.assertEqual(prof.writes, 0)
+
+    def test_like_that_resolves_a_contradiction_is_still_a_write(self):
+        prof = self._Prof(nutritional_preferences={"food_likes": ["lentils"],
+                                                   "food_dislikes": ["lentils"]},
+                          properties={})
+        self.assertTrue(self._decide(prof, "like", "lentils"))
+        self.assertEqual(prof.nutritional_preferences["food_dislikes"], [])
+        self.assertEqual(prof.writes, 2)  # nutritional_preferences + properties
 
 
 if __name__ == "__main__":

@@ -702,6 +702,13 @@ class MemorySuggestion(BaseModel):
             "stored with the memory as its provenance"
         ),
     )
+    already_known: bool = Field(
+        default=False,
+        description=(
+            "True when the profile already holds this value: the UI shows it "
+            "pre-selected instead of asking, and nothing is written again"
+        ),
+    )
 
 
 class MemoryDecisionRequest(BaseModel):
