@@ -1085,6 +1085,7 @@ def sync_prompts(
     client: Optional[Any] = None,
     registry: Optional[List["_Prompt"]] = None,
     force: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, int]:
     """Seed registry prompts into Langfuse; optionally push fallback updates.
 
@@ -1102,6 +1103,9 @@ def sync_prompts(
     version, and the UI can roll back by moving the label — but any UI edit
     stops being the served version, so force is for releases that changed the
     fallbacks on purpose. Identical prompts are skipped either way.
+
+    ``dry_run=True`` reads Langfuse but never writes: the counts say what a
+    real run would create or update, and each would-be write is logged.
 
     Safe no-op when ``client`` is None (Langfuse disabled). Per-prompt failures
     are logged and counted, never raised, so startup is never blocked.
@@ -1131,28 +1135,35 @@ def sync_prompts(
                     # or identical — leave it.
                     counts["skipped"] += 1
                     continue
+                if not dry_run:
+                    client.create_prompt(
+                        name=prompt.name,
+                        type="text",
+                        prompt=prompt.fallback,
+                        labels=[prompt.label],
+                    )
+                counts["updated"] += 1
+                logger.info(
+                    "%s new '%s' version of prompt '%s' from the fallback.",
+                    "Would publish" if dry_run else "Published",
+                    prompt.label,
+                    prompt.name,
+                )
+                continue
+
+            if not dry_run:
                 client.create_prompt(
                     name=prompt.name,
                     type="text",
                     prompt=prompt.fallback,
                     labels=[prompt.label],
                 )
-                counts["updated"] += 1
-                logger.info(
-                    "Published new '%s' version of prompt '%s' from the fallback.",
-                    prompt.label,
-                    prompt.name,
-                )
-                continue
-
-            client.create_prompt(
-                name=prompt.name,
-                type="text",
-                prompt=prompt.fallback,
-                labels=[prompt.label],
-            )
             counts["created"] += 1
-            logger.info("Seeded missing prompt '%s' to Langfuse.", prompt.name)
+            logger.info(
+                "%s missing prompt '%s' to Langfuse.",
+                "Would seed" if dry_run else "Seeded",
+                prompt.name,
+            )
         except Exception as exc:  # pragma: no cover - defensive
             counts["failed"] += 1
             logger.warning("Failed to seed prompt '%s': %s", prompt.name, exc)

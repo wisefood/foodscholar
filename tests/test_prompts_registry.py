@@ -360,6 +360,78 @@ class TestPromptSync(unittest.TestCase):
             result, {"created": 0, "updated": 0, "skipped": 0, "failed": 0}
         )
 
+    def test_dry_run_reads_but_never_writes(self):
+        """--dry-run reports what --force would do and creates nothing."""
+        from backend import prompts as P
+
+        class FakeManaged:
+            def __init__(self, prompt):
+                self.prompt = prompt
+
+        ns = P._PROMPT_NAMESPACE
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+                self.store = {
+                    ns + "p-existing-same": "SAME",
+                    ns + "p-existing-diff": "UI EDIT",
+                }
+
+            def get_prompt(self, name, **kwargs):
+                if name not in self.store:
+                    raise Exception(f"Prompt not found: '{name}'")
+                return FakeManaged(self.store[name])
+
+            def create_prompt(self, **kwargs):
+                self.created.append(kwargs["name"])
+
+        fake = FakeClient()
+        result = P.sync_prompts(
+            client=fake, registry=self._registry(), force=True, dry_run=True
+        )
+        self.assertEqual(fake.created, [])
+        self.assertEqual(result["created"], 1)   # p-missing would be seeded
+        self.assertEqual(result["updated"], 1)   # p-existing-diff would get a version
+        self.assertEqual(result["skipped"], 1)
+
+
+class TestSeedScriptSelection(unittest.TestCase):
+    """scripts/seed_langfuse_prompts.py --name: short or namespaced, typo-safe."""
+
+    def _select(self):
+        import importlib.util, os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "scripts", "seed_langfuse_prompts.py"
+        )
+        spec = importlib.util.spec_from_file_location("seed_langfuse_prompts", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.select_prompts
+
+    def _registry(self):
+        from backend.prompts import _Prompt
+        return [_Prompt("qa-memory-extractor", fallback="A"),
+                _Prompt("qa-starter-questions", fallback="B")]
+
+    def test_no_names_means_everything(self):
+        select = self._select()
+        self.assertEqual(len(select(self._registry(), [])), 2)
+
+    def test_short_and_namespaced_names_both_match(self):
+        from backend.prompts import _PROMPT_NAMESPACE
+        select = self._select()
+        short = select(self._registry(), ["qa-memory-extractor"])
+        full = select(self._registry(), [_PROMPT_NAMESPACE + "qa-memory-extractor"])
+        self.assertEqual([p.name for p in short], [_PROMPT_NAMESPACE + "qa-memory-extractor"])
+        self.assertEqual([p.name for p in full], [p.name for p in short])
+
+    def test_unknown_name_is_an_error_not_a_silent_noop(self):
+        select = self._select()
+        with self.assertRaises(ValueError) as ctx:
+            select(self._registry(), ["qa-memory-extracter"])
+        self.assertIn("qa-memory-extracter", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
