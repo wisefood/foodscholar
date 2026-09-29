@@ -1080,6 +1080,18 @@ ALL_PROMPTS: List["_Prompt"] = [
 ]
 
 
+def _is_not_found(exc: BaseException) -> bool:
+    """True when a prompt fetch failed because the prompt does not exist.
+
+    The SDK raises a typed 404 with ``status_code``; older versions and the
+    test doubles raise a plain exception whose message says so. Anything
+    else (DNS, connection refused, 401, 5xx) is not "missing".
+    """
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    return "not found" in str(exc).lower()
+
+
 def sync_prompts(
     *,
     client: Optional[Any] = None,
@@ -1125,8 +1137,18 @@ def sync_prompts(
                 existing = client.get_prompt(
                     prompt.name, label=prompt.label, cache_ttl_seconds=0
                 )
-            except Exception:
-                existing = None  # treated as "missing"
+            except Exception as exc:
+                if not _is_not_found(exc):
+                    # Unreachable host, bad credentials, 5xx: we do not know
+                    # what Langfuse holds, so neither create nor report a
+                    # phantom create. Startup keeps going; the counts say so.
+                    counts["failed"] += 1
+                    logger.warning(
+                        "Could not fetch prompt '%s' from Langfuse: %s",
+                        prompt.name, exc,
+                    )
+                    continue
+                existing = None  # a real 404: genuinely missing
 
             if existing is not None:
                 live_text = getattr(existing, "prompt", None)

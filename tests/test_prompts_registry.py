@@ -395,6 +395,57 @@ class TestPromptSync(unittest.TestCase):
         self.assertEqual(result["updated"], 1)   # p-existing-diff would get a version
         self.assertEqual(result["skipped"], 1)
 
+    def test_unreachable_langfuse_is_a_failure_not_a_missing_prompt(self):
+        """DNS/connection errors must not look like 'prompt missing': nothing
+        is created (even with --force) and a dry run reports no phantom
+        creates. This is what the production pod hits when the in-cluster
+        Langfuse hostname does not resolve."""
+        from backend import prompts as P
+
+        class DeadClient:
+            def __init__(self):
+                self.created = []
+
+            def get_prompt(self, name, **kwargs):
+                raise OSError("[Errno -2] Name or service not known")
+
+            def create_prompt(self, **kwargs):
+                self.created.append(kwargs["name"])
+
+        for dry_run in (False, True):
+            dead = DeadClient()
+            result = P.sync_prompts(
+                client=dead, registry=self._registry(), force=True, dry_run=dry_run
+            )
+            self.assertEqual(dead.created, [])
+            self.assertEqual(result["failed"], 3)
+            self.assertEqual(result["created"], 0)
+            self.assertEqual(result["updated"], 0)
+
+    def test_typed_404_counts_as_missing(self):
+        """The SDK's NotFoundError carries status_code=404 and no 'not found'
+        text is guaranteed; it must still mean 'seed it'."""
+        from backend import prompts as P
+
+        class Gone(Exception):
+            status_code = 404
+
+        class Client:
+            def __init__(self):
+                self.created = []
+
+            def get_prompt(self, name, **kwargs):
+                raise Gone("no such prompt")
+
+            def create_prompt(self, **kwargs):
+                self.created.append(kwargs["name"])
+
+        c = Client()
+        result = P.sync_prompts(client=c, registry=self._registry())
+        self.assertEqual(len(c.created), 3)
+        self.assertEqual(result["created"], 3)
+        self.assertEqual(result["failed"], 0)
+
 
 class TestSeedScriptSelection(unittest.TestCase):
     """scripts/seed_langfuse_prompts.py --name: short or namespaced, typo-safe."""

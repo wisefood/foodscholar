@@ -102,6 +102,26 @@ def main() -> int:
         print("Could not initialize Langfuse client.")
         return 1
 
+    # A fetch failure is not "prompt missing". Refuse to guess against a host
+    # that cannot be reached: from inside the cluster the in-cluster service
+    # name may not resolve, and the public host may be down.
+    base_url = os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+    reachable = getattr(client, "auth_check", None)
+    if reachable is not None:
+        try:
+            ok = bool(reachable())
+        except Exception as exc:
+            ok = False
+            print(f"Langfuse auth check raised: {exc}")
+        if not ok:
+            print(
+                f"Langfuse is unreachable or rejected the keys at {base_url}. "
+                "Nothing was read or written. Point LANGFUSE_BASE_URL at a "
+                "running instance (the public host, if the in-cluster service "
+                "does not resolve) and retry."
+            )
+            return 1
+
     result = sync_prompts(
         client=client, registry=registry, force=args.force, dry_run=args.dry_run
     )
