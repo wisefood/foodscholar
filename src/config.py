@@ -115,6 +115,34 @@ class Config:
             os.getenv("GUIDELINE_JOB_LOCK_TIMEOUT", "7200")
         )
 
+        # Excel export of one guide's guidelines, requested from the console.
+        # The finished workbook is kept in Redis, next to its status, for
+        # GUIDE_EXPORT_TTL_SECONDS; after that the export has to be run again.
+        self.settings["ENABLE_GUIDE_EXPORT_WORKER"] = (
+            os.getenv("ENABLE_GUIDE_EXPORT_WORKER", "true").lower() == "true"
+        )
+        self.settings["GUIDE_EXPORT_WORKER_POLL_INTERVAL"] = int(
+            os.getenv("GUIDE_EXPORT_WORKER_POLL_INTERVAL", "5")
+        )
+        self.settings["GUIDE_EXPORT_QUEUE_KEY"] = os.getenv(
+            "GUIDE_EXPORT_QUEUE_KEY", "guide_export:queue"
+        )
+        self.settings["GUIDE_EXPORT_STATUS_PREFIX"] = os.getenv(
+            "GUIDE_EXPORT_STATUS_PREFIX", "guide_export:job"
+        )
+        self.settings["GUIDE_EXPORT_LOCK_PREFIX"] = os.getenv(
+            "GUIDE_EXPORT_LOCK_PREFIX", "guide_export:lock"
+        )
+        self.settings["GUIDE_EXPORT_FILE_PREFIX"] = os.getenv(
+            "GUIDE_EXPORT_FILE_PREFIX", "guide_export:file"
+        )
+        self.settings["GUIDE_EXPORT_LOCK_TIMEOUT"] = int(
+            os.getenv("GUIDE_EXPORT_LOCK_TIMEOUT", "900")
+        )
+        self.settings["GUIDE_EXPORT_TTL_SECONDS"] = int(
+            os.getenv("GUIDE_EXPORT_TTL_SECONDS", "86400")
+        )
+
         # Guideline facet enrichment (post-extraction). Bumping the version
         # re-enriches the whole corpus on the next run; records at or above the
         # current version are skipped, so runs are resumable and repeatable.

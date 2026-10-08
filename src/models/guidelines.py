@@ -299,6 +299,50 @@ class GuidelineExtractionJobResponse(BaseModel):
     )
 
 
+class GuideExportRequest(BaseModel):
+    """Request body for queueing an Excel export of a guide's guidelines."""
+
+    force: bool = Field(
+        default=False,
+        description="Queue a new export even if one is already queued or running",
+    )
+
+
+class GuideExportJobResponse(BaseModel):
+    """Status of the latest Excel export of a guide."""
+
+    guide_urn: str = Field(description="Guide URN")
+    status: Literal[
+        "not_found", "queued", "running", "succeeded", "failed", "stalled"
+    ] = Field(description="Current job state")
+    stalled: bool = Field(
+        default=False,
+        description=(
+            "The job claims to be running but no worker holds its lock — the "
+            "process handling it died. Queueing again is safe."
+        ),
+    )
+    job_id: Optional[str] = Field(default=None, description="Latest export job identifier")
+    stage: Optional[str] = Field(
+        default=None, description="queued, fetching, writing or done"
+    )
+    enqueued_at: Optional[str] = Field(default=None, description="ISO timestamp when queued")
+    started_at: Optional[str] = Field(default=None, description="ISO timestamp when work started")
+    completed_at: Optional[str] = Field(default=None, description="ISO timestamp when it finished")
+    total_guidelines: Optional[int] = Field(
+        default=None, description="Guidelines in the export, once fetched"
+    )
+    filename: Optional[str] = Field(default=None, description="Workbook file name")
+    size_bytes: Optional[int] = Field(default=None, description="Workbook size")
+    expires_at: Optional[str] = Field(
+        default=None, description="When the finished workbook stops being downloadable"
+    )
+    download_ready: bool = Field(
+        default=False, description="Whether the workbook can be downloaded now"
+    )
+    error: Optional[str] = Field(default=None, description="Failure message, if it failed")
+
+
 class GuidelineImportRequest(BaseModel):
     """Request body for importing extracted guidelines into a guide."""
 

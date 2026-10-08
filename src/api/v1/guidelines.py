@@ -4,8 +4,11 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 from models.guidelines import (
+    GuideExportJobResponse,
+    GuideExportRequest,
     GuidelineArtifactStorageResponse,
     GuidelineEnrichmentEnqueueRequest,
     GuidelineEnrichmentPreviewRequest,
@@ -14,6 +17,14 @@ from models.guidelines import (
     GuidelineImportResponse,
     GuidelineExtractionRunRequest,
 )
+from services.guide_export_jobs import (
+    GuideExportError,
+    GuideExportJobService,
+    GuideExportNotFound,
+    GuideExportNotReady,
+    GuideExportQueueUnavailable,
+)
+from services.guide_export_workbook import XLSX_MEDIA_TYPE
 from services.guideline_corpus import GuidelineCorpusService
 from services.guideline_extractor import GuidelineExtractionError
 from services.guideline_enrichment_jobs import (
@@ -37,6 +48,7 @@ router = APIRouter(prefix="/guidelines", tags=["Guidelines"])
 job_service = GuidelineJobService()
 enrichment_job_service = GuidelineEnrichmentJobService()
 corpus_service = GuidelineCorpusService()
+export_service = GuideExportJobService()
 
 
 @router.get("/storage/{artifact_uuid}", response_model=GuidelineArtifactStorageResponse)
@@ -143,6 +155,63 @@ async def import_guidelines_to_guide(
         logger.error("Error importing guidelines for %s: %s", artifact_uuid, exc, exc_info=True)
         status_code = 404 if "not found" in str(exc).lower() else 500
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
+@router.post(
+    "/export/{guide_urn}",
+    response_model=GuideExportJobResponse,
+    status_code=202,
+)
+async def enqueue_guide_export(guide_urn: str, request: Optional[GuideExportRequest] = None):
+    """
+    Queue an Excel export of every guideline of a guide.
+
+    If an export of the guide is already queued or running, its status is
+    returned and no duplicate is queued. The finished workbook is downloadable
+    from `/export/{guide_urn}/download` until it expires.
+    """
+    try:
+        export_service.enqueue_job(guide_urn, force=bool(request and request.force))
+        return export_service.get_job_response(guide_urn)
+    except GuideExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GuideExportQueueUnavailable as exc:
+        logger.error("Redis unavailable while queuing the export of %s: %s", guide_urn, exc)
+        raise HTTPException(status_code=503, detail="Guide export queue is unavailable") from exc
+
+
+@router.get("/export/{guide_urn}", response_model=GuideExportJobResponse)
+async def get_guide_export_status(guide_urn: str):
+    """Return the status of the latest Excel export of a guide."""
+    try:
+        return export_service.get_job_response(guide_urn)
+    except GuideExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GuideExportQueueUnavailable as exc:
+        logger.error("Redis unavailable while reading the export of %s: %s", guide_urn, exc)
+        raise HTTPException(status_code=503, detail="Guide export queue is unavailable") from exc
+
+
+@router.get("/export/{guide_urn}/download")
+async def download_guide_export(guide_urn: str):
+    """Return the latest finished Excel export of a guide."""
+    try:
+        filename, content = export_service.get_file(guide_urn)
+    except GuideExportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except GuideExportNotReady as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except GuideExportNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GuideExportQueueUnavailable as exc:
+        logger.error("Redis unavailable while reading the export of %s: %s", guide_urn, exc)
+        raise HTTPException(status_code=503, detail="Guide export queue is unavailable") from exc
+
+    return Response(
+        content=content,
+        media_type=XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/worker/status")

@@ -34,6 +34,11 @@ from workers.guideline_enrichment_worker import (
     start_guideline_enrichment_worker,
     stop_guideline_enrichment_worker,
 )
+from workers.guide_export_worker import (
+    start_guide_export_worker,
+    stop_guide_export_worker,
+    get_guide_export_worker,
+)
 from config import config
 
 # Initialize logger
@@ -98,6 +103,9 @@ async def lifespan(app: FastAPI):
     if config.settings.get("ENABLE_GUIDELINE_ENRICHMENT_WORKER", True):
         logger.info("Starting guideline enrichment worker...")
         start_guideline_enrichment_worker()
+    if config.settings.get("ENABLE_GUIDE_EXPORT_WORKER", True):
+        logger.info("Starting guide export worker...")
+        start_guide_export_worker()
 
     # Idempotently sync prompts to Langfuse in the background. Non-blocking:
     # app startup never waits on (or fails due to) Langfuse availability.
@@ -130,6 +138,9 @@ async def lifespan(app: FastAPI):
     if config.settings.get("ENABLE_GUIDELINE_ENRICHMENT_WORKER", True):
         logger.info("Stopping guideline enrichment worker...")
         stop_guideline_enrichment_worker()
+    if config.settings.get("ENABLE_GUIDE_EXPORT_WORKER", True):
+        logger.info("Stopping guide export worker...")
+        stop_guide_export_worker()
 
     if config.settings["KG_ENABLED"]:
         from services import kg_service
@@ -273,6 +284,8 @@ async def health_check():
     if config.settings["ENABLE_GUIDELINE_EXTRACTION_WORKER"]:
         guideline_worker = get_guideline_worker()
         health_data["guideline_worker"] = guideline_worker.get_stats()
+    if config.settings.get("ENABLE_GUIDE_EXPORT_WORKER", True):
+        health_data["guide_export_worker"] = get_guide_export_worker().get_stats()
 
     return health_data
 

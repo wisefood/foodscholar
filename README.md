@@ -547,6 +547,9 @@ instance, with the raw spec at `/openapi.json`.
 | `POST` | `/guidelines/extract/{artifact_uuid}` | Queue extraction from an artifact PDF |
 | `GET` | `/guidelines/extract/{artifact_uuid}` | Extraction job status and results |
 | `POST` | `/guidelines/import/{artifact_uuid}` | Import extracted rules onto the parent guide |
+| `POST` | `/guidelines/export/{guide_urn}` | Queue an Excel export of a guide's guidelines (FSKG layout) |
+| `GET` | `/guidelines/export/{guide_urn}` | Status of the guide's latest export |
+| `GET` | `/guidelines/export/{guide_urn}/download` | The finished `.xlsx` (404 once expired, 409 while running) |
 | `GET` | `/guidelines/worker/status` | Extraction worker status |
 | `POST` | `/guidelines/enrichment/preview` | Preview a facet-enrichment run |
 | `POST` | `/guidelines/enrichment/enqueue` | Queue facet enrichment |
@@ -734,6 +737,14 @@ off it. `tests/test_model_config.py` asserts no configured default references a 
 | `GUIDELINE_ENRICHMENT_QUEUE_KEY` | `guideline_enrichment:queue` | Redis queue key |
 | `GUIDELINE_ENRICHMENT_LOCK_PREFIX` | `guideline_enrichment:lock` | Redis lock prefix |
 | `GUIDELINE_ENRICHMENT_LOCK_TIMEOUT` | `7200` | Lock TTL (s) |
+| `ENABLE_GUIDE_EXPORT_WORKER` | `true` | Start the guide Excel export worker |
+| `GUIDE_EXPORT_WORKER_POLL_INTERVAL` | `5` | Export poll interval (s) |
+| `GUIDE_EXPORT_TTL_SECONDS` | `86400` | How long a finished workbook (and its status) stays in Redis |
+| `GUIDE_EXPORT_LOCK_TIMEOUT` | `900` | Export lock TTL (s) |
+| `GUIDE_EXPORT_QUEUE_KEY` | `guide_export:queue` | Redis queue key |
+| `GUIDE_EXPORT_STATUS_PREFIX` | `guide_export:job` | Redis status key prefix (one per guide) |
+| `GUIDE_EXPORT_LOCK_PREFIX` | `guide_export:lock` | Redis lock prefix |
+| `GUIDE_EXPORT_FILE_PREFIX` | `guide_export:file` | Redis key prefix for finished workbooks |
 
 ### Retrieval tuning
 

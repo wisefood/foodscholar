@@ -47,6 +47,8 @@ PyMuPDF>=1.24.0,<2.0.0
 pyarrow==23.0.1
 numpy==1.26.4
 pandas==3.0.1
+# Writes the console's guide export workbooks (services/guide_export_workbook.py).
+openpyxl>=3.1,<4
 langfuse>=3.0.0,<4.0.0
 # The hierarchical knowledge graph, read-only. The graph is built offline by a
 # job running the library's own phases; this service projects it into an
