@@ -5,3 +5,6 @@ __pycache__/
 src/data/*
 # Confidential research material — never commit
 docs/ACCRETE_RESEARCH_PROPOSAL.md
+
+# QA benchmark run output (scripts/run_qa_benchmark.py)
+benchmark-runs/

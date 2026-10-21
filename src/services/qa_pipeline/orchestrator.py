@@ -404,7 +404,7 @@ async def run_pipeline(
         effective_retriever=effective_retriever,
         user_context=user_context,
     )
-    if clarification is None:
+    if clarification is None and not request.bypass_cache:
         cached = await asyncio.to_thread(service.cache_manager.get, cache_key)
         if cached:
             cached["cache_hit"] = True

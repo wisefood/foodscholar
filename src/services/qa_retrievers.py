@@ -717,8 +717,10 @@ AGE_GROUP_FACETS: List[tuple] = [
     (("toddler", "1-3", "1-4", "0-3"), ["early_childhood"], 12, 48),
     (("child", "kid", "4-8", "school", "5-12"), ["early_childhood", "school_age"], 48, 144),
     (("teen", "adolescent", "13-18"), ["adolescence"], 144, 216),
-    (("adult", "18-64", "19-64"), ["adulthood"], 216, 780),
+    # Before "adult": the first row with a matching token wins, and
+    # "older adult" contains "adult".
     (("elder", "older", "senior", "65"), ["older_adulthood"], 780, 1560),
+    (("adult", "18-64", "19-64"), ["adulthood"], 216, 780),
     (("pregnan",), ["pregnancy"], None, None),
     (("lactat", "breastfeed"), ["lactation"], None, None),
 ]

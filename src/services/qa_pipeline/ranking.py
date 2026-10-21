@@ -50,6 +50,32 @@ STUDY_DESIGN_WEIGHTS = [
 ]
 
 
+# Every environment-tunable knob that changes which evidence an answer is built
+# from, fusion included. The answer cache keys on all of them and benchmark
+# runs record them: scores from before and after a retune are not comparable.
+RANKING_SETTINGS = (
+    "QA_RRF_K",
+    "QA_RRF_CANDIDATES",
+    "QA_RECENCY_HALF_LIFE_YEARS",
+    "QA_RECENCY_FLOOR",
+    "QA_INFLUENCE_WEIGHT",
+    "QA_INFLUENCE_CITATION_CAP",
+    "QA_EARNED_TIER_ENABLED",
+    "QA_EARNED_PRIME_CITATIONS",
+    "QA_EARNED_PRIME_INFLUENTIAL",
+    "QA_EARNED_CORE_CITATIONS",
+    "QA_EARNED_PRIME_BOOST",
+    "QA_EARNED_CORE_BOOST",
+    "QA_MIN_SCORE",
+    "QA_PER_DOC_CAP",
+)
+
+
+def ranking_config() -> Dict[str, Any]:
+    """The live value of every ranking setting, keyed by setting name."""
+    return {name: config.settings.get(name) for name in RANKING_SETTINGS}
+
+
 def _setting(name: str, default: float) -> float:
     try:
         return float(config.settings.get(name, default))

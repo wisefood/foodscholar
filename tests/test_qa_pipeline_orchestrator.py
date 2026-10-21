@@ -418,6 +418,32 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(events[-1].data["memory_suggestions"])
         suggest.assert_not_called()
 
+    async def test_bypass_cache_answers_fresh_and_still_refreshes_the_entry(self):
+        cached = {
+            "primary_answer": {"answer": "Stale answer.", "citations": [],
+                               "confidence": "high", "model_used": "test"},
+        }
+
+        def cache_get(key):
+            return dict(cached) if str(key).startswith("qa:") else None
+
+        request = QARequest(
+            question="Do whole grains lower cholesterol?", bypass_cache=True
+        )
+        with patch.object(
+            self.service.cache_manager, "get", side_effect=cache_get
+        ), patch.object(self.service.cache_manager, "set") as cache_set:
+            events, calls = await self._run(request)
+
+        self.assertNotIn("stage.cache", [e.name for e in events])
+        self.assertTrue(calls)  # retrieval ran
+        done = events[-1]
+        self.assertEqual(done.name, "done")
+        self.assertFalse(done.data["cache_hit"])
+        self.assertNotEqual(done.data["primary_answer"]["answer"], "Stale answer.")
+        stored_keys = [c.args[0] for c in cache_set.call_args_list if c.args]
+        self.assertTrue(any(str(k).startswith("qa:") for k in stored_keys))
+
 
 if __name__ == "__main__":
     unittest.main()

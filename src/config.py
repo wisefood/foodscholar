@@ -24,6 +24,9 @@ class Config:
         self.settings["HOST"] = os.getenv("HOST", "0.0.0.0")
         self.settings["PORT"] = int(os.getenv("PORT", 8000))
         self.settings["DEBUG"] = os.getenv("DEBUG", "true").lower() == "true"
+        # Baked in at image build (Dockerfile ARG, set by CI); the image ships
+        # without .git, so this is the only way a running service knows it.
+        self.settings["GIT_COMMIT"] = os.getenv("GIT_COMMIT", "unknown")
         self.settings["ELASTIC_HOST"] = os.getenv(
             "ELASTIC_HOST", "http://elasticsearch:9200"
         )

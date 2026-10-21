@@ -319,12 +319,14 @@ artifact PDF ──▶ download to workspace ──▶ render pages (PyMuPDF, GU
 ├── requirements.txt
 ├── extract_guidelines.py                 # CLI wrapper around the extraction service
 ├── scripts/
+│   ├── run_qa_benchmark.py                # persona question set → recorded QA runs
 │   └── seed_langfuse_prompts.py           # idempotent prompt seeding
 ├── docs/
 │   ├── ARCHITECTURE_PRESENTATION.md       # architecture walkthrough
 │   ├── BACKGROUND_WORKER.md               # worker design and operations
 │   ├── guideline-facets-and-retrieval.md  # facets, context-aware extraction, retrieval gate
-│   └── langfuse-integration-guide.md      # observability integration
+│   ├── langfuse-integration-guide.md      # observability integration
+│   └── qa-benchmark.md                    # running and recording QA benchmarks
 ├── src/
 │   ├── app.py                            # FastAPI app + lifespan
 │   ├── config.py                         # environment configuration
@@ -501,6 +503,7 @@ instance, with the raw spec at `/openapi.json`.
 | `POST` | `/qa/memory` | Apply or decline a memory nudge raised by a previous turn |
 | `POST` | `/qa/feedback` | Submit feedback on an answer (supports A/B dual-answer) |
 | `GET` | `/qa/models` | Available Groq models and the default |
+| `GET` | `/qa/runtime-info` | Git commit, models, prompt versions and ranking settings in effect ([benchmarks](docs/qa-benchmark.md)) |
 | `GET` | `/qa/questions` | Starter nutrition questions for a language |
 | `GET` | `/qa/tips` | Tips of the day, grounded in guidelines or articles |
 | `DELETE` | `/qa/cache/clear` | Invalidate cached answers by pattern |

@@ -170,6 +170,13 @@ class GuidelineContextClauseTests(unittest.TestCase):
         self.assertEqual(guideline_age_should_clauses("martian"), [])
         self.assertEqual(guideline_age_should_clauses(None), [])
 
+    def test_older_adult_is_not_resolved_as_adult(self):
+        from services.qa_retrievers import age_group_facets
+
+        self.assertEqual(age_group_facets("older adult")[0], ["older_adulthood"])
+        self.assertEqual(age_group_facets("young adult")[0], ["adulthood"])
+        self.assertEqual(age_group_facets("adult")[0], ["adulthood"])
+
 
 class HybridRetrievalTests(unittest.TestCase):
     """

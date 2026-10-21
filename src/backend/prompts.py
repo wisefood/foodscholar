@@ -50,6 +50,16 @@ def _to_langchain(text: str) -> str:
 # each slash-delimited segment as a folder in the UI (requires SDK >= 3.0.2).
 _PROMPT_NAMESPACE = "foodscholar/"
 
+# The version each prompt last served in this process: the Langfuse version
+# number, or "fallback" for the in-code text. A Langfuse UI edit changes answers
+# without a deploy, so benchmark runs record this via GET /qa/runtime-info.
+_SERVED_VERSIONS: Dict[str, Any] = {}
+
+
+def served_prompt_versions() -> Dict[str, Any]:
+    """Every prompt this process has served, with the version it served."""
+    return dict(sorted(_SERVED_VERSIONS.items()))
+
 
 class _Prompt:
     """A single registered prompt: Langfuse-managed with an in-code fallback."""
@@ -83,16 +93,27 @@ class _Prompt:
             logger.warning("Langfuse get_prompt(%s) failed: %s", self.name, exc)
             return None
 
+    def _record(self, managed: Optional[Any]) -> None:
+        # The SDK hands back its own fallback client (is_fallback=True) when
+        # the prompt is missing from Langfuse; that is still our in-code text.
+        if managed is None or getattr(managed, "is_fallback", False):
+            _SERVED_VERSIONS[self.name] = "fallback"
+        else:
+            _SERVED_VERSIONS[self.name] = getattr(managed, "version", None)
+
     def compile(self, **variables: Any) -> str:
         """Resolve the prompt and substitute variables; always returns a str."""
         managed = self._managed()
         if managed is not None:
             try:
-                return managed.compile(**variables)
+                text = managed.compile(**variables)
+                self._record(managed)
+                return text
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
                     "compile(%s) failed; using fallback: %s", self.name, exc
                 )
+        self._record(None)
         return _compile_fallback(self.fallback, variables)
 
     def langchain(self, **precompiled: Any) -> str:
@@ -100,13 +121,16 @@ class _Prompt:
         managed = self._managed()
         if managed is not None:
             try:
-                return managed.get_langchain_prompt(**precompiled)
+                text = managed.get_langchain_prompt(**precompiled)
+                self._record(managed)
+                return text
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
                     "get_langchain_prompt(%s) failed; using fallback: %s",
                     self.name,
                     exc,
                 )
+        self._record(None)
         text = (
             _compile_fallback(self.fallback, precompiled)
             if precompiled

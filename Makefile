@@ -15,6 +15,10 @@ TAG     = latest
 #: landed, because its digest is the only thing that changes; a commit tag
 #: can be looked up and is what a rollback asks for.
 REV     = $(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
+#: Baked into the image and reported by GET /api/v1/qa/runtime-info, so a
+#: benchmark run records the code it ran against. `-dirty` when uncommitted
+#: changes went into the build: then the commit alone does not describe it.
+COMMIT  = $(shell git rev-parse HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
 CONTEXT = k8s-w
 NS      = wf-prod
 
@@ -27,7 +31,7 @@ build:
 	@echo "==> building $(IMAGE):$(TAG) ($(REV))"
 	# `--pull` so a stale local base image cannot quietly pin an old
 	# interpreter or an old certificate bundle.
-	$(DOCKER) build --pull . -t $(IMAGE):$(TAG) -t $(IMAGE):$(REV)
+	$(DOCKER) build --pull --build-arg GIT_COMMIT=$(COMMIT) . -t $(IMAGE):$(TAG) -t $(IMAGE):$(REV)
 	@echo "==> built:"
 	@$(DOCKER) images $(IMAGE):$(TAG) --format '    {{.ID}}  {{.CreatedAt}}'
 
@@ -50,7 +54,7 @@ verify:
 ## wrong dependency — the dependency layer is keyed on requirements.txt, so
 ## an edit that does not change that file will not invalidate it.
 rebuild:
-	$(DOCKER) build --pull --no-cache . -t $(IMAGE):$(TAG) -t $(IMAGE):$(REV)
+	$(DOCKER) build --pull --no-cache --build-arg GIT_COMMIT=$(COMMIT) . -t $(IMAGE):$(TAG) -t $(IMAGE):$(REV)
 	$(MAKE) push verify
 
 ## Roll the cluster onto what was just pushed, and say what it is running.
