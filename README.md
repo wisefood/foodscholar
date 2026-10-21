@@ -319,7 +319,9 @@ artifact PDF ──▶ download to workspace ──▶ render pages (PyMuPDF, GU
 ├── requirements.txt
 ├── extract_guidelines.py                 # CLI wrapper around the extraction service
 ├── scripts/
+│   ├── mmlu_to_questions.py               # MMLU split → benchmark question set
 │   ├── run_qa_benchmark.py                # persona question set → recorded QA runs
+│   ├── score_choice_benchmark.py          # accuracy for known-answer runs (MMLU)
 │   └── seed_langfuse_prompts.py           # idempotent prompt seeding
 ├── docs/
 │   ├── ARCHITECTURE_PRESENTATION.md       # architecture walkthrough

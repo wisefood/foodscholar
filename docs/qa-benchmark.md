@@ -20,11 +20,14 @@ python scripts/run_qa_benchmark.py --api http://<foodscholar>:8001 \
 | Option | Effect |
 |---|---|
 | `--persona P01`, `--type Factual`, `--only <question_id>`, `--limit N` | Run a subset (repeatable). The parent of a selected follow-up is always included. |
-| `--run-id <id>` | Resume that run: questions already recorded as `ok` are skipped, errors are retried. |
+| `--run-id <id>` | Resume that run: questions already recorded as `ok` are skipped. Errors, degraded answers and the follow-ups of re-asked questions are asked again. |
 | `--concurrency 2` | Questions in flight at once. Groq rate limits are the ceiling. |
 | `--language-from question\|persona` | Answer language from the question row (default) or the persona's `api_mapping.language`. |
 | `--retriever rag\|kggen\|no_rag` | Override the API's default retriever, e.g. to compare retrievers on the same set. |
 | `--follow-up-delay 20` | Seconds a turn-2 question waits after its parent (see below). |
+| `--clarify persona\|none` | Answer FoodScholar's clarifications as the persona (default), or record them and stop (see below). |
+| `--groq-api-key <key>` | Groq key for `--clarify persona`; defaults to `GROQ_API_KEY`. |
+| `--clarify-model`, `--clarification-answers <file>` | The Groq model that answers (default `openai/gpt-oss-20b`), and per-question scripted answers that override it. |
 | `--dry-run` | Print the payloads that would be sent; no calls. |
 
 The API must include `GET /qa/runtime-info`. The runner refuses to start without
@@ -41,13 +44,19 @@ silently ignores it, so re-runs would replay cached answers.
   - `runtime_info_start` and `runtime_info_end`: two `GET /qa/runtime-info`
     snapshots, one before and one after the run.
   - `drift`: every setting that changed between the two snapshots.
-  - `counts`: totals for `ok`, `error`, `skipped`, `needs_clarification`,
-    `cache_hit` and `follow_up_without_context`. The last two should be 0.
+  - `counts`: totals for `ok`, `error`, `skipped`, `clarifications_asked`,
+    `needs_clarification` (asked and left unanswered), `cache_hit`,
+    `follow_up_without_context` and `degraded_retrieval`. The last three should
+    be 0. `degraded_retrieval` counts answers where a search errored,
+    for example an Elasticsearch timeout. The pipeline still answers from the
+    other searches, so the answer is weaker but the request doesn't fail.
 - **`responses.jsonl`**: one line per question, with its ids, the request sent,
   `status` (`ok` / `error` / `skipped`), HTTP status, latency, and the complete
   `QAResponse`. That includes citations with quotes and context,
   `retrieved_sources`, `reasoning_steps`, `conversation_context`,
-  `user_context` and `request_id`.
+  `user_context` and `request_id`. The file is append-only: a resumed run adds
+  a new line for each question it asks again and keeps the earlier attempt.
+  **The last line per `question_id` is the result**; earlier ones are history.
 
 `runtime-info` reports:
 
@@ -89,9 +98,61 @@ sent immediately would arrive with no conversation. That's why the runner waits
 `--follow-up-delay` first. A follow-up answered without context
 (`conversation_context.turn_count < 2`) is flagged and counted.
 
-**Clarifications** are results, not obstacles. When FoodScholar asks one, the
-runner records it and doesn't answer. Any follow-up in that thread is skipped,
-because the pending clarification would only be served again.
+**Clarifications** are answered as the persona would answer them, within the
+same run. They have to be: a pending clarification expires after 30 minutes.
+FoodScholar asks at most one per thread, so one answer always leads to the
+final answer.
+
+- **How the answer is picked:** `openai/gpt-oss-20b` on Groq reads the persona's
+  profile, the question, the clarification and its options, and must pick one
+  of the offered options (a constrained JSON schema). For example, P01, a parent
+  of school-age children, would answer "6-12".
+- **Scripted answers win:** an entry in `--clarification-answers`
+  (`{"question_id": "6-12"}`) overrides the model for that question.
+- **Both turns are kept:** `clarification_turns` holds the clarification
+  response exactly as returned, with the answer given, its source and the
+  model's one-line reason. `response` is the final answer. The clarification
+  category scores the first; the judge scores the second.
+- **When no answer can be given** (an option outside the list, truncated
+  output, an API error): the clarification stays the result, the error is
+  recorded, and follow-ups in that thread are skipped.
+- **`--clarify none`:** keeps the earlier behaviour for every question; the
+  clarification is recorded and nothing is answered.
+
+The Groq key comes from `--groq-api-key` or `GROQ_API_KEY` and is never
+written to the run files. The runner checks the key and model before the run
+starts.
+
+## Closed-form benchmarks (MMLU)
+
+These are benchmarks with known answers, run through the same runner and
+scored without a judge.
+
+1. **`scripts/mmlu_to_questions.py`** turns an MMLU split into a question set.
+   - The question text is the stem, the four lettered options, and an
+     instruction to lead with the letter.
+   - The correct letter is stored as `gold` and never sent.
+   - A neutral persona asks everything. It has no country or age group, so
+     the clarifier answers "in general" if FoodScholar asks for detail.
+   - Questions over 1000 characters are left out and reported. None of the
+     306 `nutrition` test questions are.
+2. **The runner, twice:** as-is, then with `--retriever no_rag`. Both use the
+   same pipeline and answer model; only retrieval differs.
+3. **`scripts/score_choice_benchmark.py`** reads the chosen letter from each
+   final answer.
+   - First it matches the answer's opening (`C.`, `**C**`, `Answer: C`).
+     Otherwise gpt-oss-20b on Groq reads it, restricted to the four letters
+     or `none`.
+   - It writes `scores.jsonl` and `scores.json` into the run directory.
+   - An error, an unanswered clarification or no clear choice all count as
+     wrong in `accuracy`. `accuracy_when_answered` excludes them.
+   - `--compare <other run>` pairs two scored runs of the same questions and
+     runs an exact McNemar test on the questions only one of them got right.
+
+```bash
+python scripts/mmlu_to_questions.py --parquet <mmlu>/all/test-00000-of-00001.parquet \
+    --subject nutrition --out-questions mmlu-nutrition-test.json --out-personas mmlu-persona.json
+```
 
 ## Not yet built
 
