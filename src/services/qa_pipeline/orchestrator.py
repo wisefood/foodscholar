@@ -103,7 +103,7 @@ async def _memory_suggestions(
 def _load_prior_notes(service: "QAService", thread_id: Optional[str]) -> List[ResearchNote]:
     if not thread_id:
         return []
-    cached = service.cache_manager.get(_notes_cache_key(thread_id))
+    cached = service.thread_store.get(_notes_cache_key(thread_id))
     if not isinstance(cached, dict):
         return []
     notes = []
@@ -136,7 +136,7 @@ def _store_notes(
     prior: List[ResearchNote],
     new: List[ResearchNote],
 ) -> None:
-    service.cache_manager.set(
+    service.thread_store.set(
         _notes_cache_key(thread_id),
         {"notes": [note.model_dump() for note in _merged_notes(prior, new)]},
         ttl=TTL_QA_NOTES,

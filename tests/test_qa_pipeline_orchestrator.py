@@ -126,7 +126,10 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         from models.qa import QAUserContext
         from services.qa_service import QAService
 
+        from utilities.cache import CacheManager
+
         self.service = QAService(cache_enabled=False)
+        self.service.thread_store = CacheManager(enabled=False)  # no Redis in tests
         self.service._embedder = _FakeEmbedder()
 
         patchers = [

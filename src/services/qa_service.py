@@ -216,7 +216,14 @@ class QAService:
     GUIDELINES_INDEX_NAME = "guidelines"
 
     def __init__(self, cache_enabled: bool = True):
+        # Cached answers, switched by CACHE_ENABLED (off in production).
         self.cache_manager = CacheManager(enabled=cache_enabled)
+        # Thread state is not a cache: pending clarifications, the running
+        # summary with recent turns, and research notes are what a follow-up
+        # question is answered from. It lived on cache_manager until a
+        # production CACHE_ENABLED=false silently cost every follow-up its
+        # context, so it is always on, whatever that flag says.
+        self.thread_store = CacheManager(enabled=True)
         # Consecutive failures to persist a question. Reset on the first
         # success, so a non-zero value means "right now", not "ever".
         self._persist_failures = 0
@@ -1382,7 +1389,7 @@ class QAService:
         if thread:
             self._qa_threads.pop(thread_id, None)
 
-        cached = self.cache_manager.get(f"qa_thread:{thread_id}")
+        cached = self.thread_store.get(f"qa_thread:{thread_id}")
         if isinstance(cached, dict):
             cached["thread_id"] = thread_id
             cached.setdefault("expires_at", now + TTL_QA_CLARIFICATION_THREAD)
@@ -1392,7 +1399,7 @@ class QAService:
 
     def _clear_qa_thread(self, thread_id: str) -> None:
         self._qa_threads.pop(thread_id, None)
-        self.cache_manager.delete(f"qa_thread:{thread_id}")
+        self.thread_store.delete(f"qa_thread:{thread_id}")
 
     def _conversation_cache_key(self, thread_id: str) -> str:
         return f"qa_conversation:{thread_id}"
@@ -1407,7 +1414,7 @@ class QAService:
         state: Dict[str, Any] = {"summary": None, "turns": []}
         if not thread_id:
             return state
-        cached = self.cache_manager.get(self._conversation_cache_key(thread_id))
+        cached = self.thread_store.get(self._conversation_cache_key(thread_id))
         if isinstance(cached, dict):
             summary = cached.get("summary")
             if isinstance(summary, str) and summary.strip():
@@ -1496,7 +1503,7 @@ class QAService:
                     "answer": answer_text[:QA_CONVERSATION_TURN_ANSWER_CHARS],
                 },
             ][-QA_CONVERSATION_VERBATIM_TURNS:]
-            self.cache_manager.set(
+            self.thread_store.set(
                 self._conversation_cache_key(thread_id),
                 {
                     "thread_id": thread_id,
@@ -1601,7 +1608,7 @@ class QAService:
             "expires_at": now + TTL_QA_CLARIFICATION_THREAD,
         }
         self._qa_threads[thread_id] = payload
-        self.cache_manager.set(
+        self.thread_store.set(
             f"qa_thread:{thread_id}",
             payload,
             ttl=TTL_QA_CLARIFICATION_THREAD,

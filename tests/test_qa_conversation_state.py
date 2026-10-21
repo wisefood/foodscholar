@@ -69,7 +69,7 @@ class ComposePriorConversationTests(unittest.TestCase):
 class ConversationTurnStorageTests(unittest.TestCase):
     def setUp(self):
         self.service = QAService(cache_enabled=False)
-        self.service.cache_manager = _FakeCache()
+        self.service.thread_store = _FakeCache()
         self.service._conversation_summary_llm = _FakeSummaryLLM()
 
     def _update(self, question, answer):
@@ -92,6 +92,14 @@ class ConversationTurnStorageTests(unittest.TestCase):
             [turn["question"] for turn in state["turns"]], ["Q2?", "Q3?"]
         )
         self.assertTrue(state["summary"].startswith("- User asked"))
+
+    def test_thread_state_does_not_depend_on_answer_caching(self):
+        """Production runs CACHE_ENABLED=false; follow-ups must still see the turn before."""
+        self.assertFalse(self.service.cache_manager.enabled)
+        self.assertTrue(QAService(cache_enabled=False).thread_store.enabled)
+        self._update("Q1?", "A1.")
+        state = self.service._load_conversation_state("t1")
+        self.assertEqual([turn["question"] for turn in state["turns"]], ["Q1?"])
 
     def test_long_answers_are_truncated_in_the_window(self):
         self._update("Q?", "x" * 5000)
