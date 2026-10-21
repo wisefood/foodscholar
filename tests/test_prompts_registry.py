@@ -260,6 +260,66 @@ Evidence:
             legacy)
 
 
+class TestServedVersions(unittest.TestCase):
+    """Which version each prompt served, for benchmark reproducibility."""
+
+    def setUp(self):
+        _disable_langfuse()
+
+    def _served(self, name):
+        from backend.prompts import served_prompt_versions, _PROMPT_NAMESPACE
+        return served_prompt_versions().get(_PROMPT_NAMESPACE + name)
+
+    def test_no_langfuse_records_fallback(self):
+        from backend.prompts import _Prompt
+        p = _Prompt("served-off", fallback="Hi {{name}}")
+        p.compile(name="x")
+        self.assertEqual(self._served("served-off"), "fallback")
+
+    def test_managed_prompt_records_its_version(self):
+        from unittest.mock import patch
+        from backend.prompts import _Prompt
+
+        class Managed:
+            version = 7
+            is_fallback = False
+
+            def compile(self, **kwargs):
+                return "managed"
+
+            def get_langchain_prompt(self, **kwargs):
+                return "managed"
+
+        class Client:
+            def get_prompt(self, *args, **kwargs):
+                return Managed()
+
+        p = _Prompt("served-on", fallback="Hi")
+        with patch("backend.prompts.get_langfuse_client", return_value=Client()):
+            p.langchain()
+        self.assertEqual(self._served("served-on"), 7)
+
+    def test_sdk_fallback_client_counts_as_fallback(self):
+        from unittest.mock import patch
+        from backend.prompts import _Prompt
+
+        class SdkFallback:
+            version = 0
+            is_fallback = True
+
+            def compile(self, **kwargs):
+                return "Hi"
+
+        class Client:
+            def get_prompt(self, *args, **kwargs):
+                return SdkFallback()
+
+        p = _Prompt("served-missing", fallback="Hi")
+        with patch("backend.prompts.get_langfuse_client", return_value=Client()):
+            p.compile()
+        self.assertEqual(self._served("served-missing"), "fallback")
+
+
 class TestPromptSync(unittest.TestCase):
     """Idempotent startup sync: create when missing OR when fallback changed."""
 

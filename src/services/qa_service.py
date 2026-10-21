@@ -35,12 +35,13 @@ from models.qa import (
     QAFeedbackResponse,
     SimpleNutriQuestionsResponse,
     TipsOfTheDayResponse,
+    QARuntimeInfo,
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
 )
 from backend.elastic import ELASTIC_CLIENT
 from backend.groq import GROQ_CHAT
-from backend.langfuse import build_trace_config
+from backend.langfuse import build_trace_config, langfuse_enabled
 from backend.model_output import normalize_model_text
 from config import config
 from backend.prompts import (
@@ -49,6 +50,7 @@ from backend.prompts import (
     QA_TIPS_FROM_ARTICLES,
     QA_TIP_REWRITE,
     QA_CONVERSATION_SUMMARY,
+    served_prompt_versions,
 )
 
 
@@ -80,6 +82,9 @@ from utilities.cache import CacheManager
 from exceptions import InvalidError
 
 logger = logging.getLogger(__name__)
+
+# The `rag` retriever's query embedder; its 384 dims must match ES_DIM.
+QA_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 TTL_QA_RESPONSE = 86400  # 1 day
 TTL_QA_FEEDBACK = 2592000  # 30 days
@@ -232,10 +237,8 @@ class QAService:
         if self._embedder is None:
             from sentence_transformers import SentenceTransformer
 
-            self._embedder = SentenceTransformer(
-                "sentence-transformers/all-MiniLM-L6-v2"
-            )
-            logger.info("Loaded sentence-transformers/all-MiniLM-L6-v2 embedding model")
+            self._embedder = SentenceTransformer(QA_EMBED_MODEL)
+            logger.info("Loaded %s embedding model", QA_EMBED_MODEL)
         return self._embedder
 
     def _embed_query(self, question: str) -> List[float]:
@@ -560,6 +563,37 @@ class QAService:
                 )
                 session.commit()
 
+    def runtime_info(self) -> QARuntimeInfo:
+        """Everything that changes answers without a code change, as of now."""
+        from services.qa_pipeline.ranking import ranking_config
+
+        settings = config.settings
+        retrieval_keys = [
+            "QA_MAX_SUBQUESTIONS",
+            "QA_MAX_REPAIR_ROUNDS",
+            "QA_GUIDELINE_RETRIEVAL_MODE",
+            "QA_GUIDELINE_KNN_BOOST",
+        ] + sorted(k for k in settings if k.startswith("KG_RETRIEVAL_"))
+        return QARuntimeInfo(
+            git_commit=str(settings.get("GIT_COMMIT") or "unknown"),
+            pipeline_mode=str(settings.get("QA_PIPELINE_MODE", "agentic")),
+            models={
+                "answer": DEFAULT_GROQ_MODEL,
+                "planner": settings["QA_PLANNER_MODEL"],
+                "evaluator": settings["QA_EVALUATOR_MODEL"],
+                "fast": settings["QA_FAST_MODEL"],
+                "utility": settings["QA_UTILITY_MODEL"],
+                "memory_extractor": settings["MEMORY_EXTRACTOR_MODEL"],
+                "embedding": QA_EMBED_MODEL,
+            },
+            prompt_versions=served_prompt_versions(),
+            langfuse_enabled=langfuse_enabled(),
+            ranking=ranking_config(),
+            retrieval={k: settings.get(k) for k in retrieval_keys},
+            answer_cache_enabled=bool(self.cache_manager.enabled),
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
     async def answer_question(self, request: QARequest) -> QAResponse:
         """Answer a question; agentic pipeline by default, legacy on rollback.
 
@@ -685,7 +719,8 @@ class QAService:
                 user_context=user_context,
             )
 
-        cache_checked = False
+        # A bypass counts as a lookup that already ran and missed.
+        cache_checked = request.bypass_cache
         # Cache check
         cache_key = self._build_cache_key(
             request,
@@ -693,7 +728,7 @@ class QAService:
             effective_retriever=effective_retriever,
             user_context=user_context,
         )
-        if clarification is None:
+        if clarification is None and not cache_checked:
             cache_checked = True
             cached = self.cache_manager.get(cache_key)
             if cached:
@@ -1221,7 +1256,12 @@ class QAService:
         """Resolve country/region and audience context for retrieval and answering."""
         context = QAUserContext(
             experience_group=request.experience_group or request.expertise_level,
+            country=request.country,
+            region=request.region,
+            member_age_group=request.member_age_group,
         )
+        if not context.country and context.region:
+            context.country = self._country_from_region(context.region)
 
         if not request.member_id:
             return context
@@ -3546,6 +3586,8 @@ class QAService:
         user_context: Optional[QAUserContext] = None,
     ) -> str:
         """Generate cache key from question + effective settings."""
+        from services.qa_pipeline.ranking import ranking_config
+
         effective_question = question or request.question
         retriever = effective_retriever or self._resolve_retriever(request)
         context = user_context.model_dump(exclude_none=True) if user_context else {}
@@ -3566,11 +3608,7 @@ class QAService:
                 # A pipeline switch or ranking retune must miss the old cache:
                 # the same question now legitimately produces a different answer.
                 "pipeline": config.settings.get("QA_PIPELINE_MODE", "agentic"),
-                "ranking": {
-                    "half_life": config.settings.get("QA_RECENCY_HALF_LIFE_YEARS"),
-                    "influence": config.settings.get("QA_INFLUENCE_WEIGHT"),
-                    "min_score": config.settings.get("QA_MIN_SCORE"),
-                },
+                "ranking": ranking_config(),
             },
         )
 

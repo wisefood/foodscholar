@@ -372,6 +372,38 @@ class QARequest(BaseModel):
             "formulation. Defaults to expertise_level."
         ),
     )
+    country: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Optional asker country for callers without a member_id. A "
+            "member's own household context takes precedence."
+        ),
+    )
+    region: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional asker region, e.g. 'Dublin, Ireland' or 'IE-D'. A "
+            "member's own household context takes precedence."
+        ),
+    )
+    member_age_group: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Optional asker age group, e.g. 'adult' or 'older adult'. A "
+            "member's own profile takes precedence."
+        ),
+    )
+    bypass_cache: bool = Field(
+        default=False,
+        description=(
+            "Skip the cached-answer lookup and run the pipeline fresh. Thread "
+            "state (summary, research notes) is still used, so follow-ups in "
+            "the same qa_thread_id keep their context. For benchmark re-runs."
+        ),
+    )
     retriever: Literal["rag", "no_rag", "kggen"] = Field(
         default="rag",
         description=(
@@ -876,6 +908,36 @@ class QAFeedbackListResponse(BaseModel):
     limit: int
     offset: int
     items: List[QAFeedbackEntry] = Field(default_factory=list)
+
+
+class QARuntimeInfo(BaseModel):
+    """What a benchmark run records so its scores can be compared."""
+
+    git_commit: str = Field(
+        description="Commit the running image was built from, or 'unknown'"
+    )
+    pipeline_mode: str = Field(description="'agentic' or 'legacy'")
+    models: Dict[str, str] = Field(
+        description="Model id per pipeline role (answer, planner, evaluator, …)"
+    )
+    prompt_versions: Dict[str, Any] = Field(
+        description=(
+            "Version each prompt last served in this process: a Langfuse "
+            "version number, or 'fallback' for the in-code text. Prompts not "
+            "used since startup are absent."
+        )
+    )
+    langfuse_enabled: bool = Field(
+        description="Whether Langfuse is configured (it can still be unreachable)"
+    )
+    ranking: Dict[str, Any] = Field(description="Every ranking setting's live value")
+    retrieval: Dict[str, Any] = Field(
+        description="Planner, repair and retriever settings' live values"
+    )
+    answer_cache_enabled: bool = Field(
+        description="Whether answers are cached at all on this deployment"
+    )
+    generated_at: str = Field(description="ISO timestamp of this snapshot")
 
 
 class SimpleNutriQuestionsResponse(BaseModel):

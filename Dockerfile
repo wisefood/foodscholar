@@ -93,6 +93,12 @@ WORKDIR /app
 # sync — the graph is reachable over the network like every other backend.
 COPY . .
 
+# The commit this image was built from, reported by GET /api/v1/qa/runtime-info
+# so benchmark runs can record it (.git is not in the image). Declared last so
+# a changing value never invalidates a cached layer above it.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=$GIT_COMMIT
+
 # PORT env (deployment sets it; default 8000 in src/config.py) decides the
 # listen port — this EXPOSE is documentation and must match the deployment.
 EXPOSE 8001

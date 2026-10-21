@@ -19,6 +19,7 @@ from models.qa import (
     MemoryDecisionRequest,
     MemoryDecisionResponse,
     MemorySuggestion,
+    QARuntimeInfo,
     SimpleNutriQuestionsResponse,
     TipsOfTheDayResponse,
     AVAILABLE_GROQ_MODELS,
@@ -363,6 +364,19 @@ async def list_available_models():
         "available_models": AVAILABLE_GROQ_MODELS,
         "default_model": DEFAULT_GROQ_MODEL,
     }
+
+
+@router.get("/runtime-info", response_model=QARuntimeInfo)
+async def get_runtime_info():
+    """
+    What a benchmark run records so its scores can be compared.
+
+    Ranking weights, models and Langfuse prompts all change answers without a
+    code change, so two runs are only comparable when this snapshot matches.
+    Prompt versions are those this process last *served*: a prompt not used
+    since startup is absent, so take a snapshot after a run as well as before.
+    """
+    return qa_service.runtime_info()
 
 
 @router.get("/questions", response_model=SimpleNutriQuestionsResponse)

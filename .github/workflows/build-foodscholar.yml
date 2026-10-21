@@ -33,6 +33,8 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
           tags: |
             ${{ vars.DOCKERHUB_USERNAME }}/foodscholar:sha-${{ github.sha }}
             ${{ vars.DOCKERHUB_USERNAME }}/foodscholar:latest
