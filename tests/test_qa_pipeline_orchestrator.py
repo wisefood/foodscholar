@@ -151,6 +151,11 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "services.qa_pipeline.orchestrator.stream_answer",
                 _fake_stream_answer,
             ),
+            # Relevance grading calls a model; tested in test_qa_relevance.
+            patch(
+                "services.qa_pipeline.relevance.grade_relevance",
+                AsyncMock(return_value=None),
+            ),
         ]
         for p in patchers:
             p.start()
@@ -272,12 +277,29 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             notes=[ResearchNote(text="Corpus lacks infant fiber data.", kind="gap")],
             used_llm=True,
         )
-        events, calls = await self._run(evaluations=[gap])
+        # The first-round recheck (test_qa_gap_recheck) switched off: a
+        # corpus gap answers at once and discloses it.
+        with patch.dict("config.config.settings", {"QA_GAP_RECHECK_ENABLED": False}):
+            events, calls = await self._run(evaluations=[gap])
         names = [e.name for e in events]
 
         self.assertNotIn("stage.repair", names)
         self.assertIn("stage.notes", names)
         self.assertEqual(len(calls), 2)  # single round only
+        self.assertEqual(names[-1], "done")
+
+    async def test_first_round_corpus_gap_is_rechecked_once(self):
+        gap = EvaluationResult(
+            verdict="corpus_gap",
+            reason="Not covered by the corpus.",
+            notes=[ResearchNote(text='Try "infant fibre intake".', kind="lead")],
+            used_llm=True,
+        )
+        events, calls = await self._run(evaluations=[gap, gap])
+        names = [e.name for e in events]
+
+        self.assertEqual(names.count("stage.repair"), 1)
+        self.assertIn("infant fibre intake", [query for _, _, query in calls])
         self.assertEqual(names[-1], "done")
 
     async def test_clarification_verdict_stores_thread_and_ends_stream(self):

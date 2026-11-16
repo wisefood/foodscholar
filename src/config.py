@@ -1,6 +1,31 @@
 """Application configuration."""
+import contextvars
 import os
-from typing import List
+from typing import Any, List, Mapping, Optional
+
+# A per-request overlay on the settings, set only while an ablation request is
+# answered (services.qa_pipeline.ablation). Context-local: asyncio tasks and
+# asyncio.to_thread copy it, so it follows the request and never leaks into
+# another one.
+SETTINGS_OVERLAY: "contextvars.ContextVar[Optional[Mapping[str, Any]]]" = (
+    contextvars.ContextVar("settings_overlay", default=None)
+)
+
+
+class Settings(dict):
+    """The settings dict; reads see the active request's overlay first."""
+
+    def __getitem__(self, key):
+        overlay = SETTINGS_OVERLAY.get()
+        if overlay and key in overlay:
+            return overlay[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        overlay = SETTINGS_OVERLAY.get()
+        if overlay and key in overlay:
+            return overlay[key]
+        return super().get(key, default)
 
 
 def _csv_list(raw: str) -> List[str]:
@@ -17,7 +42,7 @@ class Config:
     """Application configuration."""
 
     def __init__(self):
-        self.settings = {}
+        self.settings = Settings()
 
     def setup(self):
         """Read environment variables and store them in settings."""
@@ -414,6 +439,52 @@ class Config:
         self.settings["QA_STREAM_HEARTBEAT_SECONDS"] = int(
             os.getenv("QA_STREAM_HEARTBEAT_SECONDS", "15")
         )
+
+        # Component switches. Production keeps every component on; they exist
+        # so an ablation study can turn one off (see docs/qa-ablation.md).
+        def _on(name: str, default: str = "true") -> bool:
+            return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        # Off: a deterministic plan (the question as asked, one article and
+        # one guideline search) instead of the LLM planner.
+        self.settings["QA_PLANNER_ENABLED"] = _on("QA_PLANNER_ENABLED")
+        # Off: never ask the asker for a detail; answer with assumptions.
+        self.settings["QA_CLARIFY_ENABLED"] = _on("QA_CLARIFY_ENABLED")
+        # Which search legs run: "hybrid" (BM25 + kNN), "lexical" or "vector".
+        self.settings["QA_RETRIEVAL_LEGS"] = os.getenv("QA_RETRIEVAL_LEGS", "hybrid")
+        # Hits the vector leg returns; 0 means the same as QA_RRF_CANDIDATES.
+        # 10 reproduces the vector leg before the kNN size fix.
+        self.settings["QA_KNN_CANDIDATES"] = int(os.getenv("QA_KNN_CANDIDATES", "0"))
+        # Off: rank by fused relevance alone (no tier, recency, influence,
+        # study design or guideline affinity multipliers).
+        self.settings["QA_RANKING_PRIORS_ENABLED"] = _on("QA_RANKING_PRIORS_ENABLED")
+        # Off: answer as if nothing were known about the asker (no country,
+        # region, age group or household profile).
+        self.settings["QA_USER_CONTEXT_ENABLED"] = _on("QA_USER_CONTEXT_ENABLED")
+        # Off: rank without these multipliers only (comma list of tier,
+        # recency, influence, design, affinity); "" keeps them all.
+        self.settings["QA_RANKING_PRIORS_OFF"] = os.getenv("QA_RANKING_PRIORS_OFF", "")
+        # Evidence handed to the answer: articles (0 = the request's top_k)
+        # and guideline rules (0 = QA_GUIDELINE_RAG_TOP_K_MAX).
+        self.settings["QA_ARTICLE_TOP_K"] = int(os.getenv("QA_ARTICLE_TOP_K", "0"))
+        self.settings["QA_GUIDELINE_TOP_K"] = int(os.getenv("QA_GUIDELINE_TOP_K", "0"))
+        # Off: searches ignore the planner's attribute filters (year window,
+        # study design, population facets) and run on the query alone.
+        self.settings["QA_SEARCH_FILTERS_ENABLED"] = _on("QA_SEARCH_FILTERS_ENABLED")
+        # Off: a follow-up is answered without the thread's earlier turns,
+        # summary or research notes.
+        self.settings["QA_THREAD_MEMORY_ENABLED"] = _on("QA_THREAD_MEMORY_ENABLED")
+        # A first-round "corpus gap" is checked once more, with the searches
+        # the evaluator suggested, before the answer says the corpus lacks it.
+        self.settings["QA_GAP_RECHECK_ENABLED"] = _on("QA_GAP_RECHECK_ENABLED")
+        # Relevance grading of each search's head of candidates before the
+        # cut (services/qa_pipeline/relevance.py).
+        self.settings["QA_RERANK_ENABLED"] = _on("QA_RERANK_ENABLED")
+        self.settings["QA_RERANK_CANDIDATES"] = int(os.getenv("QA_RERANK_CANDIDATES", "20"))
+        self.settings["QA_RERANK_MODEL"] = os.getenv("QA_RERANK_MODEL", "")
+        # Per-request overrides of the settings above, for ablation runs.
+        # Off in production: a request that carries one is refused.
+        self.settings["QA_ABLATION_ENABLED"] = _on("QA_ABLATION_ENABLED", "false")
 
         # ------------------------------------------------------------------
         # Knowledge graph browsing (foodscholar-lib)

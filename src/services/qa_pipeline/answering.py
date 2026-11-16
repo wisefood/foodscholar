@@ -33,7 +33,11 @@ from agents.qa_agent import (
 )
 from backend.groq import GROQ_CHAT
 from backend.langfuse import build_trace_config
-from backend.prompts import QA_ANSWER_STREAM_SYSTEM, QA_ANSWER_STREAM_USER
+from backend.prompts import (
+    QA_ANSWER_STREAM_SYSTEM,
+    QA_ANSWER_STREAM_USER,
+    QA_CLAIM_CHECK_SYSTEM,
+)
 from models.qa import QAAnswer
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,58 @@ _SENTINEL_HOLDBACK = 24
 _LEAKED_TRAILER_RE = re.compile(r"\{\s*\"cited_sources\"")
 
 _INLINE_CITATION_RE = re.compile(r"\]\(/(articles|guidelines)/([^)\s]+)\)")
+
+CLAIM_CHECK_INTENT = "claim_check"
+
+# A "Verdict: ..." line the model wrote into the prose despite the claim-check
+# instruction: lifted out of the answer, and used when the trailer has none.
+_PROSE_VERDICT_LINE_RE = re.compile(
+    # The separator may be a comma: answer prose has its dashes normalised
+    # ("Verdict – Myth" arrives as "Verdict, Myth").
+    r"^[\s>*_#-]*verdict\s*\**\s*[:\-–,]\s*\**\s*([^\n*]+?)\s*\**\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_claim_verdict(raw: Any) -> Optional[str]:
+    """Map a model's verdict wording onto the four contract values.
+
+    Accepts the canonical values and common variants case-insensitively
+    ("partly true", "not supported", "false", "not enough evidence", ...).
+    Anything unrecognised is None: no verdict beats a wrong one.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = re.sub(r"[\s_\-]+", " ", raw.strip().lower()).strip(" .!:\"'")
+    if not text:
+        return None
+    if text.startswith(("not supported", "unsupported", "false", "myth", "incorrect", "wrong", "refuted")):
+        return "not_supported"
+    if text.startswith(("partly", "partially", "partial", "mixed", "half true", "somewhat")):
+        return "partly"
+    if text.startswith(("unclear", "uncertain", "insufficient", "not enough", "inconclusive", "unknown", "no evidence")):
+        return "unclear"
+    if text.startswith(("supported", "true", "fact", "correct", "mostly true", "accurate")):
+        return "supported"
+    return None
+
+
+def split_prose_verdict(text: str) -> tuple[str, Optional[str]]:
+    """Remove a leading "Verdict: X" line (within the first 3 lines) from prose.
+
+    Returns (prose_without_that_line, normalised_verdict_or_None).
+    """
+    lines = (text or "").split("\n")
+    for index in range(min(len(lines), 3)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        match = _PROSE_VERDICT_LINE_RE.match(line)
+        if not match:
+            break
+        rest = "\n".join(lines[:index] + lines[index + 1:]).lstrip("\n")
+        return rest, normalize_claim_verdict(match.group(1))
+    return text, None
 
 
 def split_leaked_trailer(text: str) -> tuple[str, str]:
@@ -130,13 +186,17 @@ async def stream_answer(
     user_context: Optional[Dict[str, Any]] = None,
     prior_conversation: Optional[str] = None,
     trace_context: Optional[Dict[str, Optional[str]]] = None,
+    intent: str = "answer",
 ) -> AsyncIterator[Dict[str, Any]]:
     """Stream the answer; yields delta events, then one final event.
 
     Yields ``{"kind": "delta", "text": str}`` for each streamed answer chunk
     and finally ``{"kind": "final", "answer": QAAnswer, "follow_ups": [...],
-    "parsed_trailer": bool}``.
+    "parsed_trailer": bool, "claim_verdict": str | None}``. ``claim_verdict``
+    is only ever set for ``intent="claim_check"``, read from the trailer's
+    ``verdict`` key.
     """
+    claim_check = intent == CLAIM_CHECK_INTENT
     rag_used = bool(payloads)
     retriever_shape = "rag" if rag_used else "no_rag"
     source_context = (
@@ -157,9 +217,14 @@ async def stream_answer(
         "question": question,
         "source_context": source_context,
     }
+    system_template = QA_ANSWER_STREAM_SYSTEM.langchain()
+    if claim_check:
+        # One system message, the claim instructions after the base rules:
+        # they extend the trailer protocol the base prompt defines.
+        system_template = system_template + "\n\n" + QA_CLAIM_CHECK_SYSTEM.langchain()
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", QA_ANSWER_STREAM_SYSTEM.langchain()),
+            ("system", system_template),
             ("human", QA_ANSWER_STREAM_USER.langchain()),
         ]
     )
@@ -239,6 +304,7 @@ async def stream_answer(
             "answer": _error_answer(model, "", rag_used),
             "follow_ups": [],
             "parsed_trailer": False,
+            "claim_verdict": None,
         }
         return
 
@@ -284,12 +350,22 @@ async def stream_answer(
                 logger.warning("Citation trailer unparseable; recovering from links")
                 parsed = {}
 
+    claim_verdict: Optional[str] = None
+    if claim_check:
+        claim_verdict = normalize_claim_verdict(parsed.get("verdict"))
+        # A verdict line the model wrote into the prose anyway never stays in
+        # the settled answer; it stands in when the trailer has no verdict.
+        answer_text, prose_verdict = split_prose_verdict(answer_text)
+        if claim_verdict is None:
+            claim_verdict = prose_verdict
+
     if not answer_text:
         yield {
             "kind": "final",
             "answer": _error_answer(model, "", rag_used),
             "follow_ups": [],
             "parsed_trailer": parsed_trailer,
+            "claim_verdict": None,
         }
         return
 
@@ -319,4 +395,5 @@ async def stream_answer(
         "answer": answer,
         "follow_ups": [str(f) for f in follow_ups if f][:5],
         "parsed_trailer": parsed_trailer,
+        "claim_verdict": claim_verdict,
     }
