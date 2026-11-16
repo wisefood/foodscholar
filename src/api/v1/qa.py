@@ -22,6 +22,7 @@ from models.qa import (
     QARuntimeInfo,
     SimpleNutriQuestionsResponse,
     TipsOfTheDayResponse,
+    DailyQuizResponse,
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
 )
@@ -388,7 +389,11 @@ async def get_simple_nutri_questions(
 ):
     """Get 4 simple starter nutrition questions cached for 30 minutes."""
     try:
-        return qa_service.get_simple_nutri_questions(language=language)
+        # In a worker thread: generation calls a model, and a blocking call
+        # here would freeze every other request (Q&A streams included).
+        return await asyncio.to_thread(
+            qa_service.get_simple_nutri_questions, language=language
+        )
     except Exception as e:
         logger.error("Error getting starter nutrition questions: %s", e, exc_info=True)
         raise InternalError(
@@ -414,13 +419,56 @@ async def get_tips_of_the_day(
 ):
     """Get 2 did_you_know facts and 2 tips, cached for 30 minutes."""
     try:
-        return qa_service.get_tips_of_the_day(
-            member_id=member_id, language=language
+        # In a worker thread: generating the day's tips takes several model
+        # calls, and calling it directly froze the whole server meanwhile, so
+        # Q&A streams started during it hung until the client gave up.
+        return await asyncio.to_thread(
+            qa_service.get_tips_of_the_day, member_id=member_id, language=language
         )
     except Exception as e:
         logger.error("Error getting nutrition tips of the day: %s", e, exc_info=True)
         raise InternalError(
             detail="Error generating tips of the day. Please try again.",
+            extra={"cause": e.__class__.__name__},
+        )
+
+
+@router.get("/quiz", response_model=DailyQuizResponse)
+async def get_daily_quiz(
+    member_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional WiseFood member id. Biases the sources toward the "
+            "member's topics and drops questions that mention their "
+            "allergens/dislikes, exactly as for the tips."
+        ),
+    ),
+    language: str = Query(
+        default="en",
+        description="Language of the quiz (ISO 639-1 code, e.g. 'en', 'hu', 'sl').",
+    ),
+    count: int = Query(
+        default=3,
+        description="How many questions (clamped to 1-5).",
+    ),
+):
+    """Today's quiz: grounded multiple-choice questions, cached for the day.
+
+    Each question comes with the source it was written from (same `evidence`
+    shape as the tips). Returns an empty list, not an error, when no valid
+    question could be generated.
+    """
+    try:
+        return await asyncio.to_thread(
+            qa_service.get_daily_quiz,
+            member_id=member_id,
+            language=language,
+            count=count,
+        )
+    except Exception as e:
+        logger.error("Error getting the daily quiz: %s", e, exc_info=True)
+        raise InternalError(
+            detail="Error generating the daily quiz. Please try again.",
             extra={"cause": e.__class__.__name__},
         )
 

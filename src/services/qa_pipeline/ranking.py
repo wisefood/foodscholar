@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from config import config
 from models.qa import QAUserContext, SubQuestionFilters
@@ -312,9 +312,22 @@ def adjust_evidence(
     now_year: Optional[int] = None,
     user_context: Optional[QAUserContext] = None,
     question_facets: Optional[SubQuestionFilters] = None,
+    design_neutral_sub_questions: Optional[Set[str]] = None,
 ) -> List[EvidenceItem]:
-    """Compute adjusted scores in place and drop audience-restricted items."""
+    """Compute adjusted scores in place and drop audience-restricted items.
+
+    Study design says how strong evidence of an EFFECT is; it says nothing
+    about "how much calcium is in oat milk", which product surveys answer and
+    trials do not. A source found only by such "quantity" searches
+    (``design_neutral_sub_questions``) gets no design weight either way.
+    """
     expert = is_expert_audience(expertise_level)
+    priors = str(config.settings.get("QA_RANKING_PRIORS_ENABLED", True)).lower() in {
+        "1", "true", "yes", "on",
+    }
+    priors_off = {
+        p.strip() for p in str(config.settings.get("QA_RANKING_PRIORS_OFF", "") or "").split(",") if p.strip()
+    }
     adjusted: List[EvidenceItem] = []
     for item in items:
         payload = item.payload
@@ -338,6 +351,24 @@ def adjust_evidence(
             influence = influence_factor(payload)
             design = study_design_factor(payload)
             affinity = 1.0
+            if (
+                design_neutral_sub_questions
+                and item.sub_question_ids
+                and set(item.sub_question_ids) <= design_neutral_sub_questions
+            ):
+                design = 1.0
+
+        if not priors:
+            # Ablation: fused relevance alone.
+            tier, recency, influence, design, affinity = 1.0, 1.0, 1.0, 1.0, 1.0
+            tier_label = ""
+        elif priors_off:
+            # Ablation: these multipliers only.
+            tier = 1.0 if "tier" in priors_off else tier
+            recency = 1.0 if "recency" in priors_off else recency
+            influence = 1.0 if "influence" in priors_off else influence
+            design = 1.0 if "design" in priors_off else design
+            affinity = 1.0 if "affinity" in priors_off else affinity
 
         item.score_parts = {
             "rrf_norm": round(item.rrf_norm, 6),
@@ -370,6 +401,9 @@ def select_evidence(
     """
     min_score = _setting("QA_MIN_SCORE", 0.05)
     per_doc_cap = max(int(_setting("QA_PER_DOC_CAP", 2)), 1)
+    # Evidence budgets; 0 keeps the request's top_k and the guideline default.
+    top_k = int(_setting("QA_ARTICLE_TOP_K", 0)) or top_k
+    guideline_top_k = int(_setting("QA_GUIDELINE_TOP_K", 0)) or QA_GUIDELINE_RAG_TOP_K_MAX
 
     below_threshold = 0
     over_doc_cap = 0
@@ -392,9 +426,9 @@ def select_evidence(
             articles.append(item)
 
     over_budget = max(len(articles) - top_k, 0) + max(
-        len(guidelines) - QA_GUIDELINE_RAG_TOP_K_MAX, 0
+        len(guidelines) - guideline_top_k, 0
     )
-    selected = articles[:top_k] + guidelines[:QA_GUIDELINE_RAG_TOP_K_MAX]
+    selected = articles[:top_k] + guidelines[:guideline_top_k]
     dropped = {
         "below_threshold": below_threshold,
         "over_doc_cap": over_doc_cap,

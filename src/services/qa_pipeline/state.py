@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from models.qa import (
     PlannedSubQuestion,
@@ -71,6 +71,13 @@ class PipelineState:
     notes: List[ResearchNote] = field(default_factory=list)
     prior_notes: List[ResearchNote] = field(default_factory=list)
     timings_ms: Dict[str, int] = field(default_factory=dict)
+    # The research log (services.qa_pipeline.progress): per-round signals
+    # with a status, one log line per round, and every search already run.
+    progress: List[Dict[str, Any]] = field(default_factory=list)
+    research_log: List[Dict[str, Any]] = field(default_factory=list)
+    queries_tried: Set[Tuple[str, str]] = field(default_factory=set)
+    # (sub-question id, evidence key) -> relevance grade 0-3 (relevance.py)
+    relevance: Dict[Tuple[str, str], int] = field(default_factory=dict)
 
     def sub_questions(self) -> List[PlannedSubQuestion]:
         return list(self.plan.sub_questions) if self.plan else []
@@ -119,6 +126,9 @@ class PipelineState:
             "verdicts": self.verdicts,
             "repairs": self.repairs,
             "notes": [note.model_dump() for note in self.notes],
+            # How each round went (observe-only for now) and what was tried.
+            "progress": self.progress,
+            "research_log": self.research_log,
             "evidence_counts": {
                 "articles": articles,
                 "guidelines": len(self.evidence) - articles,

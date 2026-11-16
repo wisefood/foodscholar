@@ -216,9 +216,13 @@ class ElasticsearchClientSingleton:
             source_config = {"excludes": source_excludes}
 
         try:
+            # `size` too, not only `k`: without it Elasticsearch returns its
+            # default 10 hits, so a k=30 vector leg silently saw a third of
+            # its candidates.
             response = self.client.search(
                 index=index_name,
                 knn=knn_body,
+                size=k,
                 source=source_config,
             )
 

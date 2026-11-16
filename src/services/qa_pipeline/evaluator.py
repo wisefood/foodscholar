@@ -42,7 +42,10 @@ VERDICTS = {
     "needs_user_clarification",
 }
 
-_SNIPPET_CHARS = 280
+# Long enough to hold the numbers a "how much" question needs: at 280 the
+# checker saw two plant-milk nutrient surveys and still found "no article
+# with oat milk calcium content".
+_SNIPPET_CHARS = 600
 _TOP_PER_SUB_QUESTION = 5
 
 
@@ -154,6 +157,8 @@ def _evidence_digest(state: PipelineState) -> List[Dict[str, Any]]:
                         "citations": item.payload.get("citationCount")
                         or item.payload.get("citation_count"),
                         "score": round(item.adjusted_score, 4),
+                        # 0-3: how directly it answers this search (relevance.py)
+                        "relevance": item.score_parts.get("relevance"),
                         "snippet": _snippet(item.payload),
                     }
                     for item in items[:_TOP_PER_SUB_QUESTION]

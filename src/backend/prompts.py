@@ -10,6 +10,7 @@ use with ``ChatPromptTemplate``.
 """
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from backend.langfuse import get_langfuse_client
@@ -78,12 +79,21 @@ class _Prompt:
         self.label = label
         self.cache_ttl_seconds = cache_ttl_seconds
 
+    # After a fetch that came back without a managed prompt (Langfuse down or
+    # unreachable, or the prompt not created there), serve the in-code text
+    # for this long before asking again. The SDK caches successes, not
+    # failures: with Langfuse gone every compile() paid a failed lookup
+    # (about a second each, several per question).
+    FAILED_FETCH_BACKOFF_SECONDS = 300
+
     def _managed(self) -> Optional[Any]:
+        if time.monotonic() < getattr(self, "_skip_until", 0.0):
+            return None
         client = get_langfuse_client()
         if client is None:
             return None
         try:
-            return client.get_prompt(
+            managed = client.get_prompt(
                 self.name,
                 fallback=self.fallback,
                 label=self.label,
@@ -91,7 +101,10 @@ class _Prompt:
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Langfuse get_prompt(%s) failed: %s", self.name, exc)
-            return None
+            managed = None
+        if managed is None or getattr(managed, "is_fallback", False):
+            self._skip_until = time.monotonic() + self.FAILED_FETCH_BACKOFF_SECONDS
+        return managed
 
     def _record(self, managed: Optional[Any]) -> None:
         # The SDK hands back its own fallback client (is_fallback=True) when
@@ -329,7 +342,7 @@ CRITICAL RULES:
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
 3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
 4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
-5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources. An answer that only says "not stated in the sources, ask a professional" is a failure.
+5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources: end each such sentence with the exact tag [general knowledge] (always these two English words, even when answering in another language; the app shows it as a badge). Never put anything else in square brackets except citation links. An answer that only says "not stated in the sources, ask a professional" is a failure.
 6. Do NOT fabricate information beyond what the retrieved sources support.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
 7b. Be CONCRETE and actionable whenever the sources allow it: amounts, servings, frequencies, and food examples beat vague encouragement ("eat 2-3 servings of fruit a day" beats "eat more fruit").
@@ -685,7 +698,7 @@ CRITICAL RULES:
 2. Every factual claim MUST cite at least one retrieved source using a markdown link.
 3. For article sources, cite as [First Author et al. (Year)](/articles/ARTICLE_URN). Use the first author's surname from the article metadata, followed by "et al." if there are multiple authors. Single-author articles: [Lee (2020)](/articles/URN).
 4. For guideline sources, cite using the short label shown in brackets next to the source heading, e.g. [G1](/guidelines/GUIDELINE_URN), [G2](/guidelines/GUIDELINE_URN). Never use the full rule text as the link label.
-5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources. An answer that only says "not stated in the sources, ask a professional" is a failure.
+5. If the retrieved sources do not contain sufficient information, say so explicitly — and then STILL HELP: give the well-established general guidance (with concrete numbers where they are safe and standard, e.g. accepted intake ranges), clearly labeled as general knowledge rather than from the retrieved sources: end each such sentence with the exact tag [general knowledge] (always these two English words, even when answering in another language; the app shows it as a badge). Never put anything else in square brackets except citation links. An answer that only says "not stated in the sources, ask a professional" is a failure.
 6. Do NOT fabricate information beyond what the retrieved sources support. If no sources are provided, answer from general knowledge WITHOUT creating any citation links.
 7. Prefer dietary guideline rules for practical intake recommendations; use articles for study-specific mechanisms or evidence.
 7b. Be CONCRETE and actionable whenever the sources allow it: amounts, servings, frequencies, and food examples beat vague encouragement ("eat 2-3 servings of fruit a day" beats "eat more fruit").
@@ -724,10 +737,47 @@ Retrieved Sources:
 
 Answer the question concisely using the sources above as evidence, then emit the citation trailer."""
 
+# Appended to the answer system prompt when the request's intent is
+# "claim_check". The verdict travels only in the trailer, so the prose never
+# carries a label the UI would have to strip.
+_QA_CLAIM_CHECK_SYSTEM_FALLBACK = """CLAIM CHECK MODE:
+The question is not a question but a claim about food that the reader heard somewhere, in their own words. Check it against the retrieved sources.
+- Start by saying, in plain friendly words, what the evidence says about this claim.
+- Explain where the claim probably comes from: the grain of truth or the misunderstanding behind it.
+- End with one practical takeaway the reader can use.
+- Do NOT write a verdict label anywhere in the prose: no "Verdict:" line, no "Myth"/"Fact"/"True"/"False" heading, no rating. The verdict goes ONLY in the trailer.
+- All rules above still apply: expertise level, language, citations, style.
+
+In the PART 2 JSON trailer, add one more key next to "cited_sources":
+  "verdict": "supported" or "partly" or "not_supported" or "unclear"
+Use "supported" when the evidence broadly backs the claim, "partly" when it is true only in part or only for some people or amounts, "not_supported" when the evidence contradicts it, and "unclear" when the sources do not allow a judgement. Keep the value in English, exactly one of these four words."""
+
 QA_PLANNER_SYSTEM = _Prompt("qa-planner-system", _QA_PLANNER_SYSTEM_FALLBACK)
+_QA_RELEVANCE_SYSTEM_FALLBACK = (
+    "You grade search results for a nutrition research assistant. You get the "
+    "user's question, one search made to answer it ('search', with what kind of "
+    "evidence it is looking for), and candidate sources (title, year, the start "
+    "of the text).\n\n"
+    "Grade each source for THIS search only:\n"
+    "- 3: directly answers it with the specific information sought (for a "
+    "'quantity' search: the amounts or content figures themselves; for an effect: "
+    "a study of that effect in people).\n"
+    "- 2: clearly about the same subject and useful, but not the specific answer.\n"
+    "- 1: shares the topic only loosely (a related food, nutrient or population).\n"
+    "- 0: about something else (another food, another population, another "
+    "question), however similar the words.\n\n"
+    "Judge what the source is about, not how many words it shares with the "
+    "search. Study prestige does not raise a grade. Grade every source.\n\n"
+    'Return ONLY JSON: {"grades": {"s1": 0-3, "s2": 0-3, ...}}'
+)
+
 QA_EVALUATOR_SYSTEM = _Prompt("qa-evaluator-system", _QA_EVALUATOR_SYSTEM_FALLBACK)
+QA_RELEVANCE_SYSTEM = _Prompt("qa-relevance-system", _QA_RELEVANCE_SYSTEM_FALLBACK)
 QA_ANSWER_STREAM_SYSTEM = _Prompt(
     "qa-answer-stream-system", _QA_ANSWER_STREAM_SYSTEM_FALLBACK
+)
+QA_CLAIM_CHECK_SYSTEM = _Prompt(
+    "qa-claim-check-system", _QA_CLAIM_CHECK_SYSTEM_FALLBACK
 )
 QA_ANSWER_STREAM_USER = _Prompt(
     "qa-answer-stream-user", _QA_ANSWER_STREAM_USER_FALLBACK
@@ -935,6 +985,41 @@ QA_TIPS_FROM_ARTICLES = _Prompt(
     "qa-tips-from-articles", _QA_TIPS_FROM_ARTICLES_FALLBACK
 )
 QA_TIP_REWRITE = _Prompt("qa-tip-rewrite", _QA_TIP_REWRITE_FALLBACK)
+
+_QA_DAILY_QUIZ_FALLBACK = """You write a short daily food quiz for curious people with no science background.
+
+LANGUAGE: Write every question, option and explanation in {{language}}. Proper nouns and
+established scientific Latin terms with no common {{language}} equivalent may remain.
+
+Using ONLY the numbered sources below, write exactly {{count}} multiple-choice questions.
+Rules:
+- Each question must be answerable from its OWN source alone; give that source's number.
+- When a source is written for a group (its Guide or "Applies to" line names an age range,
+  life stage, pregnancy or a condition), the question must name that group, e.g. "For
+  children aged 1 to 4, how much cooked meat is one serving?". Never ask about a group's
+  amount or rule as if it applied to everyone.
+- 3 options per question (4 at most), exactly one correct. Wrong options must be plausible,
+  the kind of thing people commonly believe, never silly or trick answers.
+- "why": one or two plain sentences explaining the right answer, in friendly everyday words.
+- Questions are about everyday eating: foods, amounts, labels, habits. Use different sources
+  for different questions.
+- General education only: no diagnosis, treatment, medication or supplement doses.
+- Avoid absolute guarantees ("cures", "prevents", "always", "never").
+- Questions <= 25 words, options <= 12 words each.
+
+Return ONLY valid JSON in this exact format:
+{
+  "items": [
+    {"question": "question text", "options": ["option A", "option B", "option C"], "answer": 0, "why": "short explanation", "source": 1}
+  ]
+}
+"answer" is the 0-based index of the correct option.
+
+Sources:
+{{source_context}}
+"""
+
+QA_DAILY_QUIZ = _Prompt("qa-daily-quiz", _QA_DAILY_QUIZ_FALLBACK)
 
 
 # ===========================================================================

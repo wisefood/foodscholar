@@ -85,6 +85,25 @@ def _candidates() -> int:
         return 30
 
 
+def _knn_candidates(default: int) -> int:
+    """Hits from the vector leg: QA_KNN_CANDIDATES, or the lexical leg's count."""
+    try:
+        value = int(config.settings.get("QA_KNN_CANDIDATES", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else default
+
+
+def _legs() -> Tuple[bool, bool]:
+    """(lexical, vector): which legs QA_RETRIEVAL_LEGS runs."""
+    mode = str(config.settings.get("QA_RETRIEVAL_LEGS", "hybrid") or "hybrid").lower()
+    if mode == "lexical":
+        return True, False
+    if mode == "vector":
+        return False, True
+    return True, True
+
+
 def rrf_fuse(
     legs: List[List[Tuple[str, Dict[str, Any], RetrievedSource]]],
     *,
@@ -413,31 +432,39 @@ def run_branch(
     failed branch is recorded and never fails the pipeline.
     """
     size = _candidates()
+    knn_size = _knn_candidates(size)
+    # Ablation switch; production runs both legs.
+    run_lexical, run_vector = _legs()
     lexical_query = sub_question.lexical_query or sub_question.text
-    filters = sub_question.filters
+    filters = (
+        sub_question.filters
+        if str(config.settings.get("QA_SEARCH_FILTERS_ENABLED", True)).lower() in {"1", "true", "yes", "on"}
+        else None  # ablation: the query alone
+    )
     legs: List[List[Tuple[str, Dict[str, Any], RetrievedSource]]] = []
     leg_status: Dict[str, Any] = {}
 
     if branch == "articles":
-        try:
-            legs.append(
-                search_articles_lexical(
-                    lexical_query,
-                    size=size,
-                    expertise_level=expertise_level,
-                    filters=filters,
+        if run_lexical:
+            try:
+                legs.append(
+                    search_articles_lexical(
+                        lexical_query,
+                        size=size,
+                        expertise_level=expertise_level,
+                        filters=filters,
+                    )
                 )
-            )
-            leg_status["lexical"] = len(legs[-1])
-        except Exception as exc:
-            logger.error("Article BM25 leg failed: %s", exc, exc_info=True)
-            leg_status["lexical_error"] = repr(exc)
-        if vector is not None:
+                leg_status["lexical"] = len(legs[-1])
+            except Exception as exc:
+                logger.error("Article BM25 leg failed: %s", exc, exc_info=True)
+                leg_status["lexical_error"] = repr(exc)
+        if vector is not None and run_vector:
             try:
                 legs.append(
                     search_articles_knn(
                         vector,
-                        size=size,
+                        size=knn_size,
                         expertise_level=expertise_level,
                         filters=filters,
                     )
@@ -447,22 +474,27 @@ def run_branch(
                 logger.error("Article kNN leg failed: %s", exc, exc_info=True)
                 leg_status["knn_error"] = repr(exc)
     elif branch == "guidelines":
-        try:
-            legs.append(
-                search_guidelines_lexical(
-                    lexical_query,
-                    size=size,
-                    user_context=user_context,
-                    filters=filters,
-                )
-            )
-            leg_status["lexical"] = len(legs[-1])
-        except Exception as exc:
-            logger.error("Guideline BM25 leg failed: %s", exc, exc_info=True)
-            leg_status["lexical_error"] = repr(exc)
-        if vector is not None and guideline_hybrid_enabled():
+        if run_lexical:
             try:
-                legs.append(search_guidelines_knn(vector, size=size))
+                legs.append(
+                    search_guidelines_lexical(
+                        lexical_query,
+                        size=size,
+                        user_context=user_context,
+                        filters=filters,
+                    )
+                )
+                leg_status["lexical"] = len(legs[-1])
+            except Exception as exc:
+                logger.error("Guideline BM25 leg failed: %s", exc, exc_info=True)
+                leg_status["lexical_error"] = repr(exc)
+        # Vector-only runs the guideline vector leg even when hybrid guideline
+        # retrieval is off: otherwise the branch would search nothing.
+        if vector is not None and run_vector and (
+            guideline_hybrid_enabled() or not run_lexical
+        ):
+            try:
+                legs.append(search_guidelines_knn(vector, size=knn_size))
                 leg_status["knn"] = len(legs[-1])
             except Exception as exc:
                 # Same degradation contract as the legacy adapter: a broken
