@@ -26,6 +26,7 @@ from models.qa import (
     SubQuestionFilters,
 )
 from services.article_policy import article_filter_query
+from services.qa_pipeline import statements
 from services.qa_pipeline.state import EvidenceItem
 from services.qa_retrievers import (
     GUIDELINE_SOURCE_EXCLUDES,
@@ -470,6 +471,33 @@ def run_branch(
                 logger.warning(
                     "Guideline kNN leg unavailable, keyword only: %s", exc
                 )
+                leg_status["knn_error"] = repr(exc)
+    elif branch in statements.STATEMENT_BRANCH_FAMILIES:
+        families = statements.STATEMENT_BRANCH_FAMILIES[branch]
+        try:
+            legs.append(
+                statements.search_statements_lexical(
+                    lexical_query,
+                    families=families,
+                    size=size,
+                    user_context=user_context,
+                    filters=filters,
+                )
+            )
+            leg_status["lexical"] = len(legs[-1])
+        except Exception as exc:
+            logger.error("Statement BM25 leg failed: %s", exc, exc_info=True)
+            leg_status["lexical_error"] = repr(exc)
+        if vector is not None:
+            try:
+                legs.append(
+                    statements.search_statements_knn(
+                        vector, families=families, size=size, filters=filters
+                    )
+                )
+                leg_status["knn"] = len(legs[-1])
+            except Exception as exc:
+                logger.error("Statement kNN leg failed: %s", exc, exc_info=True)
                 leg_status["knn_error"] = repr(exc)
     else:  # pragma: no cover - orchestrator only dispatches known branches
         raise ValueError(f"Unknown branch: {branch}")

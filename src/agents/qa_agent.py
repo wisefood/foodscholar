@@ -90,6 +90,11 @@ def is_guideline_source(source: Dict[str, Any]) -> bool:
     return bool(source.get("rule_text")) and not source.get("abstract")
 
 
+def is_textbook_source(source: Dict[str, Any]) -> bool:
+    """A textbook statement, from the experimental statements corpus."""
+    return source.get("source_type") == "textbook"
+
+
 def join_field_values(value: Any) -> str:
     if isinstance(value, list):
         return ", ".join(str(item) for item in value if item)
@@ -331,6 +336,22 @@ def prepare_source_context(
             summaries.append(summary)
             continue
 
+        if is_textbook_source(article):
+            urn = article.get("urn", "N/A")
+            summary = f"""Textbook {idx}:
+- Source Type: textbook
+- Retriever: {article.get('retriever', retriever)}
+- URN: {urn}
+- Book: {article.get('title', 'N/A')}
+- Chapter: {article.get('chapter') or 'N/A'}
+- Section: {article.get('section') or 'N/A'}
+- Page: {article.get('page_no') or 'N/A'}
+- Year: {article.get('publication_year') or 'N/A'}
+- Cite As: [{_inline_citation_label(article, None)}](/textbooks/{urn})
+- Statement: {get_source_text(article)}"""
+            summaries.append(summary)
+            continue
+
         authors = article.get("authors", [])
         if isinstance(authors, str):
             authors = [authors]
@@ -406,6 +427,12 @@ def format_answer_context(
     elif retriever == "rag":
         parts.append(
             "- Evidence shape: Elastic RAG; sources may mix scientific article abstracts and dietary guideline rules."
+        )
+    elif retriever == "statements":
+        parts.append(
+            "- Evidence shape: short, self-contained statements extracted from national dietary guides "
+            "(listed as guidelines), review-article abstracts (listed as articles) and nutrition "
+            "textbooks (listed as textbooks; cite each exactly as its Cite As line shows)."
         )
     else:
         parts.append(
@@ -556,7 +583,11 @@ def repair_citation_links(
         ]
         if not source_ids:
             continue
-        base = "/guidelines/" if is_guideline_source(source) else "/articles/"
+        base = (
+            "/guidelines/" if is_guideline_source(source)
+            else "/textbooks/" if is_textbook_source(source)
+            else "/articles/"
+        )
         label = _inline_citation_label(source, g_label)
         for source_id in dict.fromkeys(source_ids):
             pattern = re.compile(
@@ -604,16 +635,16 @@ def create_source_citation(
         except (ValueError, TypeError):
             pass
 
-    source_type = "guideline" if is_guideline_source(source) else "article"
+    source_type = (
+        "guideline" if is_guideline_source(source)
+        else "textbook" if is_textbook_source(source)
+        else "article"
+    )
     source_id = source.get("urn") or source.get("id") or source.get("_id") or ""
     source_title = source.get("title") or (
         "Dietary guideline" if source_type == "guideline" else "Unknown Title"
     )
-    source_url = (
-        f"/guidelines/{source_id}"
-        if source_type == "guideline"
-        else f"/articles/{source_id}"
-    )
+    source_url = f"/{source_type}s/{source_id}"
 
     authors = source.get("authors")
     if isinstance(authors, str):
@@ -633,6 +664,11 @@ def create_source_citation(
         raw_region = source.get("guide_region")
         if isinstance(raw_region, str) and raw_region.strip():
             region = raw_region.strip()
+        raw_page = source.get("page_no")
+        if isinstance(raw_page, (int, float)) and not isinstance(raw_page, bool):
+            page_no = int(raw_page)
+    elif source_type == "textbook":
+        authors = None
         raw_page = source.get("page_no")
         if isinstance(raw_page, (int, float)) and not isinstance(raw_page, bool):
             page_no = int(raw_page)

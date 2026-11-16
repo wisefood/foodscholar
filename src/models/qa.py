@@ -404,13 +404,15 @@ class QARequest(BaseModel):
             "the same qa_thread_id keep their context. For benchmark re-runs."
         ),
     )
-    retriever: Literal["rag", "no_rag", "kggen"] = Field(
+    retriever: Literal["rag", "no_rag", "kggen", "statements"] = Field(
         default="rag",
         description=(
             "Retrieval strategy: 'rag' for Elasticsearch kNN over articles and "
             "guidelines, 'kggen' for Extended KG-Gen hybrid retrieval over the "
-            "knowledge graph (text + triple similarity + PageRank), 'no_rag' "
-            "for LLM-only"
+            "knowledge graph (text + triple similarity + PageRank), "
+            "'statements' (experimental) for the FSKG statements corpus "
+            "(dietary guides, review abstracts, textbooks), 'no_rag' for "
+            "LLM-only"
         ),
     )
     qa_thread_id: Optional[str] = Field(
@@ -429,8 +431,8 @@ class QARequest(BaseModel):
 class QACitation(BaseModel):
     """Citation reference to a retrieved source."""
 
-    source_type: Literal["article", "guideline"] = Field(
-        description="Type of cited source",
+    source_type: Literal["article", "guideline", "textbook"] = Field(
+        description="Type of cited source ('textbook' only from the statements corpus)",
     )
     source_id: str = Field(description="Source URN/id")
     source_title: str = Field(description="Source title")
@@ -527,9 +529,9 @@ class QAAnswer(BaseModel):
 class RetrievedSource(BaseModel):
     """A source retrieved for RAG context."""
 
-    source_type: Literal["article", "guideline"] = Field(
+    source_type: Literal["article", "guideline", "textbook"] = Field(
         default="article",
-        description="Type of retrieved source",
+        description="Type of retrieved source ('textbook' only from the statements corpus)",
     )
     urn: str = Field(description="Source URN/id")
     title: str = Field(description="Source title")

@@ -1,0 +1,49 @@
+# Local stack for the FSKG statements experiment: FoodScholar answering from
+# the statements corpus instead of articles + guidelines. Experimental, so it
+# stays on this machine: nothing here is deployed.
+#
+# Versions match production (ES 8.14.3, Redis 7). Ports are bound to
+# 127.0.0.1 only and offset from the defaults so they cannot collide with
+# anything else on a shared server. FoodScholar itself runs from the checkout
+# (see run_local.sh), not in a container.
+#
+#   docker compose -f experiments/statements/docker-compose.yaml up -d
+#   docker compose -f experiments/statements/docker-compose.yaml down      # keeps the index
+#   docker compose -f experiments/statements/docker-compose.yaml down -v   # drops it
+
+name: fs-statements
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "127.0.0.1:19200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    mem_limit: 2g
+
+  redis:
+    # Thread state (clarifications, conversation summary, research notes).
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:16379:6379"
+
+  postgres:
+    # FoodScholar creates its tables at startup and will not boot without it.
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=wisefood
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+volumes:
+  es-data:
+  pg-data:

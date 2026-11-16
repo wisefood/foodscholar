@@ -421,6 +421,15 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(events[-1].data["memory_suggestions"])
         suggest.assert_not_called()
 
+    async def test_statements_retriever_follows_the_planner_into_statement_branches(self):
+        request = QARequest(question="Do whole grains lower cholesterol?", retriever="statements")
+        events, calls = await self._run(request)
+        self.assertEqual(
+            sorted({branch for _, branch, _ in calls}),
+            ["statement_guides", "statement_literature"],
+        )
+        self.assertEqual(events[-1].name, "done")
+
     async def test_bypass_cache_answers_fresh_and_still_refreshes_the_entry(self):
         cached = {
             "primary_answer": {"answer": "Stale answer.", "citations": [],

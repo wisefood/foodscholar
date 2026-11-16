@@ -48,7 +48,7 @@ _SENTINEL_HOLDBACK = 24
 # into the prose: no legitimate answer contains this key.
 _LEAKED_TRAILER_RE = re.compile(r"\{\s*\"cited_sources\"")
 
-_INLINE_CITATION_RE = re.compile(r"\]\(/(articles|guidelines)/([^)\s]+)\)")
+_INLINE_CITATION_RE = re.compile(r"\]\(/(articles|guidelines|textbooks)/([^)\s]+)\)")
 
 
 def split_leaked_trailer(text: str) -> tuple[str, str]:
@@ -130,6 +130,7 @@ async def stream_answer(
     user_context: Optional[Dict[str, Any]] = None,
     prior_conversation: Optional[str] = None,
     trace_context: Optional[Dict[str, Optional[str]]] = None,
+    evidence_shape: str = "rag",
 ) -> AsyncIterator[Dict[str, Any]]:
     """Stream the answer; yields delta events, then one final event.
 
@@ -138,7 +139,7 @@ async def stream_answer(
     "parsed_trailer": bool}``.
     """
     rag_used = bool(payloads)
-    retriever_shape = "rag" if rag_used else "no_rag"
+    retriever_shape = evidence_shape if rag_used else "no_rag"
     source_context = (
         prepare_source_context(payloads, retriever="rag")
         if payloads

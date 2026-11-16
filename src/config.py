@@ -178,6 +178,9 @@ class Config:
         self.settings["QA_GUIDELINE_KNN_BOOST"] = float(
             os.getenv("QA_GUIDELINE_KNN_BOOST", "1.0")
         )
+        # Experimental FSKG statements corpus (retriever="statements"); built
+        # by scripts/index_statements.py, absent from production.
+        self.settings["STATEMENTS_INDEX"] = os.getenv("STATEMENTS_INDEX", "fskg_statements")
 
         # How many rules one guide enriches at a time. The provider's rate
         # limit is shared with extraction and every other replica, so this is

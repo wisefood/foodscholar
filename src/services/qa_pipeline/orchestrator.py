@@ -29,7 +29,7 @@ from models.qa import (
     ResearchNote,
     SubQuestionFilters,
 )
-from services.qa_pipeline import ranking, retrieval
+from services.qa_pipeline import ranking, retrieval, statements
 from services.qa_pipeline.answering import stream_answer
 from services.qa_pipeline.evaluator import EvaluationResult, evaluate
 from services.qa_pipeline.events import PipelineEvent
@@ -455,13 +455,20 @@ async def run_pipeline(
     evaluation: Optional[EvaluationResult] = None
     pool: List[EvidenceItem] = []
 
-    if effective_rag and effective_retriever == "rag":
+    if effective_rag and effective_retriever in ("rag", "statements"):
         to_search = list(plan.sub_questions)
         for round_index in range(max_repair_rounds + 1):
             state.round = round_index
             retrieve_started = time.monotonic()
 
             branch_tasks = _expand_branches(to_search)
+            if effective_retriever == "statements":
+                # Same planner routing, other corpus: guideline questions go
+                # to guide statements, article questions to the literature ones.
+                branch_tasks = [
+                    (sq, statements.STATEMENT_BRANCH_FOR[branch])
+                    for sq, branch in branch_tasks
+                ]
             dense_queries = [sq.dense_query or sq.text for sq, _ in branch_tasks]
             vectors: List[Optional[List[float]]] = [None] * len(branch_tasks)
             if dense_queries:
@@ -490,7 +497,9 @@ async def run_pipeline(
                     },
                 )
                 branch_label = (
-                    "guidelines" if branch == "guidelines" else "the literature"
+                    "guidelines"
+                    if branch in ("guidelines", "statement_guides")
+                    else "the literature"
                 )
                 step = steps.start(
                     "search",
@@ -902,6 +911,9 @@ async def run_pipeline(
         user_context=context_payload,
         prior_conversation=prior_conversation_text,
         trace_context=trace_context,
+        # Only the statements corpus needs describing differently; everything
+        # else keeps the shape it was answered with before.
+        evidence_shape="statements" if effective_retriever == "statements" else "rag",
     ):
         if event["kind"] == "delta":
             yield emit("answer_delta", {"text": event["text"]})

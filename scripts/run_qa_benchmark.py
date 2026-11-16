@@ -220,12 +220,117 @@ def search_failures(record: Dict[str, Any]) -> int:
     )
 
 
+# Thread memory lives a day (TTL_QA_CONVERSATION); a parent older than this
+# may already have lost its thread by the time its follow-up is asked.
+THREAD_FRESH_HOURS = 20
+
+
+def thread_expired(record: Dict[str, Any]) -> bool:
+    """Whether a recorded answer's thread can no longer be relied on."""
+    try:
+        started = datetime.fromisoformat(record.get("started_at") or "")
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - started).total_seconds() > THREAD_FRESH_HOURS * 3600
+
+
 def lacks_thread_context(record: Dict[str, Any]) -> bool:
     """A follow-up answered as if it were the first turn of its thread."""
     if not record.get("follow_up_of") or record.get("status") != "ok":
         return False
     context = (record.get("response") or {}).get("conversation_context") or {}
     return int(context.get("turn_count") or 0) < 2
+
+
+def setting_of(options: Dict[str, Any]) -> Dict[str, str]:
+    """What must match for two runs' answers to be interchangeable.
+
+    An unset retriever is the API default, ``rag``.
+    """
+    return {
+        "retriever": options.get("retriever") or "rag",
+        "clarify": options.get("clarify") or "none",
+        "language_from": options.get("language_from") or "question",
+    }
+
+
+# Request fields that differ between two askings of the same question.
+_PER_RUN_FIELDS = {"user_id", "qa_thread_id", "clarification_response"}
+
+
+def comparable_request(request: Dict[str, Any]) -> Dict[str, Any]:
+    """A request without its per-run fields; an explicit ``rag`` equals none."""
+    return {
+        k: v for k, v in request.items()
+        if k not in _PER_RUN_FIELDS and not (k == "retriever" and v == "rag")
+    }
+
+
+def first_request(record: Dict[str, Any]) -> Dict[str, Any]:
+    """The request a record's question was first asked with (before any clarification)."""
+    turns = record.get("clarification_turns") or []
+    return comparable_request((turns[0].get("request") if turns else record.get("request")) or {})
+
+
+def reusable_records(
+    run_dirs: List[str],
+    *,
+    questions: List[Dict[str, Any]],
+    personas: Dict[str, Dict[str, Any]],
+    setting: Dict[str, str],
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Answers from earlier runs that this run can take instead of asking again.
+
+    A run must have the same setting, or ValueError. A record is taken only if
+    it is ok and was asked exactly as this run would ask it (same text, same
+    persona fields); anything else is asked again. Later run_dirs win where
+    runs overlap. Returns the records by question_id and, per run, how many
+    were taken from it and the commit it ran against.
+    """
+    by_id = {q["question_id"]: q for q in questions}
+    chosen: Dict[str, Dict[str, Any]] = {}
+    provenance = []
+    for run_dir in run_dirs:
+        manifest = load_json(os.path.join(run_dir, "manifest.json"))
+        theirs = setting_of(manifest.get("options") or {})
+        if theirs != setting:
+            raise ValueError(f"{run_dir} ran as {theirs}, not {setting}: its answers are not interchangeable")
+        taken = 0
+        for qid, record in read_recorded(os.path.join(run_dir, "responses.jsonl")).items():
+            q = by_id.get(qid)
+            if q is None or record.get("status") != "ok":
+                continue
+            expected = request_for(
+                q, personas[q["persona_id"]], run_id="-",
+                language_from=setting["language_from"], retriever=setting["retriever"],
+            )
+            if first_request(record) != comparable_request(expected):
+                continue
+            chosen[qid] = {**record, "reused_from": record.get("reused_from") or record.get("run_id")}
+            taken += 1
+        runtime = manifest.get("runtime_info_end") or manifest.get("runtime_info_start") or {}
+        provenance.append({
+            "run_dir": os.path.abspath(run_dir),
+            "run_id": manifest.get("run_id"),
+            "git_commit": runtime.get("git_commit"),
+            "records": taken,
+        })
+    return chosen, provenance
+
+
+def seed_reused(responses_path: str, reused: Dict[str, Dict[str, Any]], *, run_id: str) -> int:
+    """Write reused answers into a run as if it had recorded them; returns how many.
+
+    Questions the run already holds are left alone (a resumed run keeps its
+    own answers). The resume rules then decide which still need asking again.
+    """
+    already = read_recorded(responses_path)
+    seeded = [record for qid, record in reused.items() if qid not in already]
+    if seeded:
+        with open(responses_path, "a", encoding="utf-8") as handle:
+            for record in seeded:
+                handle.write(json.dumps({**record, "run_id": run_id}, ensure_ascii=False) + "\n")
+    return len(seeded)
 
 
 def read_recorded(path: str) -> Dict[str, Dict[str, Any]]:
@@ -260,35 +365,47 @@ def groq_client(api_key: Optional[str], purpose: str) -> Any:
         ) from exc
 
 
+PARSE_ATTEMPTS = 3
+
+
 async def groq_structured(
     client: Any, *, model: str, system: str, prompt: str, schema: Dict[str, Any], name: str
 ) -> Tuple[Dict[str, Any], str]:
     """One call constrained to a JSON schema: (parsed object, model that served it).
 
     Raises ValueError when the output was cut off, so a caller never acts on
-    half an answer.
+    half an answer. gpt-oss now and then writes prose instead of the schema;
+    Groq rejects that as ``output_parse_failed``, and the call is simply tried
+    again, up to PARSE_ATTEMPTS times.
     """
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": name, "schema": schema, "strict": True},
-        },
-        # As backend.model_profiles sets them for gpt-oss: reasoning kept out
-        # of the content and charged against a budget that fits it.
-        reasoning_format="hidden",
-        reasoning_effort="low",
-        max_completion_tokens=2048,
-        temperature=0,
-    )
-    choice = response.choices[0]
-    if choice.finish_reason == "length":
-        raise ValueError("the model ran out of tokens")
-    return json.loads(choice.message.content or ""), response.model
+    for attempt in range(1, PARSE_ATTEMPTS + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": name, "schema": schema, "strict": True},
+                },
+                # As backend.model_profiles sets them for gpt-oss: reasoning
+                # kept out of the content and charged against a budget that fits it.
+                reasoning_format="hidden",
+                reasoning_effort="low",
+                max_completion_tokens=2048,
+                temperature=0,
+            )
+        except Exception as exc:
+            if "output_parse_failed" in str(exc) and attempt < PARSE_ATTEMPTS:
+                continue
+            raise
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise ValueError("the model ran out of tokens")
+        return json.loads(choice.message.content or ""), response.model
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _clarification_answer(
@@ -440,13 +557,32 @@ class BenchmarkRun:
         self.retriever = retriever
         self.responses_path = os.path.join(run_dir, "responses.jsonl")
         self.recorded = read_recorded(self.responses_path)
-        # A follow-up that got no thread context needs a new thread, so its
-        # parent is asked again too (and the follow-up after it).
+        # Parents to ask again so their follow-ups get a live thread: a
+        # follow-up that got no context, and a follow-up about to be asked
+        # whose parent's thread has expired (an answer reused from an earlier
+        # run, or simply older than thread memory lasts).
         self._fresh_threads = {
             r["follow_up_of"] for r in self.recorded.values() if lacks_thread_context(r)
         }
+        for q in questions:
+            parent = self.recorded.get(q.get("follow_up_of") or "")
+            if parent and not self._keepable(self.recorded.get(q["question_id"])) and thread_expired(parent):
+                self._fresh_threads.add(q["follow_up_of"])
         self._tasks: Dict[str, asyncio.Task] = {}
         self._write_lock = asyncio.Lock()
+
+    def _keepable(self, record: Optional[Dict[str, Any]]) -> bool:
+        """Whether a recorded answer can stand as this run's result (its parent aside).
+
+        Not when it failed, a search errored, it is a clarification nobody
+        answered while there is now a clarifier, or it is a follow-up that got
+        no thread context.
+        """
+        if not record or record.get("status") != "ok" or search_failures(record):
+            return False
+        if self.clarifier and (record.get("response") or {}).get("needs_clarification"):
+            return False
+        return not lacks_thread_context(record)
 
     async def run(self) -> Dict[str, Dict[str, Any]]:
         for q in self.questions:
@@ -462,18 +598,7 @@ class BenchmarkRun:
         # asked again, so is the follow-up, in the parent's new thread.
         parent_kept = parent is None or parent is self.recorded.get(parent_id)
         previous = self.recorded.get(qid)
-        # Re-asked: degraded answers, and clarifications nobody answered when
-        # there is now a clarifier to answer them.
-        previous_response = (previous or {}).get("response") or {}
-        unanswered = bool(self.clarifier and previous_response.get("needs_clarification"))
-        if (
-            previous
-            and previous.get("status") == "ok"
-            and not search_failures(previous)
-            and not unanswered
-            and qid not in self._fresh_threads
-            and parent_kept
-        ):
+        if self._keepable(previous) and qid not in self._fresh_threads and parent_kept:
             return previous
 
         thread_id = None
@@ -600,6 +725,8 @@ def summarize(records: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
     responses = [r.get("response") or {} for r in records.values()]
     return {
         "questions": len(records),
+        # Of these, taken from earlier runs (--reuse) rather than asked here.
+        "reused": sum(bool(r.get("reused_from")) for r in records.values()),
         "ok": sum(r.get("status") == "ok" for r in records.values()),
         "error": sum(r.get("status") == "error" for r in records.values()),
         "skipped": sum(r.get("status") == "skipped" for r in records.values()),
@@ -662,6 +789,15 @@ async def main_async(args: argparse.Namespace) -> int:
             print(json.dumps({"question_id": q["question_id"], **payload}, ensure_ascii=False))
         return 0
 
+    setting = setting_of(
+        {"retriever": args.retriever, "clarify": args.clarify, "language_from": args.language_from}
+    )
+    reused, reuse_provenance = {}, []
+    if args.reuse:
+        reused, reuse_provenance = reusable_records(
+            args.reuse, questions=questions, personas=personas, setting=setting
+        )
+
     clarifier = None
     scripted = load_json(args.clarification_answers) if args.clarification_answers else {}
     if args.clarify == "persona":
@@ -707,12 +843,18 @@ async def main_async(args: argparse.Namespace) -> int:
                     if args.clarification_answers else None
                 ),
             },
+            # Earlier runs this one took answers from, with the commit each ran on.
+            "reused": previous.get("reused", []) + reuse_provenance,
             "runtime_info_start": previous.get("runtime_info_start") or runtime_start,
             "runtime_info_end": None,
             "drift": [],
             "counts": None,
         }
         write_manifest(manifest_path, manifest)
+
+        seeded = seed_reused(os.path.join(run_dir, "responses.jsonl"), reused, run_id=run_id)
+        if args.reuse:
+            print(f"reusing {seeded} answer(s) from {len(reuse_provenance)} earlier run(s)", file=sys.stderr)
 
         run = BenchmarkRun(
             client, run_id=run_id, run_dir=run_dir, questions=questions,
@@ -746,6 +888,10 @@ def main() -> int:
     parser.add_argument("--questions", required=True, help="Questions JSON (list with question_id, persona_id, foodscholar_question)")
     parser.add_argument("--out", default="benchmark-runs", help="Directory that holds one folder per run")
     parser.add_argument("--run-id", help="Defaults to the UTC start time; reuse one to resume that run")
+    parser.add_argument(
+        "--reuse", action="append", metavar="RUN_DIR",
+        help="Take answers from an earlier run with the same setting instead of asking again (repeatable; later wins)",
+    )
     parser.add_argument("--persona", action="append", help="Only this persona (repeatable)")
     parser.add_argument("--type", action="append", help="Only this question_type (repeatable)")
     parser.add_argument("--only", action="append", help="Only this question_id (repeatable)")
@@ -761,7 +907,10 @@ def main() -> int:
         "--language-from", choices=["question", "persona"], default="question",
         help="Answer language: the question row's (default) or the persona's",
     )
-    parser.add_argument("--retriever", choices=["rag", "kggen", "no_rag"], help="Override the API's default retriever")
+    parser.add_argument(
+        "--retriever", choices=["rag", "kggen", "no_rag", "statements"],
+        help="Override the API's default retriever (statements: the local FSKG corpus)",
+    )
     parser.add_argument(
         "--clarify", choices=["persona", "none"], default="persona",
         help="Answer FoodScholar's clarifications as the persona (default), or record them and stop",

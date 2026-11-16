@@ -40,6 +40,11 @@ class EvidenceItem:
     def parent_doc_key(self) -> str:
         """Identity of the parent document, for the per-document diversity cap."""
         payload = self.payload
+        # Set by sources whose "document" is coarser than their URN, e.g. a
+        # textbook chapter of many statements.
+        parent = payload.get("parent_doc")
+        if isinstance(parent, str) and parent.strip():
+            return parent.strip()
         if payload.get("source_type") == "guideline":
             for k in ("guide_urn", "urn", "_id"):
                 value = payload.get(k)

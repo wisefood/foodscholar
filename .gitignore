@@ -8,3 +8,9 @@ docs/ACCRETE_RESEARCH_PROPOSAL.md
 
 # QA benchmark run output (scripts/run_qa_benchmark.py)
 benchmark-runs/
+
+# Benchmark and corpus data: never committed (licences, question sets)
+OneDrive_*/
+20260904-*
+mmlu-*.json
+*.xlsx

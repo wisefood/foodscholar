@@ -154,6 +154,46 @@ python scripts/mmlu_to_questions.py --parquet <mmlu>/all/test-00000-of-00001.par
     --subject nutrition --out-questions mmlu-nutrition-test.json --out-personas mmlu-persona.json
 ```
 
+## Experimental: the FSKG statements corpus
+
+`retriever: "statements"` answers from the FSKG statement workbooks instead of
+the article and guideline indices. These are short, self-contained statements
+from national dietary guides, review-article abstracts and nutrition
+textbooks. The rest of the pipeline is unchanged, so a run with
+`--retriever statements` compares corpora question for question. The corpus
+stays local and is never deployed. Data files stay out of git (`.gitignore`).
+
+**How it retrieves**
+- **Routing follows the planner:** `guidelines` sub-questions search guide
+  statements, and `articles` sub-questions search journal and textbook
+  statements.
+- **Same three signals as articles and guidelines:**
+  - a BM25 search over the statement text;
+  - an embedding search with the same MiniLM model;
+  - metadata from each statement's own fields (Population, Food entities,
+    Country, publication year), applied as BM25 boosts and vector filters.
+- **Source types:**
+  - guide statements become `guideline` (country, PDF page);
+  - journal statements become `article` (DOI, first author, year);
+  - textbook statements become the new `textbook` type
+    (`/textbooks/<urn>` links).
+
+**Running it**
+
+```bash
+docker compose -f experiments/statements/docker-compose.yaml up -d   # ES 8.14.3, Redis 7, Postgres
+ELASTIC_HOST=http://127.0.0.1:19200 PYTHONPATH=src \
+    python scripts/index_statements.py <folder of FSKG_*.xlsx> --recreate
+export GROQ_API_KEY=...
+experiments/statements/run_local.sh                                   # FoodScholar on 127.0.0.1:18011
+python scripts/run_qa_benchmark.py --api http://127.0.0.1:18011 --retriever statements ...
+```
+
+`run_local.sh` configures FoodScholar like production where it affects
+answers: the same models and ranking, answer cache off, and the in-code
+prompts. Each run's `runtime-info` snapshot records this, so it can be checked
+against the production run it is compared with.
+
 ## Not yet built
 
 - **Citation verification (4A)**: quote fidelity against the catalog text,

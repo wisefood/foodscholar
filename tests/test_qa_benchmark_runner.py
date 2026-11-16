@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -204,6 +205,34 @@ class ClarifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer["source"], "scripted")
         self.assertEqual(groq.calls, [])
 
+    async def test_a_parse_failure_is_tried_again(self):
+        groq = FakeGroq('{"choice": "6-12", "reason": "r"}')
+        create = groq.chat.completions.create
+        failures = []
+
+        async def flaky(**kwargs):
+            if not failures:
+                failures.append(1)
+                raise RuntimeError("Error code: 400 - {'code': 'output_parse_failed'}")
+            return await create(**kwargs)
+
+        groq.chat.completions.create = flaky
+        answer = await runner.PersonaClarifier(client=groq).answer("q", PERSONAS["P01"], "q", CHILD_AGE)
+        self.assertEqual(answer["clarification_response"]["selected_values"], ["6-12"])
+
+    async def test_other_errors_are_not_retried(self):
+        groq = FakeGroq("unused")
+        calls = []
+
+        async def broken(**kwargs):
+            calls.append(1)
+            raise RuntimeError("Error code: 401 - invalid_api_key")
+
+        groq.chat.completions.create = broken
+        answer = await runner.PersonaClarifier(client=groq).answer("q", PERSONAS["P01"], "q", CHILD_AGE)
+        self.assertIn("invalid_api_key", answer["error"])
+        self.assertEqual(len(calls), 1)
+
     async def test_truncated_output_is_an_error_not_a_guess(self):
         clarifier = runner.PersonaClarifier(client=FakeGroq('{"choi', finish_reason="length"))
         answer = await clarifier.answer("q", PERSONAS["P01"], "q", CHILD_AGE)
@@ -340,6 +369,86 @@ class RunTests(unittest.IsolatedAsyncioTestCase):
             [QUESTIONS[0]["foodscholar_question"], "Which guideline sets that limit?"],
         )
         self.assertEqual(runner.summarize(records)["follow_up_without_context"], 0)
+
+    def _manifest(self, run_dir, retriever=None):
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"run_id": os.path.basename(run_dir), "options": {
+                "retriever": retriever, "clarify": "persona", "language_from": "question"},
+                "runtime_info_end": {"git_commit": "old"}}, handle)
+
+    async def test_reuse_asks_only_what_earlier_runs_did_not_answer(self):
+        await self._run(QUESTIONS[:3])  # an earlier run: the first three questions
+        self._manifest(self.tmp.name)
+        setting = runner.setting_of({"retriever": None, "clarify": "persona", "language_from": "question"})
+        reused, provenance = runner.reusable_records(
+            [self.tmp.name], questions=QUESTIONS, personas=PERSONAS, setting=setting
+        )
+        self.assertEqual(sorted(reused), sorted(q["question_id"] for q in QUESTIONS[:3]))
+        self.assertEqual((provenance[0]["records"], provenance[0]["git_commit"]), (3, "old"))
+
+        fused = os.path.join(self.tmp.name, "fused")
+        os.makedirs(fused)
+        self.assertEqual(runner.seed_reused(os.path.join(fused, "responses.jsonl"), reused, run_id="fused"), 3)
+        asked_before = len(self.api.asked)
+        transport = httpx.MockTransport(self.api)
+        async with httpx.AsyncClient(transport=transport, base_url="http://api") as client:
+            records = await runner.BenchmarkRun(
+                client, run_id="fused", run_dir=fused, questions=QUESTIONS, personas=PERSONAS,
+                follow_up_delay=0, retries=0,
+            ).run()
+        newly_asked = [b["question"] for b in self.api.asked[asked_before:]]
+        self.assertEqual(len(newly_asked), len(QUESTIONS) - 3 - 1)  # the clarified thread's follow-up is skipped
+        self.assertEqual(runner.summarize(records)["reused"], 3)
+        self.assertEqual(records["P01-Guideline-01"]["reused_from"], "r1")
+
+    async def _fused_follow_up(self, parent_age_hours):
+        """An earlier run answered only P01-Guideline-01; a new run adds its follow-up."""
+        await self._run(QUESTIONS[:1])
+        path = os.path.join(self.tmp.name, "responses.jsonl")
+        record = json.loads(open(path, encoding="utf-8").read().splitlines()[-1])
+        record["started_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=parent_age_hours)
+        ).isoformat()
+        old_thread = record["response"]["qa_thread_id"]
+        fused = os.path.join(self.tmp.name, "fused")
+        os.makedirs(fused)
+        runner.seed_reused(os.path.join(fused, "responses.jsonl"), {record["question_id"]: {**record, "reused_from": "r1"}}, run_id="fused")
+        asked_before = len(self.api.asked)
+        transport = httpx.MockTransport(self.api)
+        async with httpx.AsyncClient(transport=transport, base_url="http://api") as client:
+            records = await runner.BenchmarkRun(
+                client, run_id="fused", run_dir=fused, questions=[QUESTIONS[0], QUESTIONS[3]],
+                personas=PERSONAS, follow_up_delay=0, retries=0,
+            ).run()
+        return [b["question"] for b in self.api.asked[asked_before:]], records, old_thread
+
+    async def test_new_follow_up_of_an_expired_parent_asks_the_parent_again(self):
+        asked, records, old_thread = await self._fused_follow_up(parent_age_hours=24 * 14)
+        self.assertEqual(asked, [QUESTIONS[0]["foodscholar_question"], QUESTIONS[3]["foodscholar_question"]])
+        new_thread = records["P01-Guideline-01"]["response"]["qa_thread_id"]
+        self.assertNotEqual(new_thread, old_thread)
+        self.assertEqual(records["P01-CitationVerification-01"]["request"]["qa_thread_id"], new_thread)
+        self.assertIsNone(records["P01-Guideline-01"].get("reused_from"))
+
+    async def test_new_follow_up_of_a_recent_parent_reuses_its_thread(self):
+        asked, records, old_thread = await self._fused_follow_up(parent_age_hours=1)
+        self.assertEqual(asked, [QUESTIONS[3]["foodscholar_question"]])
+        self.assertEqual(records["P01-CitationVerification-01"]["request"]["qa_thread_id"], old_thread)
+
+    async def test_reuse_refuses_another_setting_and_changed_questions(self):
+        await self._run(QUESTIONS[:1])
+        self._manifest(self.tmp.name, retriever="statements")
+        rag = runner.setting_of({"retriever": None, "clarify": "persona", "language_from": "question"})
+        with self.assertRaises(ValueError):
+            runner.reusable_records([self.tmp.name], questions=QUESTIONS, personas=PERSONAS, setting=rag)
+
+        statements_setting = {**rag, "retriever": "statements"}
+        reworded = [{**QUESTIONS[0], "foodscholar_question": "A reworded question?"}]
+        reused, _ = runner.reusable_records(
+            [self.tmp.name], questions=reworded, personas=PERSONAS, setting=statements_setting
+        )
+        self.assertEqual(reused, {})  # asked differently: ask again
 
     async def test_server_error_is_recorded_not_raised(self):
         def broken(request):
