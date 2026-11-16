@@ -7,6 +7,7 @@ dense query and a user-visible one-line rationale. Prior research notes from
 the same conversation thread are part of the input so follow-up questions
 search from what earlier turns already established.
 """
+import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional, Set
@@ -97,8 +98,53 @@ def _coerce_filters(raw: Any) -> SubQuestionFilters:
             if item is not None and str(item).strip()
         ][:6]
 
+    # Tags as the index spells them (facets.py). The planner writes them
+    # under "facets"; the older per-aspect lists are folded in too, since
+    # their names are tag fields. What is not in the index is dropped here.
+    from services.qa_pipeline import facets as corpus
+
+    wanted: Dict[str, list] = {}
+
+    def _want(field: str, values: Any) -> None:
+        found = corpus.canonical(field, values if isinstance(values, list) else [values])
+        if found:
+            wanted[field] = list(dict.fromkeys([*wanted.get(field, []), *found]))
+
+    raw_facets = raw.get("facets")
+    if isinstance(raw_facets, dict):
+        for field, values in raw_facets.items():
+            _want(str(field), values)
+    for legacy, fields in (
+        ("target_populations", ("target_populations", "life_stage", "population_group", "age_group")),
+        ("food_groups", ("food_groups",)),
+        ("nutrients", ("nutrients",)),
+        ("health_conditions", ("health_conditions",)),
+        ("study_types", ("study_type",)),
+    ):
+        for field in fields:
+            _want(field, _terms(raw.get(legacy)))
+
+    def _months(value: Any) -> Any:
+        try:
+            months = int(value)
+        except (TypeError, ValueError):
+            return None
+        return months if 0 <= months <= 1560 else None
+
+    age = raw.get("age_months")
+    age_low = _months(age[0]) if isinstance(age, list) and len(age) == 2 else _months(raw.get("age_min_months"))
+    age_high = _months(age[1]) if isinstance(age, list) and len(age) == 2 else _months(raw.get("age_max_months"))
+    must = [
+        str(name) for name in (raw.get("must") if isinstance(raw.get("must"), list) else [])
+        if str(name) in wanted or str(name) == "age"
+    ]
+
     try:
         return SubQuestionFilters(
+            facets=wanted,
+            must=must,
+            age_min_months=age_low,
+            age_max_months=age_high,
             year_min=_year(raw.get("year_min")),
             year_max=_year(raw.get("year_max")),
             open_access=raw.get("open_access")
@@ -192,8 +238,12 @@ class QAPlannerAgent:
         system_text = QA_PLANNER_SYSTEM.compile(
             max_subquestions=_max_subquestions()
         )
+        from services.qa_pipeline import facets as corpus
+
         payload: Dict[str, Any] = {
             "question": question,
+            # The tags the sources carry, so the plan can name them exactly.
+            "corpus_facets": await asyncio.to_thread(corpus.for_planner),
             "request_language": request.language,
             "expertise_level": request.expertise_level,
             "user_context": user_context.model_dump(exclude_none=True),

@@ -1,0 +1,77 @@
+{
+  "name": "qa-ablation-1",
+  "out": "benchmark-runs",
+  "reference": "full",
+  "repeats": {"full": 3},
+  "datasets": {
+    "mmlu": {
+      "personas": "mmlu-persona.json",
+      "questions": "mmlu-nutrition-test.json",
+      "scorer": "choice"
+    },
+    "persona": {
+      "personas": "20260904-personas-v2.json",
+      "questions": "20260904-questions-v2-sample120.json",
+      "scorer": "judge"
+    }
+  },
+  "configs": [
+    {"name": "full", "role": "system", "what": "Everything on, as deployed"},
+
+    {"name": "closed_book", "role": "baseline", "retriever": "no_rag",
+     "what": "Same answer model, no sources at all"},
+    {"name": "single_pass", "role": "baseline", "ablation": {"QA_PIPELINE_MODE": "legacy"},
+     "what": "The pre-agentic flow: one retrieval, one answer"},
+    {"name": "prod_2026_11_04", "role": "baseline",
+     "existing_runs": {"mmlu": "benchmark-runs/full-mmlu-rag", "persona": "benchmark-runs/full-persona-rag"},
+     "what": "Production before the Learn changes (commit 905a04f), recorded by the full benchmark"},
+
+    {"name": "no_planner", "ablation": {"QA_PLANNER_ENABLED": false},
+     "what": "The question as asked: one article and one guideline search"},
+    {"name": "no_evidence_check", "ablation": {"QA_MAX_REPAIR_ROUNDS": 0},
+     "what": "One round: no evidence check, no follow-up searches"},
+    {"name": "no_gap_recheck", "ablation": {"QA_GAP_RECHECK_ENABLED": false},
+     "what": "A first-round 'corpus gap' ends the search, as before 2026-11-10"},
+    {"name": "no_search_filters", "ablation": {"QA_SEARCH_FILTERS_ENABLED": false},
+     "what": "Searches ignore the planner's filters (years, study design, population)"},
+    {"name": "lexical_only", "ablation": {"QA_RETRIEVAL_LEGS": "lexical"},
+     "what": "Keyword search only"},
+    {"name": "vector_only", "ablation": {"QA_RETRIEVAL_LEGS": "vector"},
+     "what": "Embedding search only"},
+    {"name": "no_rerank", "ablation": {"QA_RANKING_PRIORS_ENABLED": false, "QA_MIN_SCORE": 0, "QA_PER_DOC_CAP": 50},
+     "what": "Fused search order as is: no reranking signals, no score floor, no per-guide cap"},
+    {"name": "knn_before_fix", "ablation": {"QA_KNN_CANDIDATES": 10},
+     "what": "The vector search as it was before the size fix (10 hits instead of 30)"},
+    {"name": "no_user_context", "datasets": ["persona"], "ablation": {"QA_USER_CONTEXT_ENABLED": false},
+     "what": "Nothing known about the asker"},
+    {"name": "no_clarification", "datasets": ["persona"], "ablation": {"QA_CLARIFY_ENABLED": false},
+     "what": "Never ask the asker for a detail"},
+    {"name": "no_thread_memory", "datasets": ["persona"], "ablation": {"QA_THREAD_MEMORY_ENABLED": false},
+     "what": "Follow-ups answered without the earlier turns"},
+
+    {"name": "no_ranking_priors", "stage": 2, "ablation": {"QA_RANKING_PRIORS_ENABLED": false},
+     "what": "Reranking without any of its five signals (cap and floor kept)"},
+    {"name": "no_prior_tier", "stage": 2, "ablation": {"QA_RANKING_PRIORS_OFF": "tier"},
+     "what": "Reranking without the editorial / earned tier"},
+    {"name": "no_prior_recency", "stage": 2, "ablation": {"QA_RANKING_PRIORS_OFF": "recency"},
+     "what": "Reranking without recency"},
+    {"name": "no_prior_influence", "stage": 2, "ablation": {"QA_RANKING_PRIORS_OFF": "influence"},
+     "what": "Reranking without the citation boost"},
+    {"name": "no_prior_design", "stage": 2, "ablation": {"QA_RANKING_PRIORS_OFF": "design"},
+     "what": "Reranking without the study-design weight"},
+    {"name": "no_prior_affinity", "stage": 2, "ablation": {"QA_RANKING_PRIORS_OFF": "affinity"},
+     "what": "Reranking without guideline affinity (country, population, topic)"}
+  ],
+  "sweeps": [
+    {"name": "agent_rounds", "setting": "QA_MAX_REPAIR_ROUNDS", "values": [0, 1, 2, 3], "default": 1,
+     "what": "Evidence-check-and-search-again rounds"},
+    {"name": "sub_questions", "setting": "QA_MAX_SUBQUESTIONS", "values": [1, 2, 3, 5], "default": 3,
+     "what": "Searches the planner may write"},
+    {"name": "candidates", "setting": "QA_RRF_CANDIDATES", "values": [10, 30, 60], "default": 30,
+     "what": "Hits taken from each search leg"},
+    {"name": "per_doc_cap", "setting": "QA_PER_DOC_CAP", "values": [1, 2, 5], "default": 2,
+     "what": "Rules per guide / chunks per article"},
+    {"name": "article_budget", "setting": "QA_ARTICLE_TOP_K", "values": [3, 5, 8], "default": 5,
+     "what": "Articles the answer reads"}
+  ]
+}

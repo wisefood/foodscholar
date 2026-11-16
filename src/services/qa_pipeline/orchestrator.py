@@ -20,16 +20,21 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, TYPE_CHECKING
 
 from config import config
 from models.qa import (
+    ClaimVerdict,
     ClarificationRequest,
     ConversationContext,
     MemorySuggestion,
     PlannedSubQuestion,
     QARequest,
     QAResponse,
+    QAUserContext,
     ResearchNote,
     SubQuestionFilters,
 )
-from services.qa_pipeline import ranking, retrieval
+from services.qa_pipeline import ablation
+from services.qa_pipeline import audience as audience_mod
+from services.qa_pipeline import progress as research_progress
+from services.qa_pipeline import ranking, relevance, retrieval
 from services.qa_pipeline.answering import stream_answer
 from services.qa_pipeline.evaluator import EvaluationResult, evaluate
 from services.qa_pipeline.events import PipelineEvent
@@ -49,6 +54,10 @@ CACHE_REPLAY_CHUNK_CHARS = 400
 # Strong references to fire-and-forget post-answer tasks (conversation
 # summary), so the event loop does not garbage-collect them mid-flight.
 _background_tasks: Set[asyncio.Task] = set()
+
+
+class _PlannerSwitchedOff(Exception):
+    """The ablation switch that answers without the LLM planner."""
 
 
 def _spawn_background(coro) -> None:
@@ -154,6 +163,8 @@ def _repair_action_phrase(action: Dict[str, Any]) -> str:
         return f"Switched a search to {target}"
     if kind == "add_sub_question":
         return f'Added a search: "{value}"' if value else "Added a search"
+    if kind == "recheck_gap":
+        return f'Checked again before calling it a gap: "{value}"' if value else "Checked again"
     return str(kind or "Adjusted a search")
 
 
@@ -242,17 +253,23 @@ async def run_pipeline(
     )
 
     user_context = await asyncio.to_thread(service._resolve_user_context, request)
+    if not ablation.flag("QA_USER_CONTEXT_ENABLED"):
+        # Ablation: nothing known about the asker. Answers to this thread's
+        # own clarification are still applied below.
+        user_context = QAUserContext()
     thread_context = await asyncio.to_thread(
         service._load_qa_thread, request.qa_thread_id
     )
     user_context = service._merge_thread_user_context(user_context, thread_context)
+    # Ablation: a follow-up answered as if it were the first question.
+    memory_on = ablation.flag("QA_THREAD_MEMORY_ENABLED")
     conversation_state = await asyncio.to_thread(
-        service._load_conversation_state, request.qa_thread_id
+        service._load_conversation_state, request.qa_thread_id if memory_on else None
     )
     conversation_summary = conversation_state["summary"]
     prior_conversation_text = service.compose_prior_conversation(conversation_state)
     prior_notes = await asyncio.to_thread(
-        _load_prior_notes, service, request.qa_thread_id
+        _load_prior_notes, service, request.qa_thread_id if memory_on else None
     )
 
     # A pending clarification the client did not answer is re-served verbatim.
@@ -294,6 +311,10 @@ async def run_pipeline(
 
     plan_started = time.monotonic()
     try:
+        if not ablation.flag("QA_PLANNER_ENABLED"):
+            # Ablation: the question as asked, one article and one guideline
+            # search, exactly what an unavailable planner falls back to.
+            raise _PlannerSwitchedOff()
         plan = await QAPlannerAgent().plan(
             question=effective_question,
             request=request,
@@ -302,7 +323,8 @@ async def run_pipeline(
             prior_notes=prior_notes,
         )
     except Exception as exc:  # pragma: no cover - planner already guards
-        logger.warning("Planner crashed; deterministic fallback: %s", exc)
+        if not isinstance(exc, _PlannerSwitchedOff):
+            logger.warning("Planner crashed; deterministic fallback: %s", exc)
         plan = build_fallback_pipeline_plan(
             question=effective_question,
             request=request,
@@ -321,6 +343,22 @@ async def run_pipeline(
     )
     state.prior_notes = prior_notes
     state.timings_ms["plan"] = int((time.monotonic() - plan_started) * 1000)
+    # Who the question is about: its own words, the plan's populations, then
+    # the profile. Steers guideline search, ranking, grading and the check.
+    state.audience = audience_mod.resolve(
+        effective_question,
+        populations=[
+            population
+            for sq in plan.sub_questions
+            if sq.filters is not None
+            for population in sq.filters.target_populations
+        ],
+        member_age_group=user_context.member_age_group,
+    )
+    # The safety net under the plan: a search that names nobody takes who the
+    # question is about (its own words, else the asker's profile).
+    for sq in plan.sub_questions:
+        sq.filters = audience_mod.apply(sq.filters, state.audience)
 
     yield emit(
         "stage.plan",
@@ -353,8 +391,11 @@ async def run_pipeline(
 
     # ONE clarification per thread (see legacy rationale): once the user has
     # answered or declined anything, answer with reasonable assumptions.
-    clarification_exhausted = bool(request.clarification_response) or bool(
-        answered_ids
+    clarification_exhausted = (
+        bool(request.clarification_response)
+        or bool(answered_ids)
+        # Ablation: never ask; answer with reasonable assumptions.
+        or not ablation.flag("QA_CLARIFY_ENABLED")
     )
     clarification = (
         plan.clarification
@@ -457,11 +498,24 @@ async def run_pipeline(
 
     if effective_rag and effective_retriever == "rag":
         to_search = list(plan.sub_questions)
+        # The research log's reference points (see progress.py).
+        question_terms = research_progress.key_terms(effective_question)
+        baseline_overlap: Optional[float] = None
+        selected_keys_before: Set[str] = set()
+        # Gap notes of a first round that is being rechecked: dropped when
+        # the recheck finds evidence.
+        gap_notes_to_confirm: List[ResearchNote] = []
         for round_index in range(max_repair_rounds + 1):
             state.round = round_index
             retrieve_started = time.monotonic()
+            pool_keys_before = {item.key for item in pool}
+            statuses_before = len(state.branch_statuses)
 
             branch_tasks = _expand_branches(to_search)
+            searched = [
+                (sq.id, branch, sq.lexical_query or sq.text)
+                for sq, branch in branch_tasks
+            ]
             dense_queries = [sq.dense_query or sq.text for sq, _ in branch_tasks]
             vectors: List[Optional[List[float]]] = [None] * len(branch_tasks)
             if dense_queries:
@@ -590,6 +644,17 @@ async def run_pipeline(
                 expertise_level=request.expertise_level,
                 user_context=user_context,
                 question_facets=_merged_facets(state.sub_questions()),
+                design_neutral_sub_questions={
+                    sq.id for sq in state.sub_questions() if sq.qtype == "quantity"
+                },
+                filters_by_sub_question={
+                    sq.id: sq.filters for sq in state.sub_questions()
+                },
+            )
+            relevance_started = time.monotonic()
+            await relevance.grade_relevance(state, adjusted)
+            state.timings_ms["relevance"] = state.timings_ms.get("relevance", 0) + int(
+                (time.monotonic() - relevance_started) * 1000
             )
             selected, dropped = ranking.select_evidence(
                 adjusted, top_k=request.top_k
@@ -647,6 +712,71 @@ async def run_pipeline(
                     "used_llm": evaluation.used_llm,
                 }
             )
+
+            # ---- Research log (observe-only) ------------------------------
+            # How this round went: new or repeated searches, new evidence or
+            # the same again, still on the question or wandering. Recorded
+            # with the answer; nothing acts on it yet. Never fails a run.
+            try:
+                signals = research_progress.round_signals(
+                    round_index=round_index,
+                    searched=searched,
+                    queries_tried_before=state.queries_tried,
+                    branch_statuses=state.branch_statuses[statuses_before:],
+                    pool_keys_before=pool_keys_before,
+                    pool_keys={item.key for item in pool},
+                    selected_keys_before=selected_keys_before,
+                    selected=selected,
+                    question_terms=question_terms,
+                    per_sub_question=evaluation.per_sub_question,
+                )
+                status, status_reason = research_progress.assess_round(
+                    signals,
+                    verdict=evaluation.verdict,
+                    used_llm=evaluation.used_llm,
+                    baseline_overlap=baseline_overlap,
+                )
+                state.progress.append(
+                    {**signals, "status": status, "reason": status_reason}
+                )
+                state.research_log.append(
+                    research_progress.log_entry(
+                        signals,
+                        status,
+                        status_reason,
+                        searched=searched,
+                        verdict=evaluation.verdict,
+                        gaps=[
+                            str(entry.get("gap"))
+                            for entry in evaluation.per_sub_question
+                            if entry.get("gap")
+                        ],
+                    )
+                )
+                if round_index == 0:
+                    baseline_overlap = signals.get("question_overlap_selected")
+                logger.info(
+                    "QA research round %d: %s (%s) new_kept=%s repeated=%d overlap_new=%s",
+                    round_index,
+                    status,
+                    status_reason,
+                    signals.get("new_in_selected"),
+                    len(signals.get("repeated_queries") or []),
+                    signals.get("question_overlap_new"),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Research log failed for round %d: %s", round_index, exc)
+            if gap_notes_to_confirm:
+                # The recheck kept evidence the gap notes said was missing:
+                # they were a first-search impression, not something the
+                # thread should remember as fact.
+                if {item.key for item in selected} - selected_keys_before:
+                    state.notes = [n for n in state.notes if n not in gap_notes_to_confirm]
+                gap_notes_to_confirm = []
+            state.queries_tried.update(
+                research_progress.query_key(branch, query) for _, branch, query in searched
+            )
+            selected_keys_before = {item.key for item in selected}
 
             added_notes = state.add_notes(evaluation.notes)
             if added_notes:
@@ -744,9 +874,11 @@ async def run_pipeline(
                 yield emit("clarification", response.model_dump())
                 return
 
-            if evaluation.verdict in ("sufficient", "corpus_gap"):
+            if evaluation.verdict == "sufficient":
                 break
 
+            # A first-round "corpus_gap" may be rechecked (see repair.py);
+            # a later one, or one with nothing new to try, ends the search.
             repair_plan = build_repair_plan(
                 state,
                 evaluation,
@@ -754,9 +886,15 @@ async def run_pipeline(
             )
             if not repair_plan.has_work:
                 break
+            if evaluation.verdict == "corpus_gap":
+                gap_notes_to_confirm = [n for n in added_notes if n.kind == "gap"]
             state.repairs.append(
                 {"round": round_index, "actions": repair_plan.actions}
             )
+            if state.research_log and state.research_log[-1].get("round") == round_index:
+                state.research_log[-1]["next"] = [
+                    _repair_action_phrase(action) for action in repair_plan.actions[:4]
+                ]
             yield emit(
                 "stage.repair",
                 {"round": round_index, "actions": repair_plan.actions},
@@ -776,6 +914,8 @@ async def run_pipeline(
                 ).model_dump(),
             )
             to_search = repair_plan.to_search
+            for sq in to_search:  # searches added by the repair, too
+                sq.filters = audience_mod.apply(sq.filters, state.audience)
 
     elif effective_rag and effective_retriever == "kggen":
         # Graph retriever: single pass through the adapter, then the same
@@ -893,6 +1033,7 @@ async def run_pipeline(
     answer_started = time.monotonic()
     final_answer = None
     follow_ups: List[str] = []
+    claim_verdict_value: Optional[str] = None
     async for event in stream_answer(
         question=effective_question,
         payloads=payloads,
@@ -902,12 +1043,14 @@ async def run_pipeline(
         user_context=context_payload,
         prior_conversation=prior_conversation_text,
         trace_context=trace_context,
+        intent=request.intent,
     ):
         if event["kind"] == "delta":
             yield emit("answer_delta", {"text": event["text"]})
         elif event["kind"] == "final":
             final_answer = event["answer"]
             follow_ups = event["follow_ups"]
+            claim_verdict_value = event.get("claim_verdict")
     state.timings_ms["answer"] = int((time.monotonic() - answer_started) * 1000)
     state.timings_ms["total"] = int((time.monotonic() - started) * 1000)
 
@@ -957,6 +1100,13 @@ async def run_pipeline(
             summary=conversation_summary,
             notes=_merged_notes(prior_notes, state.notes),
             turn_count=len(conversation_state["turns"]) + 1,
+        ),
+        # Only a claim check carries a verdict; an ordinary question never
+        # does, whatever its trailer said.
+        claim_verdict=(
+            ClaimVerdict(verdict=claim_verdict_value)
+            if request.intent == "claim_check" and claim_verdict_value
+            else None
         ),
     )
 

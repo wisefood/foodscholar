@@ -152,6 +152,7 @@ def request_for(
     language_from: str = "question",
     retriever: Optional[str] = None,
     qa_thread_id: Optional[str] = None,
+    ablation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The /qa/ask payload for one question asked as its persona.
 
@@ -175,8 +176,47 @@ def request_for(
         "bypass_cache": True,
         "qa_thread_id": qa_thread_id,
         "retriever": retriever,
+        "ablation": ablation or None,
     }
     return {k: v for k, v in payload.items() if v is not None}
+
+
+def parse_ablation(pairs: Optional[List[str]], raw_json: Optional[str]) -> Dict[str, Any]:
+    """``--ablation KEY=VALUE`` (repeatable) and ``--ablation-json``, merged.
+
+    Values are JSON when they parse (``false``, ``0``, ``0.5``), text otherwise
+    (``lexical``). The server types and checks them.
+    """
+    overlay: Dict[str, Any] = {}
+    if raw_json:
+        loaded = json.loads(raw_json)
+        if not isinstance(loaded, dict):
+            raise ValueError("--ablation-json must be a JSON object")
+        overlay.update(loaded)
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--ablation expects KEY=VALUE, not {pair!r}")
+        try:
+            overlay[key.strip()] = json.loads(value)
+        except ValueError:
+            overlay[key.strip()] = value.strip()
+    return overlay
+
+
+def check_ablation(runtime_info: Dict[str, Any], overlay: Dict[str, Any]) -> None:
+    """Refuse a run the API would refuse question by question, or ignore."""
+    if not overlay:
+        return
+    info = runtime_info.get("ablation") or {}
+    if not info.get("enabled"):
+        raise RuntimeError(
+            "this API does not accept ablation requests: start it with "
+            "QA_ABLATION_ENABLED=true (see docs/qa-ablation.md)"
+        )
+    unknown = sorted(set(overlay) - set(info.get("switches") or {}))
+    if unknown:
+        raise RuntimeError(f"this API does not know the ablation setting(s) {unknown}")
 
 
 def runtime_drift(start: Dict[str, Any], end: Dict[str, Any]) -> List[str]:
@@ -223,6 +263,10 @@ def search_failures(record: Dict[str, Any]) -> int:
 def lacks_thread_context(record: Dict[str, Any]) -> bool:
     """A follow-up answered as if it were the first turn of its thread."""
     if not record.get("follow_up_of") or record.get("status") != "ok":
+        return False
+    # An ablation run that switched thread memory off asks for exactly that.
+    ablation = (record.get("request") or {}).get("ablation") or {}
+    if str(ablation.get("QA_THREAD_MEMORY_ENABLED", True)).lower() in {"false", "0", "no", "off"}:
         return False
     context = (record.get("response") or {}).get("conversation_context") or {}
     return int(context.get("turn_count") or 0) < 2
@@ -426,8 +470,10 @@ class BenchmarkRun:
         language_from: str = "question",
         retriever: Optional[str] = None,
         clarifier: Optional[PersonaClarifier] = None,
+        ablation: Optional[Dict[str, Any]] = None,
     ):
         self.client = client
+        self.ablation = ablation or None
         self.clarifier = clarifier
         self.run_id = run_id
         self.questions = questions
@@ -499,6 +545,7 @@ class BenchmarkRun:
             q, self.personas[q["persona_id"]],
             run_id=self.run_id, language_from=self.language_from,
             retriever=self.retriever, qa_thread_id=thread_id,
+            ablation=self.ablation,
         )
         async with self.semaphore:
             return await self._ask(q, payload)
@@ -650,6 +697,7 @@ async def main_async(args: argparse.Namespace) -> int:
         ids=args.only, limit=args.limit,
     )
     run_id = args.run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ablation = parse_ablation(args.ablation, args.ablation_json)
     print(f"run {run_id}: {len(questions)} question(s)", file=sys.stderr)
 
     if args.dry_run:
@@ -658,6 +706,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 q, personas[q["persona_id"]], run_id=run_id,
                 language_from=args.language_from, retriever=args.retriever,
                 qa_thread_id="<thread of %s>" % q["follow_up_of"] if q.get("follow_up_of") else None,
+                ablation=ablation,
             )
             print(json.dumps({"question_id": q["question_id"], **payload}, ensure_ascii=False))
         return 0
@@ -675,10 +724,18 @@ async def main_async(args: argparse.Namespace) -> int:
         # Before the run directory exists: an unreachable or outdated API
         # leaves nothing behind.
         runtime_start = await fetch_runtime_info(client)
+        check_ablation(runtime_start, ablation)
         run_dir = os.path.join(args.out, run_id)
-        os.makedirs(run_dir, exist_ok=True)
         manifest_path = os.path.join(run_dir, "manifest.json")
         previous = load_json(manifest_path) if os.path.exists(manifest_path) else {}
+        # A resumed run must keep its configuration, or its answers would mix
+        # two configurations under one name.
+        if previous and (previous.get("options") or {}).get("ablation", {}) != ablation:
+            raise RuntimeError(
+                f"run {run_id} was recorded with ablation "
+                f"{(previous.get('options') or {}).get('ablation', {})}, not {ablation}"
+            )
+        os.makedirs(run_dir, exist_ok=True)
         manifest = {
             "run_id": run_id,
             "api": args.api,
@@ -698,6 +755,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 "concurrency": args.concurrency, "retries": args.retries,
                 "timeout_s": args.timeout, "follow_up_delay_s": args.follow_up_delay,
                 "language_from": args.language_from, "retriever": args.retriever,
+                "ablation": ablation, "config_name": args.config_name,
                 # The API key is deliberately not recorded.
                 "clarify": args.clarify,
                 "clarify_model": args.clarify_model if clarifier else None,
@@ -719,7 +777,7 @@ async def main_async(args: argparse.Namespace) -> int:
             personas=personas, concurrency=args.concurrency,
             retries=args.retries, follow_up_delay=args.follow_up_delay,
             language_from=args.language_from, retriever=args.retriever,
-            clarifier=clarifier,
+            clarifier=clarifier, ablation=ablation,
         )
         records = await run.run()
         runtime_end = await fetch_runtime_info(client)
@@ -772,6 +830,13 @@ def main() -> int:
         "--clarification-answers",
         help="JSON {question_id: option value or [values]} that overrides the persona model",
     )
+    parser.add_argument(
+        "--ablation", action="append", metavar="KEY=VALUE",
+        help="Answer with this pipeline setting changed, e.g. QA_PLANNER_ENABLED=false "
+             "(repeatable; the API must run with QA_ABLATION_ENABLED=true)",
+    )
+    parser.add_argument("--ablation-json", help="The same as a JSON object")
+    parser.add_argument("--config-name", help="Label for this configuration in an ablation study (recorded only)")
     parser.add_argument("--dry-run", action="store_true", help="Print the payloads that would be sent; no calls")
     args = parser.parse_args()
     try:

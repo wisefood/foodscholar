@@ -29,6 +29,8 @@ from models.qa import (
     PlannedSubQuestion,
     ResearchNote,
 )
+from services.qa_pipeline import facets as corpus_facets
+from services.qa_pipeline.audience import age_of, describe_in_words
 from services.qa_pipeline.state import EvidenceItem, PipelineState
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,10 @@ VERDICTS = {
     "needs_user_clarification",
 }
 
-_SNIPPET_CHARS = 280
+# Long enough to hold the numbers a "how much" question needs: at 280 the
+# checker saw two plant-milk nutrient surveys and still found "no article
+# with oat milk calcium content".
+_SNIPPET_CHARS = 600
 _TOP_PER_SUB_QUESTION = 5
 
 
@@ -140,6 +145,7 @@ def _evidence_digest(state: PipelineState) -> List[Dict[str, Any]]:
                 "why": sq.why,
                 "qtype": sq.qtype,
                 "branch": sq.branch,
+                "wanted": corpus_facets.describe(sq.filters) or None,
                 "hits": [
                     {
                         "urn": item.payload.get("urn"),
@@ -154,6 +160,14 @@ def _evidence_digest(state: PipelineState) -> List[Dict[str, Any]]:
                         "citations": item.payload.get("citationCount")
                         or item.payload.get("citation_count"),
                         "score": round(item.adjusted_score, 4),
+                        # 0-3: how directly it answers this search (relevance.py)
+                        "relevance": item.score_parts.get("relevance"),
+                        # The source's own tags (who, food group, nutrient,
+                        # study type, …) and how they met the search's wants.
+                        "guide": item.payload.get("guide_title"),
+                        "tags": corpus_facets.tags(item.payload) or None,
+                        "age": age_of(item.payload),
+                        "fit": item.score_parts.get("fit_detail"),
                         "snippet": _snippet(item.payload),
                     }
                     for item in items[:_TOP_PER_SUB_QUESTION]
@@ -235,6 +249,10 @@ async def evaluate(
 
     payload: Dict[str, Any] = {
         "question": state.effective_question,
+        "asked_about": describe_in_words(getattr(state, "audience", None)),
+        # The tags sources carry: a new or reworded search can name them in
+        # its filters (facets / must / age_months), as the plan does.
+        "corpus_facets": corpus_facets.for_planner(),
         "request_language": state.request.language,
         "round": state.round,
         "clarification_allowed": clarification_allowed,

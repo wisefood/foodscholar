@@ -61,6 +61,38 @@ def _known_statement(kind: str, value: str) -> str:
     return f"“{label}” is already in your likes."
 
 
+# Where a diet sits on the "how much animal food" axis. Two diets on
+# different rungs cannot both hold ("omnivore" and "vegetarian"); the same
+# rung can ("vegan" and "plant_based"). Restrictions (halal, gluten_free, …)
+# are not on the axis and never conflict.
+_DIET_RUNG = {
+    "omnivore": 0,
+    "flexitarian": 1,
+    "pescatarian": 2,
+    "vegetarian": 3, "lacto_vegetarian": 3, "ovo_vegetarian": 3,
+    "lacto_ovo_vegetarian": 3, "buddhist_vegetarian": 3,
+    "vegan": 4, "raw_vegan": 4, "plant_based": 4,
+}
+
+
+def _conflicting_diets(value: str, patterns) -> List[str]:
+    rung = _DIET_RUNG.get(value)
+    if rung is None:
+        return []
+    return [p for p in patterns if _DIET_RUNG.get(p) is not None and _DIET_RUNG[p] != rung]
+
+
+def _contradictions(kind: str, value: str, likes, dislikes, patterns) -> List[str]:
+    """What the profile holds that this memory would contradict."""
+    if kind == "dietary_pattern":
+        return _conflicting_diets(value, patterns)
+    if kind in ("like", "cuisine") and value in dislikes:
+        return [value]
+    if kind == "dislike" and value in likes:
+        return [value]
+    return []
+
+
 def _profile_fingerprint(prefs, props, allergies, groups) -> str:
     """The parts of a profile a memory write can touch, in a comparable form."""
     return json.dumps(
@@ -74,6 +106,24 @@ def _profile_fingerprint(prefs, props, allergies, groups) -> str:
         sort_keys=True,
         default=str,
     )
+
+
+def _writable_profile(client: Any, member_id: str) -> Any:
+    """The member's profile, created first when the member has none.
+
+    The gateway creates a profile only when a member is created with one, so
+    guests (and members added without one) have no profile row, and every
+    PATCH to it is a 404: "Remember" saved nothing for guests. The SDK hands
+    back an empty profile in that case; POST creates the row (the gateway's
+    create is an upsert, so a race with another writer is harmless).
+    """
+    member = client.members.get(member_id)
+    profile = member.profile
+    if not hasattr(profile, "to_dict") or profile.to_dict():
+        return profile
+    client.post(f"members/{member_id}/profile", json={})
+    member._profile = None  # re-read, now bound to the new row
+    return member.profile
 
 
 class MemoryService:
@@ -178,7 +228,12 @@ class MemoryService:
                 continue
             if kind != "allergy_hint" and cand.get("confidence") != "high":
                 continue
-            if value in optouts:
+            contradicts = _contradictions(kind, value, likes, dislikes, patterns)
+            # "No thanks" means "don't ask again" while the profile agrees
+            # with what was asked. A question that contradicts the profile
+            # ("I don't eat meat", profile: omnivore) is asked again, showing
+            # what the profile says, or the profile stays wrong.
+            if value in optouts and not contradicts:
                 continue
             if value in known_by_kind.get(kind, set()):
                 # Already on the profile: shown pre-selected so the user sees
@@ -210,6 +265,7 @@ class MemoryService:
                 "value": value,
                 "statement": statement,
                 "already_known": False,
+                **({"contradicts": contradicts} if contradicts else {}),
             })
 
         # New nudges take the slots first; what is already known fills the rest.
@@ -254,7 +310,7 @@ class MemoryService:
 
         client = WISEFOOD_PLATFORM.get_client()
         try:
-            profile = client.members.get(member_id).profile
+            profile = _writable_profile(client, member_id)
             prefs = dict(profile.nutritional_preferences or {})
             props = dict(profile.properties or {})
             allergies = list(profile.allergies or [])
@@ -293,9 +349,18 @@ class MemoryService:
                 props["dietary_goals"] = goals
             elif kind == "dietary_pattern":
                 # Standing regimen (keto, mediterranean, vegan...). Stored in
-                # dietary_groups, which FoodChat already reads.
+                # dietary_groups, which FoodChat already reads. A diet on
+                # another rung is replaced, not kept beside it: "omnivore" and
+                # "vegetarian" together would tell FoodChat nothing.
+                conflicting = set(_conflicting_diets(value, [str(g).lower() for g in groups]))
+                groups = [g for g in groups if str(g).lower() not in conflicting]
                 if value not in [str(g).lower() for g in groups]:
                     groups.append(value)
+
+            # Accepting what was once declined lifts the opt-out.
+            optouts = [o for o in (props.get("memory_optouts") or []) if str(o).lower() != value]
+            if optouts != list(props.get("memory_optouts") or []):
+                props["memory_optouts"] = optouts
 
             if _profile_fingerprint(prefs, props, allergies, groups) == before:
                 # Nothing to remember twice: no PATCH, no second log entry.
@@ -345,7 +410,7 @@ class MemoryService:
 
         client = WISEFOOD_PLATFORM.get_client()
         try:
-            profile = client.members.get(member_id).profile
+            profile = _writable_profile(client, member_id)
             props = dict(profile.properties or {})
             optouts = list(props.get("memory_optouts") or [])
             if value not in optouts:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from config import config
 from models.qa import QAUserContext, SubQuestionFilters
@@ -22,6 +22,8 @@ from services.article_policy import (
     tier_boost,
 )
 from services.qa_pipeline.state import EvidenceItem
+from services.qa_pipeline import facets as corpus_facets
+from services.qa_pipeline.audience import age_fit, unstated_fit
 from services.qa_retrievers import QA_GUIDELINE_RAG_TOP_K_MAX, age_group_facets
 
 logger = logging.getLogger(__name__)
@@ -274,18 +276,8 @@ def guideline_affinity_factor(
     if _terms_overlap(wanted_regions, rule_regions):
         factor *= 1.15
 
-    wanted_populations = _facet_terms(
-        facets.target_populations if facets else []
-    )
-    if user_context:
-        resolved = age_group_facets(user_context.member_age_group)
-        if resolved:
-            wanted_populations |= _facet_terms(resolved[0])
-    rule_populations = _facet_terms(payload.get("life_stage")) | _facet_terms(
-        payload.get("target_populations")
-    )
-    if _terms_overlap(wanted_populations, rule_populations):
-        factor *= 1.15
+    # Population and age fit moved to audience.py (rule_factor), which reads
+    # the rule's keyword slugs and age window instead of free text.
 
     wanted_topics = _facet_terms(
         [
@@ -305,6 +297,35 @@ def guideline_affinity_factor(
     return factor
 
 
+def source_fit(
+    payload: Dict[str, Any],
+    sub_question_ids: List[str],
+    filters_by_sub_question: Optional[Dict[str, SubQuestionFilters]],
+) -> tuple:
+    """A source against the wants of the searches that found it.
+
+    Found by several searches, it is as good as its best fit: a rule for
+    toddlers is right for the toddler search even if the same plan also
+    asked about adults.
+    """
+    if filters_by_sub_question is None:
+        return 1.0, {}
+    best: Optional[tuple] = None
+    for sq_id in sub_question_ids or [None]:
+        filters = filters_by_sub_question.get(sq_id) if sq_id else None
+        factor, detail = corpus_facets.fit(payload, filters)
+        age = age_fit(payload, filters)
+        if age != 1.0:
+            detail = {**detail, "age": "match" if age > 1.0 else "miss"}
+        unstated = unstated_fit(payload, filters)
+        if unstated != 1.0:
+            detail = {**detail, "group_only": "nobody named"}
+        factor *= age * unstated
+        if best is None or factor > best[0]:
+            best = (factor, detail)
+    return best or (1.0, {})
+
+
 def adjust_evidence(
     items: List[EvidenceItem],
     *,
@@ -312,9 +333,23 @@ def adjust_evidence(
     now_year: Optional[int] = None,
     user_context: Optional[QAUserContext] = None,
     question_facets: Optional[SubQuestionFilters] = None,
+    design_neutral_sub_questions: Optional[Set[str]] = None,
+    filters_by_sub_question: Optional[Dict[str, SubQuestionFilters]] = None,
 ) -> List[EvidenceItem]:
-    """Compute adjusted scores in place and drop audience-restricted items."""
+    """Compute adjusted scores in place and drop audience-restricted items.
+
+    Study design says how strong evidence of an EFFECT is; it says nothing
+    about "how much calcium is in oat milk", which product surveys answer and
+    trials do not. A source found only by such "quantity" searches
+    (``design_neutral_sub_questions``) gets no design weight either way.
+    """
     expert = is_expert_audience(expertise_level)
+    priors = str(config.settings.get("QA_RANKING_PRIORS_ENABLED", True)).lower() in {
+        "1", "true", "yes", "on",
+    }
+    priors_off = {
+        p.strip() for p in str(config.settings.get("QA_RANKING_PRIORS_OFF", "") or "").split(",") if p.strip()
+    }
     adjusted: List[EvidenceItem] = []
     for item in items:
         payload = item.payload
@@ -338,6 +373,29 @@ def adjust_evidence(
             influence = influence_factor(payload)
             design = study_design_factor(payload)
             affinity = 1.0
+            if (
+                design_neutral_sub_questions
+                and item.sub_question_ids
+                and set(item.sub_question_ids) <= design_neutral_sub_questions
+            ):
+                design = 1.0
+
+        # How the source's own tags and age fit what the search that found
+        # it was looking for (facets.py, audience.py).
+        fit, fit_detail = source_fit(
+            payload, item.sub_question_ids, filters_by_sub_question
+        )
+        if not priors:
+            # Ablation: fused relevance alone.
+            tier, recency, influence, design, affinity = 1.0, 1.0, 1.0, 1.0, 1.0
+            tier_label = ""
+        elif priors_off:
+            # Ablation: these multipliers only.
+            tier = 1.0 if "tier" in priors_off else tier
+            recency = 1.0 if "recency" in priors_off else recency
+            influence = 1.0 if "influence" in priors_off else influence
+            design = 1.0 if "design" in priors_off else design
+            affinity = 1.0 if "affinity" in priors_off else affinity
 
         item.score_parts = {
             "rrf_norm": round(item.rrf_norm, 6),
@@ -347,9 +405,11 @@ def adjust_evidence(
             "influence": round(influence, 4),
             "study_design": round(design, 4),
             "affinity": round(affinity, 4),
+            "fit": round(fit, 4),
+            **({"fit_detail": fit_detail} if fit_detail else {}),
         }
         item.adjusted_score = (
-            item.rrf_norm * tier * recency * influence * design * affinity
+            item.rrf_norm * tier * recency * influence * design * affinity * fit
         )
         payload["adjusted_score"] = item.adjusted_score
         payload["score_parts"] = item.score_parts
@@ -370,6 +430,9 @@ def select_evidence(
     """
     min_score = _setting("QA_MIN_SCORE", 0.05)
     per_doc_cap = max(int(_setting("QA_PER_DOC_CAP", 2)), 1)
+    # Evidence budgets; 0 keeps the request's top_k and the guideline default.
+    top_k = int(_setting("QA_ARTICLE_TOP_K", 0)) or top_k
+    guideline_top_k = int(_setting("QA_GUIDELINE_TOP_K", 0)) or QA_GUIDELINE_RAG_TOP_K_MAX
 
     below_threshold = 0
     over_doc_cap = 0
@@ -392,9 +455,9 @@ def select_evidence(
             articles.append(item)
 
     over_budget = max(len(articles) - top_k, 0) + max(
-        len(guidelines) - QA_GUIDELINE_RAG_TOP_K_MAX, 0
+        len(guidelines) - guideline_top_k, 0
     )
-    selected = articles[:top_k] + guidelines[:QA_GUIDELINE_RAG_TOP_K_MAX]
+    selected = articles[:top_k] + guidelines[:guideline_top_k]
     dropped = {
         "below_threshold": below_threshold,
         "over_doc_cap": over_doc_cap,

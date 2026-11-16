@@ -26,6 +26,9 @@ from models.qa import (
     SubQuestionFilters,
 )
 from services.article_policy import article_filter_query
+from services.qa_pipeline import facets as corpus_facets
+from services.qa_pipeline import guides as guide_context
+from services.qa_pipeline.audience import age_clauses
 from services.qa_pipeline.state import EvidenceItem
 from services.qa_retrievers import (
     GUIDELINE_SOURCE_EXCLUDES,
@@ -83,6 +86,25 @@ def _candidates() -> int:
         return max(int(config.settings.get("QA_RRF_CANDIDATES", 30)), 5)
     except (TypeError, ValueError):
         return 30
+
+
+def _knn_candidates(default: int) -> int:
+    """Hits from the vector leg: QA_KNN_CANDIDATES, or the lexical leg's count."""
+    try:
+        value = int(config.settings.get("QA_KNN_CANDIDATES", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else default
+
+
+def _legs() -> Tuple[bool, bool]:
+    """(lexical, vector): which legs QA_RETRIEVAL_LEGS runs."""
+    mode = str(config.settings.get("QA_RETRIEVAL_LEGS", "hybrid") or "hybrid").lower()
+    if mode == "lexical":
+        return True, False
+    if mode == "vector":
+        return False, True
+    return True, True
 
 
 def rrf_fuse(
@@ -196,6 +218,11 @@ def article_attribute_clauses(
                 }
             }
         )
+    # The article tags the plan named (study type, human evidence, who was
+    # studied, research area): boosts, and filters for its requirements.
+    hard, soft = corpus_facets.clauses(filters, "articles")
+    filter_clauses.extend(hard)
+    should_clauses.extend(soft)
     return filter_clauses, should_clauses
 
 
@@ -358,8 +385,15 @@ def search_guidelines_lexical(
         *guideline_context_should_clauses(user_context),
         *guideline_attribute_should_clauses(filters),
     ]
+    # The rule tags the plan named, as the index spells them, and the age
+    # window: boosts, plus filters for what the plan marked a requirement
+    # (added to the editorial gate, never replacing it).
+    hard, soft = _guideline_tag_clauses(filters)
+    context_should.extend(soft)
     if context_should:
         body["query"]["bool"]["should"] = context_should
+    if hard:
+        body["query"]["bool"]["filter"] = [*body["query"]["bool"]["filter"], *hard]
 
     response = ELASTIC_CLIENT.client.search(index="guidelines", body=body)
     leg = []
@@ -372,19 +406,33 @@ def search_guidelines_lexical(
     return leg
 
 
+def _guideline_tag_clauses(
+    filters: Optional[SubQuestionFilters],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    hard, soft = corpus_facets.clauses(filters, "guidelines")
+    age_hard, age_soft = age_clauses(filters)
+    return [*hard, *age_hard], [*soft, *age_soft]
+
+
 def search_guidelines_knn(
     vector: List[float],
     *,
     size: int,
+    filters: Optional[SubQuestionFilters] = None,
 ) -> List[Tuple[str, Dict[str, Any], RetrievedSource]]:
-    """Gated vector leg over guidelines; only used in hybrid guideline mode."""
+    """Gated vector leg over guidelines; only used in hybrid guideline mode.
+
+    The plan's requirements filter this leg too: nearest neighbours of a
+    question about adults are otherwise mostly rules for toddlers.
+    """
+    hard, _ = _guideline_tag_clauses(filters)
     raw_results = ELASTIC_CLIENT.knn_search(
         index_name="guidelines",
         query_vector=vector,
         k=size,
         num_candidates=max(size * 4, 100),
         field="embedding",
-        filter_query=guideline_retrieval_filter(),
+        filter_query=[*guideline_retrieval_filter(), *hard],
         source_excludes=GUIDELINE_SOURCE_EXCLUDES,
     )
     leg = []
@@ -410,34 +458,86 @@ def run_branch(
     """Run all legs of one (sub-question, branch) search and fuse them.
 
     A failed leg is recorded and skipped rather than failing the branch; a
-    failed branch is recorded and never fails the pipeline.
+    failed branch is recorded and never fails the pipeline. A requirement
+    (``filters.must``) that leaves almost nothing is relaxed to a preference
+    and the search run again: better a source for a neighbouring group, which
+    ranking and the grader then weigh, than an empty hand.
     """
-    size = _candidates()
     lexical_query = sub_question.lexical_query or sub_question.text
-    filters = sub_question.filters
+    filters = (
+        sub_question.filters
+        if str(config.settings.get("QA_SEARCH_FILTERS_ENABLED", True)).lower() in {"1", "true", "yes", "on"}
+        else None  # ablation: the query alone
+    )
+    legs, leg_status = _run_legs(
+        branch, lexical_query, vector, filters, user_context, expertise_level
+    )
+    items = rrf_fuse(legs)
+    relaxed: List[str] = []
+    if filters is not None and filters.must and len(items) < corpus_facets.RELAX_BELOW:
+        relaxed = list(filters.must)
+        legs, leg_status = _run_legs(
+            branch, lexical_query, vector,
+            filters.model_copy(update={"must": []}), user_context, expertise_level,
+        )
+        items = rrf_fuse(legs)
+    for item in items:
+        item.sub_question_ids = [sub_question.id]
+    if branch == "guidelines":
+        # A rule is read in its guide's context (guides.py): its guide's
+        # title and description, and its audience where the rule has none.
+        guide_context.attach(item.payload for item in items)
+
+    any_leg_ok = any(key in leg_status for key in ("lexical", "knn"))
+    status: Dict[str, Any] = {
+        "ok": any_leg_ok,
+        "hit_count": len(items),
+        "legs": leg_status,
+        "used_query": lexical_query,
+    }
+    if relaxed:
+        status["relaxed"] = relaxed
+    return BranchOutcome(
+        sub_question_id=sub_question.id, branch=branch, items=items, status=status
+    )
+
+
+def _run_legs(
+    branch: str,
+    lexical_query: str,
+    vector: Optional[List[float]],
+    filters: Optional[SubQuestionFilters],
+    user_context: Optional[QAUserContext],
+    expertise_level: Optional[str],
+) -> Tuple[List[List[Tuple[str, Dict[str, Any], RetrievedSource]]], Dict[str, Any]]:
+    size = _candidates()
+    knn_size = _knn_candidates(size)
+    # Ablation switch; production runs both legs.
+    run_lexical, run_vector = _legs()
     legs: List[List[Tuple[str, Dict[str, Any], RetrievedSource]]] = []
     leg_status: Dict[str, Any] = {}
 
     if branch == "articles":
-        try:
-            legs.append(
-                search_articles_lexical(
-                    lexical_query,
-                    size=size,
-                    expertise_level=expertise_level,
-                    filters=filters,
+        if run_lexical:
+            try:
+                legs.append(
+                    search_articles_lexical(
+                        lexical_query,
+                        size=size,
+                        expertise_level=expertise_level,
+                        filters=filters,
+                    )
                 )
-            )
-            leg_status["lexical"] = len(legs[-1])
-        except Exception as exc:
-            logger.error("Article BM25 leg failed: %s", exc, exc_info=True)
-            leg_status["lexical_error"] = repr(exc)
-        if vector is not None:
+                leg_status["lexical"] = len(legs[-1])
+            except Exception as exc:
+                logger.error("Article BM25 leg failed: %s", exc, exc_info=True)
+                leg_status["lexical_error"] = repr(exc)
+        if vector is not None and run_vector:
             try:
                 legs.append(
                     search_articles_knn(
                         vector,
-                        size=size,
+                        size=knn_size,
                         expertise_level=expertise_level,
                         filters=filters,
                     )
@@ -447,22 +547,27 @@ def run_branch(
                 logger.error("Article kNN leg failed: %s", exc, exc_info=True)
                 leg_status["knn_error"] = repr(exc)
     elif branch == "guidelines":
-        try:
-            legs.append(
-                search_guidelines_lexical(
-                    lexical_query,
-                    size=size,
-                    user_context=user_context,
-                    filters=filters,
-                )
-            )
-            leg_status["lexical"] = len(legs[-1])
-        except Exception as exc:
-            logger.error("Guideline BM25 leg failed: %s", exc, exc_info=True)
-            leg_status["lexical_error"] = repr(exc)
-        if vector is not None and guideline_hybrid_enabled():
+        if run_lexical:
             try:
-                legs.append(search_guidelines_knn(vector, size=size))
+                legs.append(
+                    search_guidelines_lexical(
+                        lexical_query,
+                        size=size,
+                        user_context=user_context,
+                        filters=filters,
+                    )
+                )
+                leg_status["lexical"] = len(legs[-1])
+            except Exception as exc:
+                logger.error("Guideline BM25 leg failed: %s", exc, exc_info=True)
+                leg_status["lexical_error"] = repr(exc)
+        # Vector-only runs the guideline vector leg even when hybrid guideline
+        # retrieval is off: otherwise the branch would search nothing.
+        if vector is not None and run_vector and (
+            guideline_hybrid_enabled() or not run_lexical
+        ):
+            try:
+                legs.append(search_guidelines_knn(vector, size=knn_size, filters=filters))
                 leg_status["knn"] = len(legs[-1])
             except Exception as exc:
                 # Same degradation contract as the legacy adapter: a broken
@@ -473,23 +578,7 @@ def run_branch(
                 leg_status["knn_error"] = repr(exc)
     else:  # pragma: no cover - orchestrator only dispatches known branches
         raise ValueError(f"Unknown branch: {branch}")
-
-    items = rrf_fuse(legs)
-    for item in items:
-        item.sub_question_ids = [sub_question.id]
-
-    any_leg_ok = any(key in leg_status for key in ("lexical", "knn"))
-    return BranchOutcome(
-        sub_question_id=sub_question.id,
-        branch=branch,
-        items=items,
-        status={
-            "ok": any_leg_ok,
-            "hit_count": len(items),
-            "legs": leg_status,
-            "used_query": lexical_query,
-        },
-    )
+    return legs, leg_status
 
 
 def merge_evidence(

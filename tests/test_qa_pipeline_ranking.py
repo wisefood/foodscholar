@@ -329,23 +329,17 @@ class GuidelineAffinityTests(unittest.TestCase):
         )
         self.assertAlmostEqual(factor, 1.15, places=6)
 
-    def test_age_group_matches_life_stage_facet(self):
-        from models.qa import QAUserContext
-
-        factor = self._affinity(
-            {"life_stage": ["early_childhood"]},
-            user_context=QAUserContext(member_age_group="toddler"),
-        )
-        self.assertAlmostEqual(factor, 1.15, places=6)
-
-    def test_question_population_matches_target_populations(self):
+    def test_population_is_scored_by_source_fit_not_affinity(self):
+        # Who a rule is for is a tag match now (facets.py): exact slugs, a
+        # boost for a match and a demotion for a rule written for others.
         from models.qa import SubQuestionFilters
 
-        factor = self._affinity(
-            {"target_populations": ["pregnant_people"]},
-            facets=SubQuestionFilters(target_populations=["pregnancy"]),
-        )
-        self.assertAlmostEqual(factor, 1.15, places=6)
+        wants = SubQuestionFilters(facets={"life_stage": ["pregnancy"]}, must=["life_stage"])
+        rule = {"source_type": "guideline", "life_stage": ["pregnancy"]}
+        other = {"source_type": "guideline", "life_stage": ["early_childhood"]}
+        self.assertGreater(ranking.source_fit(rule, ["sq1"], {"sq1": wants})[0], 1.0)
+        self.assertLess(ranking.source_fit(other, ["sq1"], {"sq1": wants})[0], 0.5)
+        self.assertEqual(self._affinity(rule), 1.0)
 
     def test_topical_overlap_boosts(self):
         from models.qa import SubQuestionFilters
@@ -368,7 +362,7 @@ class GuidelineAffinityTests(unittest.TestCase):
             user_context=QAUserContext(country="EU", member_age_group="adult"),
             facets=SubQuestionFilters(food_groups=["vegetables"]),
         )
-        self.assertAlmostEqual(factor, 1.15 * 1.15 * 1.1, places=6)
+        self.assertAlmostEqual(factor, 1.15 * 1.1, places=6)
         self.assertLess(factor, 1.5)
 
     def test_affinity_lands_in_score_parts(self):

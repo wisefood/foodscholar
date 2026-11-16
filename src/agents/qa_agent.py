@@ -269,6 +269,14 @@ def _format_citation_counts(article: Dict[str, Any]) -> str:
     return str(citations)
 
 
+def _guide_line(source: Dict[str, Any]) -> str:
+    """The guide a rule comes from, in its own words: a rule that says
+    nothing about age may sit in "a guide for children aged 1-4"."""
+    title = str(source.get("guide_title") or "").strip()
+    description = " ".join(str(source.get("guide_description") or "").split())
+    return " — ".join(part for part in (title, description) if part)
+
+
 def prepare_source_context(
     articles: List[Dict[str, Any]],
     retriever: str = "rag",
@@ -294,6 +302,7 @@ def prepare_source_context(
 - Retriever: {article.get('retriever', retriever)}
 - URN: {article.get('urn', article.get('id', article.get('_id', 'N/A')))}
 - Guide URN: {article.get('guide_urn', 'N/A')}
+- Guide: {_guide_line(article) or 'N/A'}
 - Region: {article.get('guide_region', 'N/A')}
 - Food Groups: {food_groups or 'N/A'}
 - Target Populations: {target_populations or 'N/A'}
@@ -541,10 +550,11 @@ def repair_citation_links(
     reported it as "endpointsChooi et al." — the link is correct, it is simply
     welded to the previous word.
     """
-    if not text or not sources:
+    if not text:
         return text or ""
+    label_links: Dict[str, str] = {}
     g_counter = 1
-    for source in sources:
+    for source in sources or []:
         g_label = None
         if is_guideline_source(source):
             g_label = f"G{g_counter}"
@@ -558,12 +568,47 @@ def repair_citation_links(
             continue
         base = "/guidelines/" if is_guideline_source(source) else "/articles/"
         label = _inline_citation_label(source, g_label)
+        label_links.setdefault(label.lower(), f"{base}{source_ids[0]}")
         for source_id in dict.fromkeys(source_ids):
+            # A bracketed id used as a link's URL, "[G679]([urn])": becomes
+            # the URL itself. Rewriting it as a whole link would nest a link
+            # inside a link, which renders as "[G679[" with nothing to click.
+            target = re.compile(
+                r"\]\(\s*[【\[]\s*" + re.escape(source_id) + r"\s*[】\]]?\s*\)"
+            )
+            text = target.sub(f"]({base}{source_id})", text)
             pattern = re.compile(
-                r"[【\[]\s*" + re.escape(source_id) + r"\s*[】\]]?(?!\()"
+                r"(?<!\]\()[【\[]\s*" + re.escape(source_id) + r"\s*[】\]]?(?!\()"
             )
             text = pattern.sub(f"[{label}]({base}{source_id})", text)
-    return separate_citations_from_text(text)
+    return separate_citations_from_text(_repair_lenticular_brackets(text, label_links))
+
+
+#: 【label】: the citation brackets gpt-oss writes by habit.
+_LENTICULAR = re.compile(r"【\s*([^【】\n]{1,120}?)\s*】(\()?")
+
+
+def _repair_lenticular_brackets(text: str, label_links: Dict[str, str]) -> str:
+    """Turn 【label】 citations into markdown.
+
+    Live: "…not equivalent to dairy milk【Johnson et al. (2024)】." The page
+    turned 【 into "[" and dropped 】, so readers saw "[Johnson et al. (2024)."
+    with nothing to click, and "【general knowledge】" escaped its badge.
+    A label that names a retrieved source becomes its link; one followed by a
+    URL becomes that link; the general-knowledge tag and anything else keep
+    square brackets.
+    """
+
+    def replace(match: "re.Match[str]") -> str:
+        label, link_follows = match.group(1).strip(), match.group(2)
+        if link_follows:
+            return f"[{label}]("
+        if label.lower() == "general knowledge":
+            return "[general knowledge]"
+        link = label_links.get(label.lower())
+        return f"[{label}]({link})" if link else f"[{label}]"
+
+    return _LENTICULAR.sub(replace, text)
 
 
 #: A citation link opening immediately after a word character or a closing

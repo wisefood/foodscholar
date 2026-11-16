@@ -181,6 +181,26 @@ class SubQuestionFilters(BaseModel):
         default_factory=list,
         description="Health conditions the question concerns, e.g. 'diabetes'",
     )
+    facets: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Tags the sources must or should carry, as the index spells them: "
+            "field -> wanted values (services/qa_pipeline/facets.py)"
+        ),
+    )
+    must: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Facet fields (or 'age') that are requirements: a source tagged "
+            "with something else is wrong for this search, not merely less good"
+        ),
+    )
+    age_min_months: Optional[int] = Field(
+        default=None, description="Youngest age the search is about, in months"
+    )
+    age_max_months: Optional[int] = Field(
+        default=None, description="Oldest age the search is about, in months"
+    )
 
     def is_empty(self) -> bool:
         return not any(
@@ -194,6 +214,9 @@ class SubQuestionFilters(BaseModel):
                 self.food_groups,
                 self.nutrients,
                 self.health_conditions,
+                self.facets,
+                self.age_min_months is not None,
+                self.age_max_months is not None,
             ]
         )
 
@@ -404,6 +427,15 @@ class QARequest(BaseModel):
             "the same qa_thread_id keep their context. For benchmark re-runs."
         ),
     )
+    ablation: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Ablation studies only: pipeline settings to answer this request "
+            "with, e.g. {\"QA_PLANNER_ENABLED\": false}. Refused unless the "
+            "deployment sets QA_ABLATION_ENABLED; GET /qa/runtime-info lists "
+            "the allowed settings."
+        ),
+    )
     retriever: Literal["rag", "no_rag", "kggen"] = Field(
         default="rag",
         description=(
@@ -423,6 +455,31 @@ class QARequest(BaseModel):
     clarification_response: Optional[ClarificationAnswer] = Field(
         default=None,
         description="Structured answer to a clarification request.",
+    )
+    intent: Literal["answer", "claim_check"] = Field(
+        default="answer",
+        description=(
+            "'answer' (default) answers the question. 'claim_check' treats "
+            "`question` as a claim the reader heard, in their own words: the "
+            "answer explains what the evidence says about it, and the response "
+            "carries a structured `claim_verdict`."
+        ),
+    )
+
+
+ClaimVerdictValue = Literal["supported", "partly", "not_supported", "unclear"]
+
+
+class ClaimVerdict(BaseModel):
+    """What the evidence says about a checked claim (intent='claim_check')."""
+
+    verdict: ClaimVerdictValue = Field(
+        description=(
+            "'supported' (evidence broadly backs the claim), 'partly' (true "
+            "only in part, or for some people or amounts), 'not_supported' "
+            "(evidence contradicts it), 'unclear' (sources do not allow a "
+            "judgement)"
+        ),
     )
 
 
@@ -698,6 +755,14 @@ class QAResponse(BaseModel):
             "so the UI can show the user what FoodScholar remembers."
         ),
     )
+    claim_verdict: Optional[ClaimVerdict] = Field(
+        default=None,
+        description=(
+            "Set only for intent='claim_check': the verdict on the claim, read "
+            "from the answer's machine-readable trailer. Null when the request "
+            "was an ordinary question or the model gave no usable verdict."
+        ),
+    )
 
 
 class ConversationContext(BaseModel):
@@ -727,6 +792,13 @@ class MemorySuggestion(BaseModel):
     ] = Field(description="What profile field an acceptance writes to")
     value: str = Field(description="Canonical lowercase item / goal slug / pattern")
     statement: str = Field(description="The nudge question shown to the user")
+    contradicts: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "What the profile holds that this would replace (e.g. 'omnivore' "
+            "for 'vegetarian'); shown so the asker knows the profile changes"
+        ),
+    )
     source_text: Optional[str] = Field(
         default=None,
         description=(
@@ -937,6 +1009,13 @@ class QARuntimeInfo(BaseModel):
     answer_cache_enabled: bool = Field(
         description="Whether answers are cached at all on this deployment"
     )
+    ablation: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Whether requests may carry 'ablation' here, and every setting "
+            "they may override with its default"
+        ),
+    )
     generated_at: str = Field(description="ISO timestamp of this snapshot")
 
 
@@ -985,6 +1064,17 @@ class TipEvidence(BaseModel):
     region: Optional[str] = Field(
         default=None, description="Guide region, used to build the guide path"
     )
+    age_min_months: Optional[int] = Field(
+        default=None,
+        description=(
+            "Start of the age window the rule is written for, in months. Set "
+            "only when the rule names an age group (children, older adults)."
+        ),
+    )
+    age_max_months: Optional[int] = Field(
+        default=None,
+        description="End of that age window, in months (open-ended when null)",
+    )
 
 
 class TipWithEvidence(BaseModel):
@@ -994,6 +1084,37 @@ class TipWithEvidence(BaseModel):
     evidence: Optional[TipEvidence] = Field(
         default=None,
         description="Evidence used to create the item; omitted for fallbacks",
+    )
+
+
+class QuizItem(BaseModel):
+    """One multiple-choice question of the daily quiz, with its source."""
+
+    id: str = Field(description="Stable id of the question (hash of its text)")
+    question: str = Field(description="The question, in the requested language")
+    options: List[str] = Field(description="3 or 4 answer options")
+    answer: int = Field(description="Index of the correct option in `options`")
+    why: str = Field(
+        description="One or two plain sentences on why that answer is right"
+    )
+    evidence: Optional[TipEvidence] = Field(
+        default=None,
+        description="Source the question was written from (same shape as tips)",
+    )
+
+
+class DailyQuizResponse(BaseModel):
+    """Response model for the daily quiz (GET /qa/quiz)."""
+
+    questions: List[QuizItem] = Field(
+        default_factory=list,
+        description="Grounded multiple-choice questions; empty if none were valid",
+    )
+    generated_at: Optional[str] = Field(
+        default=None, description="ISO timestamp when the quiz was generated"
+    )
+    cache_hit: bool = Field(
+        default=False, description="Whether this result came from cache"
     )
 
 

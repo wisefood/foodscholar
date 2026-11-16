@@ -35,6 +35,8 @@ from models.qa import (
     QAFeedbackResponse,
     SimpleNutriQuestionsResponse,
     TipsOfTheDayResponse,
+    DailyQuizResponse,
+    QuizItem,
     QARuntimeInfo,
     AVAILABLE_GROQ_MODELS,
     DEFAULT_GROQ_MODEL,
@@ -50,7 +52,24 @@ from backend.prompts import (
     QA_TIPS_FROM_ARTICLES,
     QA_TIP_REWRITE,
     QA_CONVERSATION_SUMMARY,
+    QA_DAILY_QUIZ,
     served_prompt_versions,
+)
+from services.daily_quiz import (
+    QUIZ_COUNT_DEFAULT,
+    build_quiz_source_context,
+    clamp_quiz_count,
+    validate_quiz_items,
+)
+from services.learn_sources import (
+    APPLIES_TO_NOTE,
+    balanced_order,
+    blend,
+    dedupe,
+    guideline_age_window,
+    guideline_applies_to,
+    read_recent_sources,
+    remember_sources,
 )
 
 
@@ -98,6 +117,12 @@ QA_CONVERSATION_VERBATIM_TURNS = 2
 QA_CONVERSATION_TURN_ANSWER_CHARS = 1500
 TTL_SIMPLE_NUTRI_QUESTIONS = 1800  # 30 minutes
 TTL_TIPS_OF_THE_DAY = 1800  # 30 minutes
+# The daily quiz key carries the UTC day, so a new day is a new key; the TTL
+# only bounds how long a day's entry lingers.
+TTL_DAILY_QUIZ = 86400
+QUIZ_SOURCE_POOL_SIZE = 16
+QUIZ_SOURCE_LIMIT = 10
+MAX_QUIZ_GEN_ATTEMPTS = 2
 TIP_GROUNDING_TOP_K = 3
 TIP_SOURCE_ARTICLE_POOL_SIZE = 10
 TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS = 40
@@ -387,7 +412,10 @@ class QAService:
             "type": "tips_of_the_day",
             # v7: items are generated in `language`, so a v6 entry holds
             # English text under a key that no longer implies English.
-            "version": 7,
+            # v8: rules carry who they are for, and the pool is balanced
+            # across guides and journals; a v7 entry may state a group's
+            # amount as everyone's.
+            "version": 8,
             "tips_count": tips_count,
             "did_you_know_count": did_you_know_count,
             # Part of the key, not just the prompt: the cache is shared across
@@ -502,6 +530,308 @@ class QAService:
 
         return response
 
+    def get_daily_quiz(
+        self,
+        member_id: Optional[str] = None,
+        language: str = "en",
+        count: int = QUIZ_COUNT_DEFAULT,
+    ) -> DailyQuizResponse:
+        """A few grounded multiple-choice questions, the same all day.
+
+        Sources are sampled the way the tips of the day are (guideline rules
+        first, articles to top up), biased toward a member's topics when the
+        profile has some, and never mentioning their allergens or dislikes.
+        Cached per UTC day, language, count and member fingerprint. Unlike
+        tips, Redis is a convenience here: without it the quiz is generated
+        per request. When nothing valid comes back the list is empty, not an
+        error, so the reader's page can fall back to its own questions.
+        """
+        count = clamp_quiz_count(count)
+        language = (language or "en").strip().lower() or "en"
+        member_context = self._tip_member_context(member_id)
+        cache_data: Dict[str, Any] = {
+            "type": "daily_quiz",
+            # v2: questions name the group a rule is for (a v1 entry asked
+            # about a 1-4 year old's portion as if it were everyone's).
+            "version": 2,
+            "day": datetime.now(timezone.utc).strftime("%Y%m%d"),
+            "count": count,
+            "language": language,
+        }
+        if member_context:
+            cache_data["member_topics"] = member_context["topics"]
+            cache_data["member_avoid"] = member_context["avoid"]
+        cache_key = self.cache_manager.generate_cache_key(prefix="qa", data=cache_data)
+
+        try:
+            cached = self.simple_question_redis.get(cache_key)
+            if cached:
+                payload = json.loads(cached) if isinstance(cached, (str, bytes)) else cached
+                payload["cache_hit"] = True
+                return DailyQuizResponse(**payload)
+        except Exception as e:
+            logger.warning("Daily quiz cache read failed for %s: %s", cache_key, e)
+
+        questions = self._generate_daily_quiz(
+            count=count, member_context=member_context, language=language
+        )
+        response = DailyQuizResponse(
+            questions=[QuizItem(**q) for q in questions],
+            generated_at=datetime.now().isoformat(),
+            cache_hit=False,
+        )
+        if response.questions:
+            # Today's sources go to the back of the queue for two weeks.
+            self._learn_remember(
+                "quiz", [q.evidence.urn for q in response.questions if q.evidence]
+            )
+            # An empty quiz is not cached: the next request tries again.
+            try:
+                self.simple_question_redis.setex(
+                    cache_key, TTL_DAILY_QUIZ, json.dumps(response.model_dump())
+                )
+            except Exception as e:
+                logger.warning("Daily quiz cache write failed for %s: %s", cache_key, e)
+        return response
+
+    def _generate_daily_quiz(
+        self,
+        *,
+        count: int,
+        member_context: Optional[Dict[str, List[str]]] = None,
+        language: str = "en",
+    ) -> List[Dict[str, Any]]:
+        """Best of a couple of attempts, each from a different source pool."""
+        best: List[Dict[str, Any]] = []
+        for attempt in range(1, MAX_QUIZ_GEN_ATTEMPTS + 1):
+            try:
+                items = self._generate_daily_quiz_once(
+                    count=count,
+                    member_context=member_context,
+                    language=language,
+                    seed_offset=attempt,
+                )
+            except Exception as e:
+                logger.error(
+                    "Daily quiz attempt %d/%d failed: %s",
+                    attempt,
+                    MAX_QUIZ_GEN_ATTEMPTS,
+                    e,
+                    exc_info=True,
+                )
+                continue
+            if len(items) > len(best):
+                best = items
+            if len(best) >= count:
+                break
+        return best[:count]
+
+    def _quiz_sources(
+        self,
+        *,
+        count: int,
+        seed: int,
+        member_topics: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Numbered sources for the quiz prompt: rules and studies, blended.
+
+        Rules come guide by guide, studies journal by journal, and whatever
+        was shown on recent days goes last (see services.learn_sources). Each
+        rule carries its guide's title and who it applies to.
+        """
+        pool_size = max(QUIZ_SOURCE_POOL_SIZE, count * 4)
+        recent = self._learn_recent("quiz")
+        query = (
+            " ".join(member_topics)
+            if member_topics
+            else self._tip_source_query(seed, branch="guidelines")
+        )
+        guidelines = self._learn_guideline_pool(
+            size=pool_size, seed=seed, query=query, recent=recent
+        )
+        titles = self._guide_titles(guidelines)
+        rule_sources: List[Dict[str, Any]] = []
+        for guideline in guidelines:
+            rule_text = self._extract_guideline_rule_text(guideline)
+            if not rule_text:
+                continue
+            rule_sources.append(
+                {
+                    "text": rule_text,
+                    "guide": titles.get(guideline.get("guide_urn") or "", ""),
+                    "applies_to": guideline_applies_to(guideline),
+                    "evidence": {
+                        # The guideline's own id, as the tips use: it resolves
+                        # to the exact guide page the rule came from.
+                        "urn": self._guideline_document_urn(guideline),
+                        "passage": self._extract_guideline_passage(guideline),
+                        "title": guideline.get("title", None),
+                        "publication_year": self._guideline_publication_year(guideline),
+                        **self._guideline_link_hints(guideline),
+                    },
+                }
+            )
+
+        study_sources: List[Dict[str, Any]] = []
+        for article in self._learn_article_pool(
+            size=pool_size,
+            seed=seed,
+            query=self._tip_source_query(seed, branch="articles"),
+            recent=recent,
+        ):
+            abstract = " ".join(
+                str(article.get("abstract") or article.get("description") or "").split()
+            )
+            urn = str(article.get("urn", article.get("_id", "")) or "").strip()
+            if not urn or len(abstract) < TIP_SOURCE_ARTICLE_MIN_ABSTRACT_CHARS:
+                continue
+            year = article.get("publication_year")
+            study_sources.append(
+                {
+                    "text": abstract,
+                    "evidence": {
+                        "urn": urn,
+                        "passage": abstract[:_TIP_PASSAGE_MAX_CHARS].strip(),
+                        "title": article.get("title", None),
+                        "publication_year": str(year) if year else None,
+                        "source_type": "article",
+                    },
+                }
+            )
+        # Two rules, then a study: studies take part every day.
+        return blend(rule_sources, study_sources, run=2)[:QUIZ_SOURCE_LIMIT]
+
+    # ── Learn source pools (quiz + tips): balanced, broad, not repeating ──
+
+    @staticmethod
+    def _learn_today() -> int:
+        return datetime.now(timezone.utc).date().toordinal()
+
+    def _learn_redis(self):
+        try:
+            return self.simple_question_redis
+        except Exception:
+            return None
+
+    def _learn_recent(self, kind: str) -> Set[str]:
+        """Sources of this kind shown in the last two weeks."""
+        return read_recent_sources(self._learn_redis(), kind, self._learn_today())
+
+    def _learn_remember(self, kind: str, urns: List[Optional[str]]) -> None:
+        remember_sources(self._learn_redis(), kind, urns, self._learn_today())
+
+    def _learn_guideline_pool(
+        self, *, size: int, seed: int, query: Optional[str], recent: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """Rules for the day: half on topic, half from the whole catalogue.
+
+        Unseen first, then one guide at a time in turn, so neither a narrow
+        profile nor one large guide decides what everyone sees every day.
+        """
+        topical = (
+            self._get_random_tip_source_guidelines(size=size, seed=seed, query=query)
+            if query
+            else []
+        )
+        broad = self._get_random_tip_source_guidelines(
+            size=size, seed=seed + 7919, query=None
+        )
+        pool = dedupe(blend(topical or [], broad or [], run=1), key=self._guideline_document_urn)
+        return balanced_order(
+            pool,
+            key=self._guideline_document_urn,
+            group=lambda g: g.get("guide_urn"),
+            recent=recent,
+            limit=size,
+        )
+
+    def _learn_article_pool(
+        self, *, size: int, seed: int, query: Optional[str], recent: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """Studies for the day, the same way: on topic and broad, unseen first,
+        one journal at a time in turn."""
+
+        def urn(article: Dict[str, Any]) -> str:
+            return str(article.get("urn", article.get("_id", "")) or "").strip()
+
+        topical = (
+            self._get_random_tip_source_articles(size=size, seed=seed, query=query)
+            if query
+            else []
+        )
+        broad = self._get_random_tip_source_articles(
+            size=size, seed=seed + 7919, query=None
+        )
+        pool = dedupe(blend(topical or [], broad or [], run=1), key=urn)
+        return balanced_order(
+            pool,
+            key=urn,
+            group=lambda a: str(a.get("venue") or a.get("journal") or "").strip().lower(),
+            recent=recent,
+            limit=size,
+        )
+
+    def _guide_titles(self, guidelines: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Guide titles by guide urn ("Eating guidelines for 1-4 year olds"):
+        often the only place a rule's population is written down."""
+        cache: Dict[str, str] = self.__dict__.setdefault("_guide_title_cache", {})
+        titles: Dict[str, str] = {}
+        for guideline in guidelines:
+            guide_urn = guideline.get("guide_urn")
+            if not isinstance(guide_urn, str) or not guide_urn or guide_urn in titles:
+                continue
+            if guide_urn not in cache:
+                try:
+                    guide = ELASTIC_CLIENT.get_entity("guides", guide_urn) or {}
+                except Exception:
+                    continue  # not cached: the next pool tries again
+                cache[guide_urn] = " ".join(str(guide.get("title") or "").split())
+            titles[guide_urn] = cache[guide_urn]
+        return titles
+
+    def _generate_daily_quiz_once(
+        self,
+        *,
+        count: int,
+        member_context: Optional[Dict[str, List[str]]] = None,
+        language: str = "en",
+        seed_offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """One generation pass: sample sources, ask the model, validate."""
+        # A daily seed, offset from the tips' so the quiz is not the tips
+        # restated: stable within a day, different the next.
+        seed = int(datetime.now(timezone.utc).strftime("%Y%m%d")) + 101 + int(seed_offset or 0)
+        member_topics = (member_context or {}).get("topics") or []
+        avoid_terms = (member_context or {}).get("avoid") or []
+        sources = self._quiz_sources(count=count, seed=seed, member_topics=member_topics)
+        if not sources:
+            logger.warning("Daily quiz: no sources available.")
+            return []
+
+        prompt = QA_DAILY_QUIZ.compile(
+            count=count,
+            language=language,
+            source_context=build_quiz_source_context(sources),
+        )
+        response = self.simple_question_llm.invoke(
+            prompt,
+            config=build_trace_config(
+                run_name="qa-daily-quiz",
+                tags=["qa", "generated-content", "quiz"],
+            ),
+        )
+        parsed = self._parse_tip_candidates_json(response.content)
+        items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        return validate_quiz_items(
+            items,
+            sources,
+            count=count,
+            is_unsafe=lambda text: bool(
+                self._violates_tip_safety_policy(text) or self._mentions_animal_testing(text)
+            ),
+            avoid_terms=avoid_terms,
+        )
+
     def _parse_iso_datetime(self, value: str) -> datetime:
         dt = datetime.fromisoformat(value)
         if dt.tzinfo is None:
@@ -572,6 +902,7 @@ class QAService:
 
     def runtime_info(self) -> QARuntimeInfo:
         """Everything that changes answers without a code change, as of now."""
+        from services.qa_pipeline.ablation import catalog as ablation_catalog
         from services.qa_pipeline.ranking import ranking_config
 
         settings = config.settings
@@ -580,6 +911,13 @@ class QAService:
             "QA_MAX_REPAIR_ROUNDS",
             "QA_GUIDELINE_RETRIEVAL_MODE",
             "QA_GUIDELINE_KNN_BOOST",
+            "QA_PLANNER_ENABLED",
+            "QA_GAP_RECHECK_ENABLED",
+            "QA_CLARIFY_ENABLED",
+            "QA_USER_CONTEXT_ENABLED",
+            "QA_RETRIEVAL_LEGS",
+            "QA_KNN_CANDIDATES",
+            "QA_RANKING_PRIORS_ENABLED",
         ] + sorted(k for k in settings if k.startswith("KG_RETRIEVAL_"))
         return QARuntimeInfo(
             git_commit=str(settings.get("GIT_COMMIT") or "unknown"),
@@ -598,6 +936,7 @@ class QAService:
             ranking=ranking_config(),
             retrieval={k: settings.get(k) for k in retrieval_keys},
             answer_cache_enabled=bool(self.cache_manager.enabled),
+            ablation=ablation_catalog(),
             generated_at=datetime.now(timezone.utc).isoformat(),
         )
 
@@ -612,22 +951,46 @@ class QAService:
         its exact contract. ``QA_PIPELINE_MODE=legacy`` restores the previous
         single-pass flow.
         """
-        if str(config.settings.get("QA_PIPELINE_MODE", "agentic")).lower() == "legacy":
-            return await self._answer_question_legacy(request)
+        from services.qa_pipeline import ablation
 
-        final: Optional[QAResponse] = None
-        async for event in self.run_pipeline(request):
-            if event.name in ("done", "clarification"):
-                payload = {k: v for k, v in event.data.items() if k != "seq"}
-                final = QAResponse(**payload)
-        if final is None:  # pragma: no cover - the pipeline always terminates
-            raise RuntimeError("QA pipeline produced no terminal event")
-        return final
+        # An ablation request is answered with its settings on top of the
+        # deployment's, for this request only (refused unless enabled).
+        with ablation.active(self._ablation_overlay(request)):
+            if str(config.settings.get("QA_PIPELINE_MODE", "agentic")).lower() == "legacy":
+                return await self._answer_question_legacy(request)
+
+            final: Optional[QAResponse] = None
+            async for event in self.run_pipeline(request):
+                if event.name in ("done", "clarification"):
+                    payload = {k: v for k, v in event.data.items() if k != "seq"}
+                    final = QAResponse(**payload)
+            if final is None:  # pragma: no cover - the pipeline always terminates
+                raise RuntimeError("QA pipeline produced no terminal event")
+            return final
+
+    def _ablation_overlay(self, request: QARequest) -> Dict[str, Any]:
+        """The request's ablation settings, typed; InvalidError when refused."""
+        from services.qa_pipeline import ablation
+
+        try:
+            return ablation.validate(getattr(request, "ablation", None))
+        except ablation.AblationError as exc:
+            raise InvalidError(detail=str(exc), extra={"field": "ablation"}) from None
+
+    async def _ablated_pipeline(self, request: QARequest):
+        from services.qa_pipeline import ablation
+        from services.qa_pipeline.orchestrator import run_pipeline
+
+        with ablation.active(self._ablation_overlay(request)):
+            async for event in run_pipeline(self, request):
+                yield event
 
     def run_pipeline(self, request: QARequest):
         """The agentic pipeline as an async generator of PipelineEvents."""
         from services.qa_pipeline.orchestrator import run_pipeline
 
+        if getattr(request, "ablation", None):
+            return self._ablated_pipeline(request)
         return run_pipeline(self, request)
 
     async def _answer_question_legacy(self, request: QARequest) -> QAResponse:
@@ -2064,13 +2427,24 @@ class QAService:
                     did_you_know_count=did_you_know_count,
                 ):
                     # Final normalize can fill (should be no-op when complete).
-                    return self._normalize_tips_payload(
+                    final = self._normalize_tips_payload(
                         payload,
                         tips_count=tips_count,
                         did_you_know_count=did_you_know_count,
                         fill_with_fallback=True,
                         language=language,
                     )
+                    # Today's sources go to the back of the queue for two weeks.
+                    self._learn_remember(
+                        "tips",
+                        [
+                            (item.get("evidence") or {}).get("urn")
+                            for key in ("did_you_know_detail", "tips_detail")
+                            for item in (final.get(key) or [])
+                            if isinstance(item, dict)
+                        ],
+                    )
+                    return final
 
                 logger.warning(
                     "Tips payload failed guardrails; regenerating (%d/%d).",
@@ -2126,16 +2500,46 @@ class QAService:
             if member_topics
             else self._tip_source_query(daily_seed, branch="guidelines")
         )
-        source_guidelines = self._get_random_tip_source_guidelines(
+        # Balanced, broad and fresh-first: see services.learn_sources.
+        recent = self._learn_recent("tips")
+        source_guidelines = self._learn_guideline_pool(
             size=max(TIP_SOURCE_GUIDELINE_POOL_SIZE, candidate_count),
             seed=daily_seed,
             query=guideline_query,
+            recent=recent,
         )
         candidates = self._generate_tip_candidates_from_guidelines(
             guidelines=source_guidelines,
             candidate_count=candidate_count,
             language=language,
         )
+        # Studies take part every day, not only when the rules run dry: about
+        # a third of the candidates, from a pool spread across journals.
+        study_pool = self._learn_article_pool(
+            size=TIP_SOURCE_ARTICLE_POOL_SIZE,
+            seed=daily_seed,
+            query=self._tip_source_query(daily_seed, branch="articles"),
+            recent=recent,
+        )
+        if study_pool and candidates:
+            try:
+                study_candidates = self._generate_tip_candidates_from_articles(
+                    articles=study_pool,
+                    candidate_count=max(candidate_count // 3, 2),
+                    language=language,
+                )
+            except Exception:
+                logger.exception("Study-based tip candidates failed; rules only today.")
+                study_candidates = []
+            # A study reports a finding, it does not advise: from studies only
+            # "did you know" facts, never a "try this" (a single trial on
+            # infant formula is not a tip for every parent). Advice comes from
+            # the guidelines.
+            study_candidates = [
+                c for c in study_candidates
+                if isinstance(c, dict) and str(c.get("kind", "")).lower() == "did_you_know"
+            ]
+            candidates = blend(candidates, study_candidates, run=2)
         if member_topics and len(candidates) < total_count:
             # Lexical guideline matching runs dry on niche profile topics
             # ("pastitsio", "fakes") — top up SEMANTICALLY: kNN over the
@@ -2234,6 +2638,9 @@ class QAService:
                     "guide_urn": item.get("guide_urn") or None,
                     "page_no": item.get("page_no") or None,
                     "region": item.get("region") or None,
+                    # Who the rule is for, when it names an age group.
+                    "age_min_months": item.get("age_min_months"),
+                    "age_max_months": item.get("age_max_months"),
                 },
             }
 
@@ -2337,11 +2744,16 @@ class QAService:
             if isinstance(ref, dict) and ref.get("page_start")
         ]
         page_no = guideline.get("page_no") or (pages[0] if pages else None)
+        # And who it is for: the age window, only when the rule names a group
+        # (a toddler portion must not read as everyone's).
+        age_min, age_max = guideline_age_window(guideline)
         return {
             "source_type": "guideline",
             "guide_urn": guideline.get("guide_urn") or None,
             "page_no": int(page_no) if isinstance(page_no, int) else None,
             "region": guideline.get("guide_region") or None,
+            "age_min_months": age_min,
+            "age_max_months": age_max,
         }
 
     def _generate_tip_candidates_from_guidelines(
@@ -2446,8 +2858,14 @@ class QAService:
     def _prepare_tip_guideline_context(
         self, guidelines: List[Dict[str, Any]]
     ) -> str:
-        """Prepare compact guideline rule context for tip generation."""
-        snippets = []
+        """Prepare compact guideline rule context for tip generation.
+
+        Each rule carries its guide's title and who it applies to, behind a
+        note that a tip must name that group: rules are often written for one
+        group ("Eating guidelines for 1-4 year olds") without saying so.
+        """
+        titles = self._guide_titles(guidelines)
+        snippets = [APPLIES_TO_NOTE]
         for idx, guideline in enumerate(guidelines, 1):
             rule_text = self._extract_guideline_rule_text(guideline)
             food_groups = guideline.get("food_groups") or []
@@ -2460,13 +2878,15 @@ class QAService:
                 populations_text = ", ".join(str(x) for x in target_populations if x)
             else:
                 populations_text = str(target_populations)
+            guide_title = titles.get(guideline.get("guide_urn") or "", "")
             snippet = (
                 f"Guideline {idx}:\n"
                 f"- Title: {guideline.get('title', 'N/A')}\n"
-                f"- Guide: {guideline.get('guide_urn', 'N/A')}\n"
+                f"- Guide: {guide_title or guideline.get('guide_urn', 'N/A')}\n"
                 f"- Region: {guideline.get('guide_region', 'N/A')}\n"
                 f"- Food groups: {food_groups_text or 'N/A'}\n"
                 f"- Target populations: {populations_text or 'N/A'}\n"
+                f"- Applies to: {guideline_applies_to(guideline) or 'not stated'}\n"
                 f"- Rule text: {rule_text[:500]}"
             )
             snippets.append(snippet)
@@ -3582,7 +4002,8 @@ class QAService:
         """Determine the effective model to use."""
         if request.mode == "advanced" and request.model:
             return request.model
-        return DEFAULT_GROQ_MODEL
+        # The configured default; an ablation request may swap it.
+        return config.settings.get("QA_DEFAULT_MODEL") or DEFAULT_GROQ_MODEL
 
     def _build_cache_key(
         self,
@@ -3598,26 +4019,37 @@ class QAService:
         effective_question = question or request.question
         retriever = effective_retriever or self._resolve_retriever(request)
         context = user_context.model_dump(exclude_none=True) if user_context else {}
-        return self.cache_manager.generate_cache_key(
-            prefix="qa",
-            data={
-                "version": 4,
-                "question": effective_question.strip().lower(),
-                "mode": request.mode,
-                "model": self._resolve_model(request),
-                "rag_enabled": retriever != "no_rag",
-                "retriever": retriever,
-                "top_k": request.top_k,
-                "expertise_level": request.expertise_level,
-                "experience_group": request.experience_group,
-                "language": request.language,
-                "user_context": context,
-                # A pipeline switch or ranking retune must miss the old cache:
-                # the same question now legitimately produces a different answer.
-                "pipeline": config.settings.get("QA_PIPELINE_MODE", "agentic"),
-                "ranking": ranking_config(),
-            },
-        )
+        data: Dict[str, Any] = {
+            "version": 4,
+            "question": effective_question.strip().lower(),
+            "mode": request.mode,
+            "model": self._resolve_model(request),
+            "rag_enabled": retriever != "no_rag",
+            "retriever": retriever,
+            "top_k": request.top_k,
+            "expertise_level": request.expertise_level,
+            "experience_group": request.experience_group,
+            "language": request.language,
+            "user_context": context,
+            # A pipeline switch or ranking retune must miss the old cache:
+            # the same question now legitimately produces a different answer.
+            "pipeline": config.settings.get("QA_PIPELINE_MODE", "agentic"),
+            "ranking": ranking_config(),
+        }
+        # A claim and a question with the same words are different requests
+        # (the claim's answer carries a verdict). Only added for non-default
+        # intents, so every existing cache entry keeps its key.
+        intent = getattr(request, "intent", "answer") or "answer"
+        if intent != "answer":
+            data["intent"] = intent
+        # An ablated answer must never be served to anyone else. Only added
+        # when present, so every existing cache entry keeps its key.
+        from services.qa_pipeline.ablation import current as ablation_overlay
+
+        overlay = ablation_overlay()
+        if overlay:
+            data["ablation"] = overlay
+        return self.cache_manager.generate_cache_key(prefix="qa", data=data)
 
     def _should_generate_dual_answer(self, question: str) -> bool:
         """Decide whether to generate a dual answer for A/B testing."""
